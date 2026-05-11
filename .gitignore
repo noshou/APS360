@@ -1,0 +1,129 @@
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+.venv/
+env/
+
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Claude
+.claude
+
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Linker files
+*.ilk
+
+# Debugger Files
+*.pdb
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# debug information files
+*.dwo
+
+# log files
+*.log
+
+# SDKMan!
+.sdkmanrc
+
+# build dir
+_build/
+build/
+
+## OS-SPECIFIC ##
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+## EDITOR / OFFICE FILES ##
+.idea
+# Ignore lock and swap/backup files (LibreOffice, Kate, Vim, etc.)
+*.~lock*
+*.kate-swp
+*.swp
+*.swo
+*~
+.#*
+
+# Ignore temporary backup files (LibreOffice autosaves, crash recovery)
+*.bak
+*.tmp
+*.temp
+*.autosave
+
+# Temporary files
+~$*.doc*
+~$*.xls*
+~$*.ppt*
+
+# AutoRecover files
+*.asd
+*.wbk
+*.xar
+
+# Excel backup/cache files
+*.xlk
+*.xar
+*.tmp
+
+# PowerPoint autosave/temporary
+*.ppam
+*.pptx#
+*.pptm#
+
+# Office crash dumps
+*.dmp
+
+# Misc editor
+*.orig
+*.rej
