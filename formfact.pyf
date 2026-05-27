@@ -46,13 +46,13 @@ python module FormFact ! in
             use iso_c_binding, only: c_double
             use f0factor
             use f1f2factors
-            subroutine getFormFactPy(q,elm,ff_re,ff_im,status) ! in :FormFact:Molecule/FormFact/FormFact.f90:formfact
+            subroutine getformfactpy(q,elm,ff_re,ff_im,status) ! in :FormFact:Molecule/FormFact/FormFact.f90:formfact
                 real(kind=c_double) intent(in) :: q
                 character*(*) intent(in) :: elm
                 real(kind=c_double) intent(out) :: ff_re
                 real(kind=c_double) intent(out) :: ff_im
                 integer intent(out) :: status
-            end subroutine getFormFactPy
+            end subroutine getformfactpy
         end module formfact
     end interface 
 end python module FormFact

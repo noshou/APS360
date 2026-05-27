@@ -32,26 +32,31 @@ contains
     !! If element is not found, returns (0,0) and status = -1
     !! @param[in]  q      Scattering vector magnitude (sin θ)/λ in Å⁻¹
     !! @param[in]  elm    Element symbol (case-insensitive, e.g., 'Fe', 'Cu')
-    !! @param[out] status Return status: 0 = success, -1 = element not found
-    !! 
+    !! @param[out] status Return status: 0 = success, -1 = element not found, -2 = Q out of range
+    !!
     !! @return ff Complex form factor
     function getFormFact(q, elm, status) result(ff)
         real(c_double), intent(in) :: q
         character(len=*), intent(in) :: elm
         integer, intent(out) :: status
         complex(c_double) :: ff
-        
+
         real(c_double) :: f0Val, f1, f2, f0_0
-        
+
+        if (q < 0.0_c_double .or. q > 0.5_c_double) then
+            ff = cmplx(0.0_c_double, 0.0_c_double, kind=c_double)
+            status = -2
+            return
+        end if
+
         ! Get anomalous scattering factors f1 and f2
         call getF1F2(elm, f1, f2, status)
-        
+
         if (status /= 0) then
-            ! Element not found, return zero and error status
             ff = cmplx(0.0_c_double, 0.0_c_double, kind=c_double)
             return
         end if
-        
+
         ! Get atomic form factor f0
         f0Val = getF0(q, elm)
         
