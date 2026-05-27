@@ -12,12 +12,13 @@
 !!   - f2 is the imaginary anomalous correction (absorption)
 module FormFact
     use iso_c_binding, only: c_double
-    use F0Factor, only: getF0, getQVals
-    use F1F2Factors, only: getF1F2
+    use F0Factor
+    use F1F2Factors
     implicit none
     
     private
     public :: getFormFact, getQValues
+    public :: getFormFactPy
     
 contains
 
@@ -40,7 +41,7 @@ contains
         integer, intent(out) :: status
         complex(c_double) :: ff
         
-        real(c_double) :: f0Val, f1, f2
+        real(c_double) :: f0Val, f1, f2, f0_0
         
         ! Get anomalous scattering factors f1 and f2
         call getF1F2(elm, f1, f2, status)
@@ -54,15 +55,29 @@ contains
         ! Get atomic form factor f0
         f0Val = getF0(q, elm)
         
-        ! Construct complex result: real = f1 + f0, imaginary = f2
-        ff = cmplx(f1 + f0Val, f2, kind=c_double)
+        ! get f0(Q=0)
+        f0_0  = getF0(0.0_c_double, elm)
+
+        ! Construct complex result: real = f1 + f0 - f0(Q), imaginary = f2
+        ff = cmplx(f1 + f0Val - f0_0, f2, kind=c_double)
         
     end function getFormFact
+
+    !> Wrapper for python since it struggled returning compelx numbers
+    subroutine getFormFactPy(q, elm, ff_re, ff_im, status)
+        real(c_double), intent(in)  :: q
+        character(len=*), intent(in) :: elm
+        real(c_double), intent(out) :: ff_re, ff_im
+        integer, intent(out) :: status
+        complex(c_double) :: ff
+        ff = getFormFact(q, elm, status)
+        ff_re = real(ff, kind=c_double)
+        ff_im = aimag(ff)
+    end subroutine getFormFactPy
 
     !! @return the list of available q values
     function getQValues() result(qvals)
         real(c_double), allocatable :: qvals(:)
-        allocate(qvals, source=getQVals())
+        qvals = getQVals()
     end function getQValues
-
 end module FormFact

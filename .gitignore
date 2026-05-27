@@ -1,3 +1,6 @@
+# generated stuff from FormFact compilation
+*.egg-info/
+
 __pycache__/
 *.py[cod]
 *$py.class

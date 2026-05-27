@@ -778,7 +778,7 @@ contains
             elementLower = toLower(element)
 
             ! Round q to nearest 0.01 Å⁻¹
-            qRound = ceiling(q * 100_c_double) / 100_c_double
+            qRound = ceiling(q * 100.0_c_double) / 100.0_c_double
 
             ! Find element index
             elemIdx = -1
@@ -820,6 +820,6 @@ contains
     !! @return qVals List of available q values
     function getQVals() result(qVals)
             real(c_double), allocatable :: qVals(:)
-            allocate(qVals, source=qValues)
+            qVals = qValues
     end function getQVals
 end module F0Factor
