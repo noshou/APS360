@@ -1,7 +1,6 @@
 import numpy as np
 from beartype import beartype
-from scipy.special import lpmv, spherical_jn
-from scipy.special import factorial as fact
+from scipy.special import spherical_jn, sph_harm_y
 import numpy.typing as npt
 import FormFact
 
@@ -10,62 +9,40 @@ def sphHarm(
     lMax:  int,
     theta: npt.NDArray[np.float64],
     phi:   npt.NDArray[np.float64],
-) -> npt.NDArray[np.float64]:
-    """Compute real spherical harmonics Y_l^m for all (l, m) with l ∈ [0, lMax], |m| ≤ l.
-    
+) -> npt.NDArray[np.complex128]:
+    """Compute complex spherical harmonics Y_l^m for all (l, m) with l ∈ [0, lMax], |m| ≤ l.
+
     Output is flattened over (l, m): row k corresponds to (l, m) where k = l² + l + m.
     Layout: row 0 = Y_0^0; rows 1, 2, 3 = Y_1^{-1}, Y_1^0, Y_1^1; rows 4..8 = Y_2^{-2}..Y_2^2; etc.
     Total (lMax+1)² rows.
-    
+
     Args:
         lMax:  Maximum degree. Must be non-negative.
         theta: Azimuthal angles (0 → 2π), shape (N,).
         phi:   Polar angles (0 → π), shape (N,).
-    
+
     Returns:
         Y: shape ((lMax+1)², N). Y[k, i] = Y_l^m(theta[i], phi[i]) where k = l² + l + m.
-    
+
     Raises:
         ValueError: If inputs are invalid.
     """
-    # validation
     if lMax < 0:
         raise ValueError("functions.sphHarm: lMax must be non-negative")
     if theta.shape != phi.shape or theta.size == 0:
         raise ValueError("functions.sphHarm: theta and phi must share shape and be non-empty")
-    
-    # build flat (l, m) lists
-    ls_list, ms_list = [], []
+
+    K = (lMax + 1) ** 2
+    Y = np.zeros((K, theta.size), dtype=np.complex128)
+
+    k = 0
     for l in range(lMax + 1):
         for m in range(-l, l + 1):
-            ls_list.append(l)
-            ms_list.append(m)
-    ls     = np.array(ls_list)              # shape (K,) where K = (lMax+1)²
-    ms     = np.array(ms_list)              # shape (K,)
-    abs_ms = np.abs(ms)
-    
-    # associated Legendre P_l^|m|(cos(phi)) for every (k, atom)
-    # lpmv broadcasts: (K, 1) × (K, 1) × (1, N) → (K, N)
-    P = lpmv(abs_ms[:, None], ls[:, None], np.cos(phi)[None, :])
-    
-    # azimuthal: three cases by sign of m, vectorized via np.where
-    arg   = abs_ms[:, None] * theta[None, :]    # shape (K, N)
-    m_col = ms[:, None]                         # shape (K, 1), broadcasts
-    azimuthal = np.where(
-        m_col > 0, np.sqrt(2) * np.cos(arg),
-        np.where(
-            m_col < 0, np.sqrt(2) * np.sin(arg),
-            np.ones_like(arg)
-            )
-        )             
-    
-    # normalization per (l, m), shape (K,)
-    Nfac = np.sqrt(
-        (2 * ls + 1) / (4 * np.pi) *
-        (fact(ls - abs_ms, True) / fact(ls + abs_ms, True))
-    )
-    
-    return Nfac[:, None] * P * azimuthal         # shape (K, N)
+            # sph_harm_y convention: (l, m, polar, azimuthal)
+            Y[k] = sph_harm_y(l, m, phi, theta)
+            k += 1
+
+    return Y
 
 @beartype
 def bess(

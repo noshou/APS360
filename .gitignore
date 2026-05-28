@@ -73,6 +73,9 @@ env/
 _build/
 build/
 
+# precomputed SAXS data (large binaries; already embedded in demo.html)
+demo/precomputed/
+
 ## OS-SPECIFIC ##
 # macOS
 .DS_Store
