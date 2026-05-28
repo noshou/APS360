@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - demo/demo.html
+  workflow_dispatch:
 
 permissions:
   contents: read
