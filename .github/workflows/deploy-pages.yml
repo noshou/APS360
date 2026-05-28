@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - demo/demo.html
+      - demo/index.html
   workflow_dispatch:
 
 permissions:

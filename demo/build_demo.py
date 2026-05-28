@@ -1,5 +1,5 @@
 """
-Generate demo.html from precomputed .npz files.
+Generate index.html from precomputed .npz files.
 Run after precompute.py:
     python demo/build_demo.py
 """
@@ -16,7 +16,7 @@ from scipy.special import sph_harm_y
 DEMO_DIR   = Path(__file__).parent
 PREC_DIR   = DEMO_DIR / "precomputed"
 STRUCT_DIR = DEMO_DIR / "demo_structures"
-OUT_HTML   = DEMO_DIR / "demo.html"
+OUT_HTML   = DEMO_DIR / "index.html"
 
 lMax       = 10
 resolution = 40
