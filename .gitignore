@@ -1,6 +1,12 @@
-# generated stuff from FormFact compilation
-*.egg-info/
+# claude stuff
+.claude/
+CLAUDE.md
 
+
+# raw data dir
+data/
+
+# python stuff
 __pycache__/
 *.py[cod]
 *$py.class

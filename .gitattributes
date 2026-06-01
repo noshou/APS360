@@ -1,3 +1,0 @@
-*.mk  linguist-language=Makefile
-*.cmake linguist-detectable=true
-CMakeLists.txt linguist-detectable=true

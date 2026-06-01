@@ -21,8 +21,9 @@ OUT_HTML   = DEMO_DIR / "index.html"
 lMax       = 10
 resolution = 40
 
-theta = np.linspace(0, 2*np.pi, resolution)
-phi   = np.linspace(0, np.pi,   resolution)
+# Physics convention: theta = polar colatitude (0→π), phi = azimuthal (0→2π)
+theta = np.linspace(0, np.pi,   resolution)
+phi   = np.linspace(0, 2*np.pi, resolution)
 THETA, PHI = np.meshgrid(theta, phi)
 
 
@@ -32,12 +33,13 @@ def sh_proj(lMax, coeffs, THETA, PHI):
     k = 0
     for l in range(lMax + 1):
         for m in range(-l, l + 1):
-            f += coeffs[k] * sph_harm_y(l, m, PHI, THETA)
+            # scipy sph_harm_y(l, m, theta, phi): theta=polar (0→π), phi=azimuthal (0→2π)
+            f += coeffs[k] * sph_harm_y(l, m, THETA, PHI)
             k += 1
     r = 1.0 + np.real(f)
-    x = r * np.sin(PHI) * np.cos(THETA)
-    y = r * np.sin(PHI) * np.sin(THETA)
-    z = r * np.cos(PHI)
+    x = r * np.sin(THETA) * np.cos(PHI)
+    y = r * np.sin(THETA) * np.sin(PHI)
+    z = r * np.cos(THETA)
     return x, y, z
 
 
@@ -73,7 +75,7 @@ for npz_file in sorted(PREC_DIR.glob("*.npz")):
     data  = np.load(npz_file)
     I_q   = data["I_q"]
     B_lm  = data["B_lm_re"] + 1j * data["B_lm_im"]
-    qVals = data["qVals"]
+    qVals = data["qvals"]
     xyz   = xyz_file.read_text()
 
     # I(q) figure — transparent bg, themed via CSS/JS at runtime
