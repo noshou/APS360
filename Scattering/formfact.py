@@ -1,8 +1,15 @@
+import re
 import numpy as np
 from beartype import beartype
 import numpy.typing as npt
 from xraydb import f0, f1_chantler, f2_chantler, chantler_energies
 from dataclasses import dataclass
+
+# Strip charge notation to get bare element symbol (e.g. Mn2+ → Mn, Na+ → Na)
+# Used for xraydb functions that don't accept ionic notation (f1/f2, chantler_energies)
+_CHARGE_RE = re.compile(r'[0-9]*[+\-]+$')
+def _bare(ion: str) -> str:
+    return _CHARGE_RE.sub('', ion)
 
 @dataclass(frozen=True)
 class FormFactors:
@@ -58,14 +65,15 @@ class FormFactors:
             outside the tabulated range.
         """
 
-        valid = chantler_energies(ion, emin=0, emax=1e9)
+        elem = _bare(ion)
+        valid = chantler_energies(elem, emin=0, emax=1e9)
         if len(valid) == 0:
-            raise ValueError(f"No Chantler tabulation found for ion '{ion}'.")
+            raise ValueError(f"No Chantler tabulation found for '{elem}' (from ion '{ion}').")
         emin, emax = min(valid), max(valid)
         if energy < emin or energy > emax:
             raise ValueError(
                 f"Energy {energy} eV is outside the valid Chantler range "
-                f"[{emin}, {emax}] eV for ion '{ion}'."
+                f"[{emin}, {emax}] eV for '{elem}'."
             )
 
     @staticmethod
@@ -99,12 +107,21 @@ class FormFactors:
             Complex form factor evaluated at each q in ``qvals``.
         """
 
+        # f1/f2 (Chantler) require bare element symbols.
+        # f0 (Waasmaier/Cromer-Mann) accepts ionic notation when available and gives
+        # physically different values — use ionic when possible, fall back to bare.
         # xraydb.f0 uses the Cromer-Mann variable s = sin(θ)/λ = q / (4π)
+        elem = _bare(ion)
         s    = qvals / (4.0 * np.pi)
-        f0_  = np.asarray(f0(ion, s), dtype=np.float64)
-        f1_  = float(np.asarray(f1_chantler(ion, energy)).squeeze())
-        f2_  = float(np.asarray(f2_chantler(ion, energy)).squeeze())
-        f0_zero = float(np.asarray(f0(ion, 0.0)).squeeze())
+        try:
+            f0_     = np.asarray(f0(ion, s),   dtype=np.float64)
+            f0_zero = float(np.asarray(f0(ion, 0.0)).ravel()[0])
+        except Exception:
+            # ion not in Waasmaier table — fall back to neutral element
+            f0_     = np.asarray(f0(elem, s),   dtype=np.float64)
+            f0_zero = float(np.asarray(f0(elem, 0.0)).ravel()[0])
+        f1_ = float(np.asarray(f1_chantler(elem, energy)).squeeze())
+        f2_ = float(np.asarray(f2_chantler(elem, energy)).squeeze())
         return np.asarray((f0_ + f1_ - f0_zero) + 1j * f2_, dtype=np.complex128)
 
     @classmethod
