@@ -66,7 +66,10 @@ class FormFactors:
         """
 
         elem = _bare(ion)
-        valid = chantler_energies(elem, emin=0, emax=1e9)
+        try:
+            valid = chantler_energies(elem, emin=0, emax=1e9)
+        except Exception:
+            raise ValueError(f"No Chantler tabulation found for '{elem}' (from ion '{ion}').")
         if len(valid) == 0:
             raise ValueError(f"No Chantler tabulation found for '{elem}' (from ion '{ion}').")
         emin, emax = min(valid), max(valid)
@@ -80,8 +83,9 @@ class FormFactors:
     def _calc_formfact(
         ion: str,
         qvals: npt.NDArray[np.float64],
-        energy: float
-        ) -> npt.NDArray[np.complex128]:
+        energy: float,
+        skip_anomalous: bool = False,
+    ) -> npt.NDArray[np.complex128]:
 
         """Compute the complex atomic form factor f(q, E) for a given ion.
 
@@ -100,6 +104,9 @@ class FormFactors:
             Momentum transfer values in Å⁻¹.
         energy : float
             X-ray energy in eV.
+        skip_anomalous : bool, optional
+            If ``True``, skip the Chantler f1/f2 corrections and return just
+            ``f0(s)`` as complex128.  Default is ``False``.
 
         Returns
         -------
@@ -120,6 +127,8 @@ class FormFactors:
             # ion not in Waasmaier table — fall back to neutral element
             f0_     = np.asarray(f0(elem, s),   dtype=np.float64)
             f0_zero = float(np.asarray(f0(elem, 0.0)).ravel()[0])
+        if skip_anomalous:
+            return np.asarray(f0_, dtype=np.complex128)
         f1_ = float(np.asarray(f1_chantler(elem, energy)).squeeze())
         f2_ = float(np.asarray(f2_chantler(elem, energy)).squeeze())
         return np.asarray((f0_ + f1_ - f0_zero) + 1j * f2_, dtype=np.complex128)
@@ -128,15 +137,36 @@ class FormFactors:
     @beartype
     def fromIons(
         cls,
-        ions:   list[str],
-        energy: float,
-        qMin:   int | float,
-        qMax:   int | float,
-        step:   float,
+        ions:     list[str],
+        energy:   float,
+        qMin:     int | float,
+        qMax:     int | float,
+        step:     float,
+        log_path: str | None = None,
     ) -> 'FormFactors':
 
         """
         Computes complex form factors for a list of ions over a q grid.
+
+        Each ion is classified into one of three tiers:
+
+        * **Dummy** — ``f0`` raises for the bare element (e.g. ``X1+``, ``M``).
+          These sites carry no electron density and are skipped entirely.
+        * **f0-only** — ``f0`` works but no Chantler tabulation exists for the
+          element or the energy is outside the tabulated range (e.g. ``Pu``,
+          ``Am``).  Only the Thomson scattering term ``f0(s)`` is returned as
+          complex128 (no anomalous corrections).
+        * **Full** — both ``f0`` and the Chantler f1/f2 corrections are
+          available.  The complete form factor
+          ``f(q,E) = f0(s) + f1(E) − f0(0) + i·f2(E)`` is computed.
+
+        If ``log_path`` is given, skipped/fallback ions are written there, one
+        per line, e.g.::
+
+            DUMMY   X1+
+            DUMMY   M
+            F0-ONLY Pu
+            F0-ONLY Am3+
 
         Parameters
         ----------
@@ -150,6 +180,9 @@ class FormFactors:
             Maximum momentum transfer in Å⁻¹.
         step : float
             Step size of the q grid in Å⁻¹.
+        log_path : str or None, optional
+            Path to a text file where dummy/f0-only ions are logged.  If
+            ``None`` (default), no log file is written.
 
         Returns
         -------
@@ -158,7 +191,7 @@ class FormFactors:
         Raises
         ------
         ValueError
-            If bounds are invalid or energy is outside the Chantler tabulation.
+            If bounds are invalid.
         """
 
         if qMin < 0 or qMax < 0 or qMin >= qMax or step <= 0 or (qMax - qMin) < step:
@@ -170,9 +203,31 @@ class FormFactors:
         num_elements = int(round((qMax - qMin) / step)) + 1
         qvals = np.linspace(qMin, qMax, num_elements, dtype=np.float64)
 
+        log_lines: list[str] = []
         ff_dict: dict[str, npt.NDArray[np.complex128]] = {}
         for ion in dict.fromkeys(ions):
-            cls._validate_energy(ion, energy)
-            ff_dict[ion] = cls._calc_formfact(ion, qvals, energy)
+            elem = _bare(ion)
+
+            # Tier 1 — dummy site: f0 raises for the bare element
+            try:
+                f0(elem, np.array([0.0]))
+            except Exception:
+                log_lines.append(f"DUMMY   {ion}")
+                continue
+
+            # Tier 2 — f0-only: Chantler tabulation missing or energy out of range
+            try:
+                cls._validate_energy(ion, energy)
+            except ValueError:
+                log_lines.append(f"F0-ONLY {ion}")
+                ff_dict[ion] = cls._calc_formfact(ion, qvals, energy, skip_anomalous=True)
+                continue
+
+            # Tier 3 — full form factor
+            ff_dict[ion] = cls._calc_formfact(ion, qvals, energy, skip_anomalous=False)
+
+        if log_path is not None and log_lines:
+            with open(log_path, 'w') as _fh:
+                _fh.write('\n'.join(log_lines) + '\n')
 
         return cls(ions=list(ff_dict.keys()), qvals=qvals, ff=ff_dict, energy=energy)

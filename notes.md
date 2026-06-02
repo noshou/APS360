@@ -400,3 +400,16 @@
          - sumStratMean = meanLight + meanHeavy
          - lightSamples = ⌈meanLight/(sumStratMean) * totalSamples⌉
          - heavySamples = totalSamples - lightSamples
+
+# 2026-06-02
+ - redoing pipeline: rcsb_big removed, rcsb_med retained (contains structures up to ~78k atoms)
+ - lMax = 50 (matches CRYSOL recommendation; covers R_max ~100 Å at q=0.5 Å⁻¹)
+ - HDF5 storage optimizations (combined ~4-6x size reduction):
+   - ZFP lossless compression for float data; bitshuffle+Zstd for uint8 metadata
+   - B_lm stored as float32 (complex64) instead of float64 (complex128)
+   - Conjugate symmetry: only m ≥ 0 modes stored; B_{l,-m} = (-1)^m · B*_{lm}
+     - Reduced modes: (lMax+1)(lMax+2)/2 = 1326 (vs 2601 full)
+     - Index: k = l*(l+1)//2 + m
+     - Stuhrmann inner loop halved (compute speedup as well)
+   - Pipeline is resumable: opens HDF5 in append mode, skips completed molecules
+   - Power-loss safe: write-to-tmp then atomic rename; tmp entries cleaned on resume

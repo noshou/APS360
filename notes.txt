@@ -1,8 +1,0 @@
-steps: 
-  
-
-# bugs:
-three bugs:
-  1. F0Factor.f90:781 — 100_c_double (integer kind) caused integer division → qRound = 0.0 always → getF0 always returned the Q=0 value regardless of input
-  2. FormFact.f90 — wrong formula f0 + f1 double-counted Z (fixed by subtracting f0(Q=0))
-  3. f2py aarch64 ABI issue — complex-returning Fortran functions have a calling convention problem on this platform; fixed by wrapping as a subroutine with real/imag as

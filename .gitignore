@@ -3,8 +3,10 @@
 CLAUDE.md
 
 
-# raw data dir
+# raw data
 data/
+dataloads.py
+build_db.py
 
 # python stuff
 __pycache__/
