@@ -1,0 +1,90 @@
+\documentclass[final]{article}
+
+\usepackage{APS360}
+\usepackage{amsmath}
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+
+\DeclareMathOperator{\sinc}{sinc}
+
+\begin{document}
+%==============================================================================
+\section{Background: X-Ray Scattering and the Debye Equation}
+%==============================================================================
+
+When a beam of X-rays is fired at a molecule, each atom deflects (``scatters'') the beam by an
+amount that depends on the atom's identity and the deflection angle~$q$. Each atom has a
+characteristic \emph{atomic form factor} $f_k(q)$ encoding how strongly it scatters at
+angle~$q$. By measuring the total scattered intensity across all angles, we obtain a
+\emph{scattering profile} $I(q)$ which is a unique fingerprint of the molecule's 3-D shape.
+
+The exact formula, the \textbf{Debye equation}, sums the pairwise interaction of every atom with
+every other atom:
+\begin{equation}
+    I(q) = \sum_{\alpha}\sum_{\beta}
+    f_{\alpha}(q)\,f^{*}_{\beta}(q)\;\sinc\!\bigl(q\,|\mathbf{r}_{\alpha} - \mathbf{r}_{\beta}|\bigr)
+    \label{eq:debye}
+\end{equation}
+where $\sinc(x)=\sin(x)/x$ captures the intuition that atoms far apart interfere less strongly.
+Because every pair must be evaluated, this scales as $O(N^2)$ in the number of atoms.
+\textbf{CRYSOL}~\cite{svergun_crysol_1995} approximates Eq.~\eqref{eq:debye} by decomposing the
+molecular shape into a sum of angular ``modes'' (spherical harmonics), truncated at order~$L$:
+\begin{equation}
+    I(q) = \sum_{l=0}^{L}\sum_{m=-l}^{l}
+    \bigl|A_{lm}(q) - \rho_0\,C_{lm}(q) + \delta\rho\,B_{lm}(q)\bigr|^2
+    \label{eq:crysol}
+\end{equation}
+where $A_{lm}$, $C_{lm}$, $B_{lm}$ encode contributions from the molecule itself, the
+displaced solvent, and the surrounding hydration shell, respectively. This reduces the cost to
+$O(N \cdot L^2)$, with $L \leq 20$ sufficient for most proteins. A live demo is available at:
+(ADD DEMO LINK HERE).
+
+This raises the central question of this project: \emph{can a neural network learn to predict
+$I(q)$ directly from the 3-D atomic coordinates of a molecule?}
+
+%==============================================================================
+\section{Proposed Architecture}
+%==============================================================================
+
+The ground truth for each molecule is computed via the \textbf{Stuhrmann decomposition}
+(in-vacuo, no solvent corrections):
+\begin{equation}
+    B_{lm}(q) = \sum_i f_i(q)\,j_l(qr_i)\,Y_{lm}(\theta_i,\phi_i),
+    \qquad
+    I(q) = (4\pi)^2 \sum_{l=0}^{L}\sum_{m=-l}^{l} |B_{lm}(q)|^2
+    \label{eq:stuhrmann}
+\end{equation}
+where $j_l$ are spherical Bessel functions and $Y_{lm}$ are spherical harmonics.
+The only label available per molecule is the intensity vector $I(q) \in \mathbb{R}^{|Q|}$.
+
+The individual $|B_{lm}(q)|^2$ terms are not directly supervised, so the network could in
+principle output $I(q)$ directly. However, we instead propose to predict the
+$\frac{(L+1)(L+2)}{2} \times |Q|$ matrix of non-negative scalars $|B_{lm}(q)|^2$
+and sum them to produce $\hat{I}(q)$, with an MSE loss on the final sum.
+This mirrors the structure of the ground-truth computation and provides useful inductive bias:
+each $(l,m)$ head specialises in a single angular frequency of the scattering pattern, and
+non-negativity is trivially enforced (outputs are squared).
+The coefficients $B_{lm}$ are rotationally variant, but $|B_{lm}|^2$ is rotationally
+invariant, so no equivariant machinery is required.
+The full architecture is as follows:
+
+\begin{enumerate}
+    \item \textbf{TODO}
+\end{enumerate}
+
+\section{Data Processing}
+~1.3 million molecules (around ~50GB) were processed into a database, spanning small organic molecules to large metal organic frameworks. These were pulled from 
+the following databases: QM9; tmQF; viro3D; rcsb (filtered <9k atoms); cambridge energy landscape; and QMML.  Full source attributions can be found here 
+(add link). The datapipeline was as followed: 1. data was bulk downloaded 2. scripts converted molecular formats such as .cif/.pdb to cartesian .xyz format 
+3. nested frames were extracted into seperate files 4. data was scanned for wrong and/or dummy sites (ie: placeholders), and they were removed from the files
+5. deuterium (D) was translated to hydrogen 5. ionic makeup was tallied (can be found here) 6. data was fed to python scripts to calculate I(q) ground truths 
+and store data as .hdf5 file.
+
+\end{document}

@@ -1,0 +1,15 @@
+# Fdb version 4
+["pdflatex"] 1780438432.64857 "/home/noso/APS360/template.tex" "template.pdf" "template" 1780438432.77555 2
+  "/home/noso/APS360/template.tex" 1780437963.8312 1137 7e24baa2d6def495206ae3bafe166053 ""
+  "/usr/share/texlive/texmf-dist/tex/latex/base/article.cls" 1777593600 20144 b966087dda3b194755eb460d32e2ef75 ""
+  "/usr/share/texlive/texmf-dist/tex/latex/base/size10.clo" 1777593600 8448 686612a86f0e04f41ea577f5ec7e83d8 ""
+  "/usr/share/texlive/texmf-dist/web2c/texmf.cnf" 1777593600 43785 66587115382950aca692b5f6e3c2fb74 ""
+  "/var/lib/texmf/web2c/pdftex/pdflatex.fmt" 1779911971 3520834 98a81b2296ff62384144a6fa61efc78d ""
+  "APS360.sty" 0 -1 0 ""
+  "template.aux" 1780438424.64827 32 3985256e7290058c681f74d7a3565a19 "pdflatex"
+  "template.tex" 1780437963.8312 1137 7e24baa2d6def495206ae3bafe166053 ""
+  (generated)
+  "template.aux"
+  "template.log"
+  "template.pdf"
+  (rewritten before read)
