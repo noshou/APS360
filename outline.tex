@@ -15,6 +15,33 @@
 \DeclareMathOperator{\sinc}{sinc}
 
 \begin{document}
+
+%==============================================================================
+\section{Introduction}
+%==============================================================================
+
+X-ray scattering produces a 1-D intensity profile $I(q)$ that encodes the 3-D shape of a
+molecule — but computing it exactly via the Debye equation scales as $O(N^2)$ in atom count,
+making it prohibitively slow for large structures and incompatible with gradient-based
+optimization. This proposal seeks to answer the question 
+\emph{can a graph neural network learn to predict $I(q)$ directly from
+atomic coordinates?} To answer this, this project aims to train a message-passing GNN as a fast, 
+differentiable surrogate for the exact computation. 
+
+%==============================================================================
+\section{Background \& Related Work}
+%==============================================================================
+Graph neural networks for molecular property prediction were pioneered by
+SchNet~\cite{schutt_schnet_2018}, which introduced continuous-filter convolutions on
+interatomic distances and remains a strong baseline for scalar molecular properties.
+DimeNet~\cite{gasteiger_dimenet_2020} extended this by incorporating bond angles, improving
+accuracy on quantum-chemical targets such as the QM9 benchmark~\cite{ramakrishnan_qm9_2014}.
+On the scattering side, CRYSOL~\cite{svergun_crysol_1995} established the spherical-harmonic
+decomposition approach that we use to generate ground-truth $I(q)$ labels.
+More recently, \citet{Schutt2021} introduced PaiNN, an equivariant message-passing network
+that achieves state-of-the-art accuracy on molecular property benchmarks while remaining
+computationally efficient — providing context for the architectural choices made here.
+
 %==============================================================================
 \section{Background: X-Ray Scattering and the Debye Equation}
 %==============================================================================
@@ -53,38 +80,90 @@ $I(q)$ directly from the 3-D atomic coordinates of a molecule?}
 \section{Proposed Architecture}
 %==============================================================================
 
-The ground truth for each molecule is computed via the \textbf{Stuhrmann decomposition}
-(in-vacuo, no solvent corrections):
+Ground truth intensities are pre-computed via the Stuhrmann decomposition (Eq.~\ref{eq:stuhrmann})
+and stored per molecule; $B_{lm}$ coefficients are discarded after computing $I(q)$.
+
 \begin{equation}
-    B_{lm}(q) = \sum_i f_i(q)\,j_l(qr_i)\,Y_{lm}(\theta_i,\phi_i),
+    B_{lm}(q) = \sum_i f_i(q)\,j_l(qr_i)\,Y^*_{lm}(\theta_i,\phi_i),
     \qquad
-    I(q) = (4\pi)^2 \sum_{l=0}^{L}\sum_{m=-l}^{l} |B_{lm}(q)|^2
+    I(q) = (4\pi)^2 \sum_{l,m} |B_{lm}(q)|^2
     \label{eq:stuhrmann}
 \end{equation}
-where $j_l$ are spherical Bessel functions and $Y_{lm}$ are spherical harmonics.
-The only label available per molecule is the intensity vector $I(q) \in \mathbb{R}^{|Q|}$.
 
-The individual $|B_{lm}(q)|^2$ terms are not directly supervised, so the network could in
-principle output $I(q)$ directly. However, we instead propose to predict the
-$\frac{(L+1)(L+2)}{2} \times |Q|$ matrix of non-negative scalars $|B_{lm}(q)|^2$
-and sum them to produce $\hat{I}(q)$, with an MSE loss on the final sum.
-This mirrors the structure of the ground-truth computation and provides useful inductive bias:
-each $(l,m)$ head specialises in a single angular frequency of the scattering pattern, and
-non-negativity is trivially enforced (outputs are squared).
-The coefficients $B_{lm}$ are rotationally variant, but $|B_{lm}|^2$ is rotationally
-invariant, so no equivariant machinery is required.
-The full architecture is as follows:
+The proposed network takes a molecule's atomic positions and element types as input and
+predicts $\hat{I}(q) \in \mathbb{R}^{|Q|}$. Let $\lambda_1$ be the hidden dimension and
+$\lambda_2$ the number of message-passing rounds (both treated as tunable hyperparameters).
+The network proceeds in four stages:
 
 \begin{enumerate}
-    \item \textbf{TODO}
+    \item \textbf{Embedding.} Each atom's element type is looked up in a trainable table,
+    producing a vector $\mathbf{h}_i \in \mathbb{R}^{\lambda_1}$. This gives the network a
+    learnable representation of each element.
+
+    \item \textbf{Message passing ($\lambda_2$ rounds).} Each atom updates its vector by
+    aggregating information from nearby neighbours. Interatomic distances are encoded as
+    Gaussian radial basis functions before being passed to a small MLP (with Swish activations)
+    that weights each neighbour's contribution. A residual connection is added at each round.
+    After $\lambda_2$ rounds, each atom's vector encodes its local chemical environment.
+
+    \item \textbf{Pooling.} Atom vectors are averaged into a single fixed-size molecule
+    vector $\mathbf{h}_{\mathrm{mol}} \in \mathbb{R}^{\lambda_1}$, independent of molecule size.
+
+    \item \textbf{Output head.} A multi-layer MLP with Swish hidden activations maps
+    $\mathbf{h}_{\mathrm{mol}}$ to $\hat{I}(q) \in \mathbb{R}^{|Q|}$. A Softplus activation
+    on the final layer enforces strict positivity $\hat{I}(q) > 0$, consistent with the
+    physical requirement that scattering intensity is always positive.
 \end{enumerate}
 
+The network is trained to minimise a log-scale MSE loss,
+\begin{equation}
+    \mathcal{L} = \frac{1}{|Q|}\sum_{q}
+    \bigl(\log\hat{I}(q) - \log I(q)\bigr)^2,
+\end{equation}
+which accounts for the orders-of-magnitude variation in intensity across the dataset.
+
+A key design consideration is rotational invariance. The $B_{lm}$ coefficients themselves
+are rotationally variant; rotating a molecule produces distinct $B_{lm}$ coefficients. 
+To predict $B_{lm}$ directly would require rotationally equivariant architectures 
+such as e3nn~\cite{e3nn}. However, these models are very computationally expensive and outside of the scope 
+of this project. Therefore, it was decided to estimate the magnitudes of the coefficients which are rotationally 
+invariant, which has the added bonus of making them real instead of complex.
+
 \section{Data Processing}
-~1.3 million molecules (around ~50GB) were processed into a database, spanning small organic molecules to large metal organic frameworks. These were pulled from 
-the following databases: QM9; tmQF; viro3D; rcsb (filtered <9k atoms); cambridge energy landscape; and QMML.  Full source attributions can be found here 
-(add link). The datapipeline was as followed: 1. data was bulk downloaded 2. scripts converted molecular formats such as .cif/.pdb to cartesian .xyz format 
-3. nested frames were extracted into seperate files 4. data was scanned for wrong and/or dummy sites (ie: placeholders), and they were removed from the files
-5. deuterium (D) was translated to hydrogen 5. ionic makeup was tallied (can be found here) 6. data was fed to python scripts to calculate I(q) ground truths 
-and store data as .hdf5 file.
+
+A dataset of \textbf{1,139,747 molecules} was assembled from 13 source collections spanning
+diverse structural regimes: small clusters (Ar, Ne, Si/Ge, binary metal), crystal structures
+(COD, 532,617 entries), small organics (QM9, 133,844), transition-metal complexes
+(tmQM, 108,541), biomolecular assemblies (RCSB, 198,173), viral proteins
+(viro3D, 85,063), hydration shells (48,571), and metal-organic frameworks (30,871).
+In total, 474 unique atom/ion types are represented (charge-resolved, e.g.\ \texttt{O} and
+\texttt{O2-} are distinct). Full source attributions are provided in \texttt{sources.tsv},
+embedded in the database.
+
+Raw structures were obtained in various formats (.cif, .pdb, .xyz\@) and converted to a
+uniform Cartesian XYZ representation. Dummy and non-physical atom sites were removed,
+deuterium was mapped to hydrogen, and structures declaring zero atoms were discarded.
+Non-element placeholders (\texttt{X}, \texttt{M}, \texttt{Cn}, etc.) were excluded from
+the ionic makeup. $I(q)$ ground truths were then computed via the Stuhrmann decomposition
+at $L{=}50$ and stored in a compressed HDF5 database.
+
+%==============================================================================
+\section{Baseline Model}
+%==============================================================================
+
+The natural baseline is the exact Stuhrmann decomposition itself, that is: given atomic coordinates,
+$I(q)$ can be computed analytically at $O(N \cdot L^2)$ cost with no approximation error.
+This is the same computation used to generate ground-truth labels, so a perfect model would
+exactly match it. We report this exact computation as the baseline and measure the GNN's
+approximation error relative to it across each dataset regime.
+
+%==============================================================================
+\section{Ethical Considerations}
+%==============================================================================
+
+All training data is open-source and fully attributed; no private or sensitive information
+is involved. The primary risk is misuse of model predictions: since the GNN is an
+approximation, predicted $I(q)$ curves could mislead structural biology or materials
+research if treated as exact without cross-validation against the ground-truth computation.
 
 \end{document}

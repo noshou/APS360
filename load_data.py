@@ -5,6 +5,8 @@ import h5py, os
 import hdf5plugin  # pip install hdf5plugin
 from beartype import beartype
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from itertools import islice
+import sys
 from tqdm import tqdm
 from Scattering.formfact import FormFactors
 from Scattering.molecule import Molecule
@@ -18,14 +20,14 @@ def _worker_init(ff: FormFactors, lMax: int) -> None:
     _ff   = ff
     _lMax = lMax
 
-def _process_mol(xyz_path: str) -> tuple[str, npt.NDArray[np.float64], npt.NDArray[np.complex64]] | None:
+def _process_mol(xyz_path: str) -> tuple[str, npt.NDArray[np.float64]] | None:
     assert _ff is not None and _lMax is not None
-    mol = Molecule.fromXYZ(xyz_path)
     try:
-        I_q, B_lm = mol.stuhrmann(_ff, _lMax)
+        mol = Molecule.fromXYZ(xyz_path)
+        I_q, _ = mol.stuhrmann(_ff, _lMax)
     except ValueError:
         return None
-    return os.path.basename(xyz_path)[:-4], I_q, B_lm
+    return os.path.basename(xyz_path)[:-4], I_q
 
 @beartype
 def loadFormFact(
@@ -73,14 +75,18 @@ def buildDB(
     Molecule computation is parallelized across `workers` processes; HDF5 writes
     are serialized on the main process (h5py is not concurrency-safe for writes).
 
+    Only I(q) is stored per molecule. B_lm coefficients are computed internally
+    by the Stuhrmann decomposition but discarded — the NN predicts I(q) directly,
+    using B_lm as a physics-structured intermediate learned during training, not
+    as a supervised target.
+
     HDF5 layout:
         /attrs:          lMax (int), energy (float)
         /q_grid:         float64 (Q,)  — momentum transfer grid in Å⁻¹
         /sources_tsv:    uint8 raw bytes of sources_tsv, if provided
-        /<group>/<stem>/I_q:   float64    (Q,)           — scattering intensity
-        /<group>/<stem>/B_lm:  complex128 ((lMax+1)², Q) — partial wave amplitudes
+        /<group>/<stem>/I_q:   float32 (Q,) — orientationally-averaged scattering intensity
 
-    All datasets are compressed using Zstd level 22 (maximum).
+    All datasets are compressed with ZFP lossless compression.
 
     Args:
         groups:      Dict mapping group name to directory of .xyz files.
@@ -97,9 +103,8 @@ def buildDB(
 
     with h5py.File(out_path, 'a') as hf:
 
-        hf.attrs['lMax']              = lMax
-        hf.attrs['energy']            = ff.energy
-        hf.attrs['conjugate_symmetry'] = True
+        hf.attrs['lMax']   = lMax
+        hf.attrs['energy'] = ff.energy
 
         if 'q_grid' not in hf:
             hf.create_dataset(
@@ -126,14 +131,20 @@ def buildDB(
 
         _TMP      = '__tmp__'
         _Q        = len(ff.qvals)
-        _LM       = (lMax + 1) * (lMax + 2) // 2  # reduced modes (m ≥ 0 only)
-        _chunk    = (_LM, _Q)
+        _written  = 0
+        _LOG_EVERY = 10_000
+
+        _n_workers = workers or os.cpu_count() or 1
+        _inflight  = _n_workers * 4
 
         with ProcessPoolExecutor(
             max_workers=workers,
             initializer=_worker_init,
             initargs=(ff, lMax),
-        ) as pool, tqdm(total=total, unit='mol') as pbar:
+        ) as pool, tqdm(
+            total=total, unit='mol', file=sys.stdout, dynamic_ncols=True,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}',
+        ) as pbar:
             for group_name, xyz_paths in all_xyz.items():
                 hf_group = hf.require_group(group_name)
 
@@ -146,15 +157,24 @@ def buildDB(
                 pending = [p for p in xyz_paths
                            if os.path.basename(p)[:-4] not in already_done]
                 pbar.update(len(xyz_paths) - len(pending))
-                futures = {pool.submit(_process_mol, p): p for p in pending}
 
-                for fut in as_completed(futures):
+                # Sliding window: keep at most _inflight tasks queued at once
+                # to avoid queuing all 1.3M futures and their results in memory.
+                it = iter(pending)
+                futures = {pool.submit(_process_mol, p): p for p in islice(it, _inflight)}
+
+                while futures:
+                    fut = next(as_completed(futures))
+                    del futures[fut]
+                    nxt = next(it, None)
+                    if nxt is not None:
+                        futures[pool.submit(_process_mol, nxt)] = nxt
                     result = fut.result()
                     if result is None:
                         pbar.update()
                         continue
-                    stem, I_q, B_lm = result
-                    pbar.set_postfix(group=group_name, mol=stem, refresh=False)
+                    stem, I_q = result
+                    pbar.set_postfix(g=group_name[:20], m=stem[:18], refresh=False)
                     pbar.update()
 
                     tmp_name = f'{_TMP}{stem}'
@@ -166,29 +186,25 @@ def buildDB(
                             chunks=True,
                             **data_compress
                         )
-                        tmp.create_dataset(
-                            'B_lm_r',
-                            data=B_lm.real,
-                            chunks=_chunk,
-                            **data_compress
-                        )
-                        tmp.create_dataset(
-                            'B_lm_i',
-                            data=B_lm.imag,
-                            chunks=_chunk,
-                            **data_compress
-                        )
-                        # Verify shapes written cleanly before committing.
+                        # Verify shape written cleanly before committing.
                         iq_ds = tmp['I_q']
-                        br_ds = tmp['B_lm_r']
-                        bi_ds = tmp['B_lm_i']
                         assert isinstance(iq_ds, h5py.Dataset) and iq_ds.shape == (_Q,)
-                        assert isinstance(br_ds, h5py.Dataset) and br_ds.shape == (_LM, _Q)
-                        assert isinstance(bi_ds, h5py.Dataset) and bi_ds.shape == (_LM, _Q)
                         hf.move(f'{group_name}/{tmp_name}',
                                 f'{group_name}/{stem}')
                     except Exception:
                         if tmp_name in hf_group:
                             del hf_group[tmp_name]
                         raise
+
+                    _written += 1
+                    if _written % _LOG_EVERY == 0:
+                        size_gb = os.path.getsize(out_path) / 1e9
+                        kb_per_mol = size_gb * 1e6 / _written
+                        est_gb = kb_per_mol * total / 1e6
+                        tqdm.write(
+                            f"[disk] {_written:,} written | "
+                            f"{size_gb:.2f} GB on disk | "
+                            f"{kb_per_mol:.1f} KB/mol | "
+                            f"est. total {est_gb:.0f} GB"
+                        )
 

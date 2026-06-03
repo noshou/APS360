@@ -57,13 +57,16 @@ class Molecule(StuhrmannMixin):
             raise ValueError("Molecule: x, y, z, and elms must all be the same length and non-empty")
 
         r = np.sqrt(x**2 + y**2 + z**2)
-        if np.any(r == 0):
-            raise ValueError("Molecule: atom at origin (r = 0) not allowed")
-
         coords = np.column_stack((x, y, z))
         # Physics convention: theta = polar colatitude (arccos(z/r), 0→π),
         #                     phi   = azimuthal angle  (arctan2(y,x), 0→2π)
-        angles = np.column_stack((np.arccos(z / r), np.arctan2(y, x)))
+        # r=0 only occurs for single-atom molecules (atom is its own centroid).
+        # j_l(0)=0 for l>0 so the angle is irrelevant; use r_safe to avoid NaN.
+        r_safe = np.where(r > 0, r, 1.0)
+        angles = np.column_stack((
+            np.arccos(np.clip(z / r_safe, -1.0, 1.0)),
+            np.arctan2(y, x),
+        ))
         coords.flags.writeable = False
         angles.flags.writeable = False
         r.flags.writeable      = False
@@ -107,11 +110,21 @@ class Molecule(StuhrmannMixin):
         """
         try:
             with open(xyz_fp) as f:
+                line1 = f.readline()
+                line2 = f.readline()
                 try:
-                    declared = int(f.readline())
+                    # Variant A: atom count first, then name
+                    declared = int(line1)
+                    name = line2.strip()
                 except ValueError:
-                    raise ValueError(f"Molecule.fromXYZ: first line of '{xyz_fp}' must be an integer atom count")
-                name = f.readline().strip()
+                    # Variant B: name first, then atom count (cluster datasets)
+                    try:
+                        declared = int(line2)
+                        name = line1.strip()
+                    except ValueError:
+                        raise ValueError(f"Molecule.fromXYZ: could not find atom count in first two lines of '{xyz_fp}'")
+                if declared == 0:
+                    raise ValueError(f"Molecule.fromXYZ: file '{xyz_fp}' declares 0 atoms")
                 el = []
                 xs, ys, zs = [], [], []
 
@@ -138,6 +151,10 @@ class Molecule(StuhrmannMixin):
         xs = np.array(xs, dtype=np.float64)
         ys = np.array(ys, dtype=np.float64)
         zs = np.array(zs, dtype=np.float64)
+        # Centre at geometric centroid so the Stuhrmann expansion is origin-independent.
+        xs -= xs.mean()
+        ys -= ys.mean()
+        zs -= zs.mean()
         return cls(xs, ys, zs, el, name)
 
     @property

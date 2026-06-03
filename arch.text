@@ -1,0 +1,15 @@
+  batch of n molecules
+          ↓
+  1. embedding: atom type → vector v        (knows: what element am I?)
+          ↓
+  2. message passing (repeat k times):      (learns: what's around me?)
+     each atom looks at neighbors,
+     updates its vector based on what it sees
+          ↓
+  3. per-atom MLP: vector v → B_lm contrib  (predicts: what do I contribute?)
+          ↓
+  4. sum over atoms → B_lm                  (aggregates: molecule total)
+          ↓
+  5. I(q) = 4π Σ|B_lm|²                    
+          ↓
+  6. loss vs stored I(q)

@@ -17,7 +17,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 # q grid in Å⁻¹ (momentum transfer, physics convention: q = 4π sin(θ)/λ)
 ENERGY = 12412.8   # eV (1 Å wavelength, standard SAXS)
-Q_MIN  = 0.02
+Q_MIN  = 0.00
 Q_MAX  = 0.50
 Q_STEP = 0.02
 

@@ -79,13 +79,11 @@ for npz_file in sorted(PREC_DIR.glob("*.npz")):
     xyz   = xyz_file.read_text()
 
     # I(q) figure — transparent bg, themed via CSS/JS at runtime
-    I_pos  = I_q[I_q > 0]
-    y_min  = float(np.floor(np.log10(I_pos.min()))) if len(I_pos) else 0
-    y_max  = float(np.ceil(np.log10(I_pos.max())))  if len(I_pos) else 1
-    q_pos  = qVals[qVals > 0]
-    x_min  = float(np.floor(np.log10(q_pos.min()))) if len(q_pos) else 0
-    x_max  = float(np.ceil(np.log10(q_pos.max())))  if len(q_pos) else 1
-    pad    = 0.05  # log-unit padding so traces don't touch the axis lines
+    # Linear x-axis so q=0 (forward scattering) is included; log y-axis for intensity range.
+    I_pos = I_q[I_q > 0]
+    y_min = float(np.floor(np.log10(I_pos.min()))) if len(I_pos) else 0
+    y_max = float(np.ceil(np.log10(I_pos.max())))  if len(I_pos) else 1
+    pad   = 0.05
     fig_iq = go.Figure()
     fig_iq.add_trace(go.Scatter(
         x=qVals.tolist(), y=I_q.tolist(), mode="lines",
@@ -96,11 +94,10 @@ for npz_file in sorted(PREC_DIR.glob("*.npz")):
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         xaxis=dict(
-            title="𝑞  (Å⁻¹)", type="log",
-            exponentformat="power",
+            title="𝑞  (Å⁻¹)",
             showgrid=False, showline=True, mirror=True,
-            ticks="outside", ticklen=5, minor=dict(ticks=""),
-            range=[x_min - pad, x_max + pad],
+            ticks="outside", ticklen=5,
+            range=[float(qVals.min()), float(qVals.max())],
         ),
         yaxis=dict(
             title="𝐼(𝑞)", type="log",
