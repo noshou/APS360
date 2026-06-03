@@ -151,6 +151,8 @@ class Molecule(StuhrmannMixin):
         xs = np.array(xs, dtype=np.float64)
         ys = np.array(ys, dtype=np.float64)
         zs = np.array(zs, dtype=np.float64)
+        if not (np.isfinite(xs).all() and np.isfinite(ys).all() and np.isfinite(zs).all()):
+            raise ValueError(f"Molecule.fromXYZ: non-finite coordinate (inf or nan) in '{xyz_fp}'")
         # Centre at geometric centroid so the Stuhrmann expansion is origin-independent.
         xs -= xs.mean()
         ys -= ys.mean()

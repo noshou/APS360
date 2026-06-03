@@ -17,12 +17,13 @@ class FormFactors:
     """
     Container for precomputed complex atomic form factors over a q grid.
 
-    The form factor is defined as:
-        f(q, E) = f0(s) + f1(E) - f0(0) + i·f2(E)
+    The form factor convention is:
+        f(q, E) = f0(s) + f'(E) + i·f''(E)
 
-    where s = q / (4π) is the Cromer-Mann scattering variable (sin(θ)/λ in Å⁻¹),
-    q = 4π sin(θ)/λ is the momentum transfer (Å⁻¹), and f1/f2 are the real and
-    imaginary anomalous dispersion corrections (Chantler tabulation).
+    where s = q/(4π) is the Cromer-Mann variable (sin(θ)/λ, Å⁻¹), f0 is the
+    Thomson scattering term (Waasmaier/Cromer-Mann; equals Z at s=0), and f'/f''
+    are the real/imaginary Chantler anomalous corrections (xraydb f1_chantler /
+    f2_chantler, which return the anomalous part only, not Z+f').
 
     Attributes
     ----------
@@ -40,6 +41,12 @@ class FormFactors:
     qvals:  npt.NDArray[np.float64]
     ff:     dict[str, npt.NDArray[np.complex128]]
     energy: float
+
+    # Form factor convention (matches xraydb):
+    #   f(q, E) = f0(s) + f'(E) + i·f''(E)
+    # where s = q/(4π), f0 is the Cromer-Mann/Waasmaier Thomson term (→Z at s=0),
+    # and f'/f'' are the Chantler anomalous corrections (f1_chantler/f2_chantler).
+    # xraydb.f1_chantler returns f'(E) only — NOT Z+f' — so no subtraction of f0(0).
 
     def __post_init__(self) -> None:
         self.qvals.flags.writeable = False
@@ -68,8 +75,8 @@ class FormFactors:
         elem = _bare(ion)
         try:
             valid = chantler_energies(elem, emin=0, emax=1e9)
-        except Exception:
-            raise ValueError(f"No Chantler tabulation found for '{elem}' (from ion '{ion}').")
+        except Exception as exc:
+            raise ValueError(f"No Chantler tabulation found for '{elem}' (from ion '{ion}').") from exc
         if len(valid) == 0:
             raise ValueError(f"No Chantler tabulation found for '{elem}' (from ion '{ion}').")
         emin, emax = min(valid), max(valid)
@@ -87,14 +94,7 @@ class FormFactors:
         skip_anomalous: bool = False,
     ) -> npt.NDArray[np.complex128]:
 
-        """Compute the complex atomic form factor f(q, E) for a given ion.
-
-        The form factor is defined as:
-            f(q, E) = f0(s) + f1(E) - f0(0) + i·f2(E)
-
-        where s = q / (4π) converts from momentum transfer (Å⁻¹) to the
-        Cromer-Mann scattering variable sin(θ)/λ expected by xraydb.f0.
-        f1/f2 are the Chantler anomalous dispersion corrections at energy E.
+        """Compute the complex atomic form factor f(q, E) = f0(s) + f'(E) + i·f''(E).
 
         Parameters
         ----------
@@ -105,33 +105,25 @@ class FormFactors:
         energy : float
             X-ray energy in eV.
         skip_anomalous : bool, optional
-            If ``True``, skip the Chantler f1/f2 corrections and return just
-            ``f0(s)`` as complex128.  Default is ``False``.
+            If ``True``, return just ``f0(s)`` (no anomalous corrections).
 
         Returns
         -------
         ndarray of complex128, shape (N,)
-            Complex form factor evaluated at each q in ``qvals``.
         """
-
-        # f1/f2 (Chantler) require bare element symbols.
-        # f0 (Waasmaier/Cromer-Mann) accepts ionic notation when available and gives
-        # physically different values — use ionic when possible, fall back to bare.
-        # xraydb.f0 uses the Cromer-Mann variable s = sin(θ)/λ = q / (4π)
+        # f0 (Waasmaier/Cromer-Mann) accepts ionic notation; fall back to bare element.
+        # f'/f'' (Chantler) require bare element symbols.
         elem = _bare(ion)
         s    = qvals / (4.0 * np.pi)
         try:
-            f0_     = np.asarray(f0(ion, s),   dtype=np.float64)
-            f0_zero = float(np.asarray(f0(ion, 0.0)).ravel()[0])
+            f0_ = np.asarray(f0(ion,  s), dtype=np.float64)
         except Exception:
-            # ion not in Waasmaier table — fall back to neutral element
-            f0_     = np.asarray(f0(elem, s),   dtype=np.float64)
-            f0_zero = float(np.asarray(f0(elem, 0.0)).ravel()[0])
+            f0_ = np.asarray(f0(elem, s), dtype=np.float64)
         if skip_anomalous:
             return np.asarray(f0_, dtype=np.complex128)
         f1_ = float(np.asarray(f1_chantler(elem, energy)).squeeze())
         f2_ = float(np.asarray(f2_chantler(elem, energy)).squeeze())
-        return np.asarray((f0_ + f1_ - f0_zero) + 1j * f2_, dtype=np.complex128)
+        return np.asarray(f0_ + f1_ + 1j * f2_, dtype=np.complex128)
 
     @classmethod
     @beartype
@@ -196,7 +188,7 @@ class FormFactors:
 
         if qMin < 0 or qMax < 0 or qMin >= qMax or step <= 0 or (qMax - qMin) < step:
             raise ValueError(
-                f"Invalid bounds or step size. Ensure qMin={qMin} and qMax={qMax} are positive, "
+                f"Invalid bounds or step size. Ensure qMin={qMin} >= 0 and qMax={qMax} > 0, "
                 f"qMin < qMax, and step={step} is smaller than or equal to the total range."
             )
 
@@ -230,4 +222,9 @@ class FormFactors:
             with open(log_path, 'w') as _fh:
                 _fh.write('\n'.join(log_lines) + '\n')
 
+        if not ff_dict:
+            raise ValueError(
+                f"All {len(ions)} input ions were classified as dummy sites (no electron density). "
+                "Check that ion symbols are valid element names."
+            )
         return cls(ions=list(ff_dict.keys()), qvals=qvals, ff=ff_dict, energy=energy)

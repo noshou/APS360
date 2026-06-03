@@ -7,83 +7,67 @@ import sys
 import json
 import numpy as np
 from pathlib import Path
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import plotly.graph_objects as go
 import plotly.io as pio
 from scipy.special import sph_harm_y
+from global_vals import *
 
-DEMO_DIR   = Path(__file__).parent
-PREC_DIR   = DEMO_DIR / "precomputed"
-STRUCT_DIR = DEMO_DIR / "demo_structures"
-OUT_HTML   = DEMO_DIR / "index.html"
+def sh_proj(full_coeffs, Y_grid, THETA, PHI):
+    """Reconstruct angular scattering surface r = 1 + Re(Σ B_lm Y_lm) in Cartesian coordinates.
 
-lMax       = 10
-resolution = 40
-
-# Physics convention: theta = polar colatitude (0→π), phi = azimuthal (0→2π)
-theta = np.linspace(0, np.pi,   resolution)
-phi   = np.linspace(0, 2*np.pi, resolution)
-THETA, PHI = np.meshgrid(theta, phi)
-
-
-def sh_proj(lMax, coeffs, THETA, PHI):
-    """Reconstruct angular scattering surface r = 1 + Re(Σ B_lm Y_lm) in Cartesian coordinates."""
-    f = np.zeros(THETA.shape, dtype=np.complex128)
-    k = 0
-    for l in range(lMax + 1):
-        for m in range(-l, l + 1):
-            # scipy sph_harm_y(l, m, theta, phi): theta=polar (0→π), phi=azimuthal (0→2π)
-            f += coeffs[k] * sph_harm_y(l, m, THETA, PHI)
-            k += 1
+    full_coeffs: (K,) complex128, full (l,m) layout, k = l²+l+m.
+    Y_grid:      (K, H, W) complex128, precomputed spherical harmonics on the meshgrid.
+    """
+    f = np.tensordot(full_coeffs, Y_grid, axes=([0], [0]))  # (H, W)
     r = 1.0 + np.real(f)
     x = r * np.sin(THETA) * np.cos(PHI)
     y = r * np.sin(THETA) * np.sin(PHI)
     z = r * np.cos(THETA)
     return x, y, z
 
+# Precompute Y_lm on the fixed meshgrid once for all structures and all q-values.
+K      = (lMax + 1) ** 2
+Y_grid = np.zeros((K, *THETA.shape), dtype=np.complex128)
+for l in range(lMax + 1):
+    for m in range(-l, l + 1):
+        Y_grid[l * l + l + m] = sph_harm_y(l, m, THETA, PHI)
 
-DISPLAY_NAMES = {
-    "Aerolysin":      "Aerolysin",
-    "C60BuckyBallHe": "He@C<sub>60</sub>",
-    "CoiledCoil":     "Coiled-Coil",
-    "Elf2Nucleosome": "ElF2-Nucleosome Complex",
-    "PhiTEBaseplate": "φTE Bacteriophage Baseplate",
-    "RhccCarborane":  "RHCC complexed with <i>o</i>-Carborane",
-    "Stripak":        "STRIPAK Complex",
-    "VATPaseLiRotor": "Li<sup>+</sup>-bound V-ATPase",
-}
+# Build a (K,) index array mapping full k -> reduced k and sign for negative m.
+_full_to_reduced = np.zeros(K, dtype=int)
+_full_sign       = np.ones(K, dtype=int)
+for l in range(lMax + 1):
+    for m in range(-l, l + 1):
+        k_full = l * l + l + m
+        abs_m  = abs(m)
+        _full_to_reduced[k_full] = l * (l + 1) // 2 + abs_m
+        if m < 0:
+            _full_sign[k_full] = (-1) ** abs_m
 
-CITATIONS = {
-    "Aerolysin":      ("https://doi.org/10.2210/pdb5JZT/pdb",           "PDB 5JZT"),
-    "C60BuckyBallHe": ("https://doi.org/10.1038/ncomms2574",             "Bloodworth et al., Nat. Commun. 5, 3442 (2014)"),
-    "CoiledCoil":     ("https://doi.org/10.2210/pdb8P4Y/pdb",           "PDB 8P4Y"),
-    "Elf2Nucleosome": ("https://doi.org/10.2210/pdb9igj/pdb",           "PDB 9IGJ"),
-    "PhiTEBaseplate": ("https://doi.org/10.2210/pdb9CUY/pdb",           "PDB 9CUY"),
-    "RhccCarborane":  ("https://www.wwpdb.org/pdb?id=pdb_00007r6h",     "PDB 7R6H"),
-    "Stripak":        ("https://doi.org/10.2210/pdb7k36/pdb",           "PDB 7K36"),
-    "VATPaseLiRotor": ("https://doi.org/10.2210/pdb2CYD/pdb",           "PDB 2CYD"),
-}
+def expand_coeffs(B_lm_q):
+    """Expand reduced m≥0 coeffs to full (l,m) layout, returning (K,) complex array."""
+    full = B_lm_q[_full_to_reduced].copy()
+    neg_mask = _full_sign < 0
+    full[neg_mask] = _full_sign[neg_mask] * np.conj(full[neg_mask])
+    return full
 
 structures = []
 
 for npz_file in sorted(PREC_DIR.glob("*.npz")):
     name     = npz_file.stem
     xyz_file = STRUCT_DIR / f"{name}.xyz"
+    if not xyz_file.exists():
+        print(f"skipped (no .xyz)")
+        continue
     print(f"Building {name}...", end=" ", flush=True)
 
     data  = np.load(npz_file)
     I_q   = data["I_q"]
     B_lm  = data["B_lm_re"] + 1j * data["B_lm_im"]
     qVals = data["qvals"]
-    xyz   = xyz_file.read_text()
+    xyz   = xyz_file.read_text(encoding="utf-8")
 
     # I(q) figure — transparent bg, themed via CSS/JS at runtime
-    # Linear x-axis so q=0 (forward scattering) is included; log y-axis for intensity range.
-    I_pos = I_q[I_q > 0]
-    y_min = float(np.floor(np.log10(I_pos.min()))) if len(I_pos) else 0
-    y_max = float(np.ceil(np.log10(I_pos.max())))  if len(I_pos) else 1
-    pad   = 0.05
     fig_iq = go.Figure()
     fig_iq.add_trace(go.Scatter(
         x=qVals.tolist(), y=I_q.tolist(), mode="lines",
@@ -104,10 +88,9 @@ for npz_file in sorted(PREC_DIR.glob("*.npz")):
             exponentformat="power",
             showgrid=False, showline=True, mirror=True,
             ticks="outside", ticklen=5, minor=dict(ticks=""),
-            range=[y_min - pad, y_max + pad],
         ),
-        margin=dict(l=60, r=20, t=40, b=50),
-        height=320,
+        margin=dict(l=60, r=20, t=30, b=40),
+        height=250,
     )
 
     # B_lm frames — normalize to unit amplitude; track true max range across all frames
@@ -120,7 +103,7 @@ for npz_file in sorted(PREC_DIR.glob("*.npz")):
         scale  = np.abs(coeffs).max()
         if scale > 0:
             coeffs = coeffs / scale
-        x, y, z = sh_proj(lMax, coeffs, THETA, PHI)
+        x, y, z = sh_proj(expand_coeffs(coeffs), Y_grid, THETA, PHI)
         max_r = max(max_r, float(np.abs(x).max()), float(np.abs(y).max()), float(np.abs(z).max()))
         all_xyz.append((x, y, z))
 
@@ -139,7 +122,7 @@ for npz_file in sorted(PREC_DIR.glob("*.npz")):
     scale0  = np.abs(coeffs0).max()
     if scale0 > 0:
         coeffs0 = coeffs0 / scale0
-    x0, y0, z0 = sh_proj(lMax, coeffs0, THETA, PHI)
+    x0, y0, z0 = sh_proj(expand_coeffs(coeffs0), Y_grid, THETA, PHI)
 
     fig_blm = go.Figure(
         data=[go.Surface(
@@ -151,10 +134,10 @@ for npz_file in sorted(PREC_DIR.glob("*.npz")):
     )
     fig_blm.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
-        height=560,
-        margin=dict(l=0, r=0, t=10, b=0),
+        height=520,
+        margin=dict(l=0, r=0, t=6, b=55),
         scene=dict(
-            domain=dict(x=[0, 1], y=[0.18, 1]),
+            domain=dict(x=[0, 1], y=[0.24, 1]),
             aspectmode="cube",
             camera=dict(eye=dict(x=1.05, y=1.05, z=1.05)),
             xaxis=dict(title="x", showgrid=True, showticklabels=True, zeroline=False, range=[-ax_lim, ax_lim]),
@@ -170,11 +153,17 @@ for npz_file in sorted(PREC_DIR.glob("*.npz")):
                 for i, q in enumerate(qVals)
             ],
             "currentvalue": {"prefix": "q = ", "suffix": " Å⁻¹"},
+            "y": 0, "pad": {"t": 8, "b": 8},
         }],
     )
 
-    fig_iq_dict  = json.loads(pio.to_json(fig_iq))
-    fig_blm_dict = json.loads(pio.to_json(fig_blm))
+    data_dir = OUTPUT_DIR / "data"
+    data_dir.mkdir(exist_ok=True)
+    payload = {
+        "iq":  json.loads(str(pio.to_json(fig_iq))),
+        "blm": json.loads(str(pio.to_json(fig_blm))),
+    }
+    (data_dir / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
 
     citation_url, citation_label = CITATIONS.get(name, ("#", name))
     structures.append({
@@ -182,9 +171,8 @@ for npz_file in sorted(PREC_DIR.glob("*.npz")):
         "display_name":  DISPLAY_NAMES.get(name, name),
         "citation_url":  citation_url,
         "citation_label": citation_label,
-        "xyz":  xyz,
-        "iq":   fig_iq_dict,
-        "blm":  fig_blm_dict,
+        "xyz":      xyz,
+        "data_url": f"precomputed/data/{name}.json",
     })
     print("done")
 
@@ -231,37 +219,44 @@ html = f"""<!DOCTYPE html>
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 body {{ font-family: sans-serif; background: var(--bg); color: var(--text); transition: background 0.2s, color 0.2s; }}
 
-.header {{ display: flex; align-items: center; justify-content: space-between; padding: 16px 24px 10px; }}
-h1 {{ font-size: 1.4em; color: var(--h1-color); letter-spacing: 0.05em; }}
+.header {{ display: flex; align-items: center; justify-content: space-between; padding: 10px 20px 6px; }}
+h1 {{ font-size: 1.2em; color: var(--h1-color); letter-spacing: 0.05em; }}
 .theme-btn {{
-    padding: 6px 14px; cursor: pointer; border: 1px solid var(--border);
+    padding: 4px 12px; cursor: pointer; border: 1px solid var(--border);
     background: var(--tab-bg); color: var(--text); border-radius: 20px;
-    font-size: 0.82em; transition: background 0.15s;
+    font-size: 0.78em; transition: background 0.15s;
 }}
 .theme-btn:hover {{ background: var(--tab-hover); }}
 
-.tabs {{ display: flex; flex-wrap: wrap; gap: 6px; padding: 0 20px; border-bottom: 2px solid var(--border); }}
+.tabs {{ display: flex; flex-wrap: wrap; gap: 4px; padding: 0 16px; border-bottom: 2px solid var(--border); }}
 .tab-btn {{
-    padding: 8px 14px; cursor: pointer; border: 1px solid var(--border);
+    padding: 5px 11px; cursor: pointer; border: 1px solid var(--border);
     background: var(--tab-bg); color: var(--text-dim); border-radius: 4px 4px 0 0;
-    font-size: 0.82em; transition: background 0.15s;
+    font-size: 0.78em; transition: background 0.15s;
 }}
 .tab-btn:hover {{ background: var(--tab-hover); color: var(--text); }}
 .tab-btn.active {{ background: var(--tab-active); color: white; border-color: var(--tab-active); }}
 
-.tab-panel {{ display: none; padding: 20px; }}
+.tab-panel {{ display: none; padding: 10px 16px; }}
 .tab-panel.active {{ display: block; }}
 
-.panel-layout {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }}
-.left-col {{ display: flex; flex-direction: column; gap: 12px; }}
-.mol-viewer {{ width: 100%; aspect-ratio: 1 / 1; border: 1px solid var(--border); border-radius: 6px; position: relative; background: var(--mol-bg); }}
-.iq-plot  {{ height: 320px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--paper); }}
-.blm-plot {{ height: 560px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--paper); }}
+.panel-layout {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: auto clamp(380px, 54vh, 600px) clamp(180px, 24vh, 280px) auto;
+    column-gap: 12px;
+    row-gap: 8px;
+}}
+.blm-caption {{ grid-column: 1; grid-row: 1; }}
+.blm-plot    {{ grid-column: 1; grid-row: 2; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--paper); }}
+.iq-plot     {{ grid-column: 1; grid-row: 3; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--paper); }}
+.citation    {{ grid-column: 1; grid-row: 4; }}
+.mol-viewer  {{ grid-column: 2; grid-row: 2 / 4; width: 100%; border: 1px solid var(--border); border-radius: 6px; position: relative; background: var(--mol-bg); }}
 .blm-caption {{
     font-family: "STIX Two Math", Georgia, serif;
-    font-size: 0.85em;
+    font-size: 0.78em;
     color: var(--text-dim);
-    padding: 6px 10px 4px;
+    padding: 4px 8px 3px;
     background: var(--paper);
     border: 1px solid var(--border);
     border-radius: 6px 6px 0 0;
@@ -270,19 +265,19 @@ h1 {{ font-size: 1.4em; color: var(--h1-color); letter-spacing: 0.05em; }}
 }}
 
 details.math-section {{
-    margin: 4px 20px 16px;
-    padding: 12px 18px;
+    margin: 2px 16px 8px;
+    padding: 8px 14px;
     background: var(--paper);
     border: 1px solid var(--border);
     border-radius: 6px;
-    font-size: 0.88em;
-    line-height: 1.9;
+    font-size: 0.82em;
+    line-height: 1.8;
 }}
 details.math-section summary {{
     cursor: pointer;
     font-weight: 600;
     color: var(--accent);
-    margin-bottom: 6px;
+    margin-bottom: 4px;
     user-select: none;
 }}
 .math-block {{
@@ -291,10 +286,10 @@ details.math-section summary {{
     color: var(--text);
     white-space: pre;
 }}
-.math-desc {{ color: var(--text-dim); margin: 2px 0 2px 18px; font-size: 0.93em; }}
+.math-desc {{ color: var(--text-dim); margin: 2px 0 2px 18px; font-size: 0.91em; }}
 .citation {{
-    margin-top: 14px;
-    font-size: 0.92em;
+    margin-top: 6px;
+    font-size: 0.85em;
     color: var(--text);
     font-weight: 500;
 }}
@@ -309,19 +304,19 @@ details.math-section summary {{
 </div>
 
 <details class="math-section">
-<summary>Mathematical Background — Stuhrmann Decomposition</summary>
-<p>The scattering intensity is expressed as a sum over spherical harmonic channels:</p>
-<div class="math-block">I(q) = (4π)² · Σ_{{l,m}} |B_lm(q)|²</div>
+<summary>Mathematical Background: Stuhrmann Decomposition</summary>
+<p>The scattering intensity is expressed as a sum over spherical harmonic channels (truncated at l = 50, giving 2601 modes):</p>
+<div class="math-block">I(q) = 4π · Σ_{{l=0}}^{{50}} Σ_{{m=-l}}^{{l}} |B_lm(q)|²</div>
 <p>where the coefficients B_lm(q) are computed by projecting atomic scattering onto the spherical harmonic basis:</p>
 <div class="math-block">B_lm(q) = Σ_i  f_i(q) · j_l(q·rᵢ) · Y*_lm(θᵢ, φᵢ)</div>
-<div class="math-desc">f_i(q) — complex atomic form factor (f₀ + f₁ + i·f₂) at momentum transfer q</div>
-<div class="math-desc">j_l     — spherical Bessel function of order l; encodes radial shell information</div>
-<div class="math-desc">Y_lm    — complex spherical harmonic; * denotes conjugate (analysis projection)</div>
-<div class="math-desc">rᵢ, θᵢ, φᵢ — spherical coordinates of atom i relative to the molecular centroid</div>
-<p style="margin-top:8px">The 3D surface visualisation reconstructs the angular scattering envelope:</p>
-<div class="math-block">r(θ,φ) = 1 + Re( Σ_{{l,m}} B_lm · Y_lm(θ,φ) ) · √I(q) / max|B_lm|</div>
-<div class="math-desc">Deformations from a unit sphere indicate anisotropic scattering at that q.  Amplitude is scaled by √I(q) so the overall size reflects total signal strength.</div>
-<p style="margin-top:8px">Complexity: O(N · L²) vs O(N²) for the Debye sum — orders of magnitude faster for large molecules.</p>
+<div class="math-desc">f_i(q): complex atomic form factor (f₀ + f₁ + i·f₂) at momentum transfer q</div>
+<div class="math-desc">j_l: spherical Bessel function of order l; encodes radial shell information</div>
+<div class="math-desc">Y_lm: complex spherical harmonic; * denotes conjugate (analysis projection)</div>
+<div class="math-desc">rᵢ, θᵢ, φᵢ: spherical coordinates of atom i relative to the molecular centroid</div>
+<p style="margin-top:8px">The 3D surface visualises the angular scattering envelope:</p>
+<div class="math-block">r(θ,φ) = 1 + Re( Σ_{{l,m}} B_lm(q) · Y_lm(θ,φ) ) / max|B_lm(q)|</div>
+<div class="math-desc">Deformations from a unit sphere indicate anisotropic scattering at that q. Coefficients are normalised to unit amplitude so the shape reflects anisotropy, not absolute intensity.</div>
+<p style="margin-top:8px">Complexity: O(N · L²) vs O(N²) for the Debye sum, orders of magnitude faster for large molecules.</p>
 </details>
 
 <div class="tabs" id="tabs"></div>
@@ -364,12 +359,10 @@ structures.forEach((s, i) => {{
     panel.className = 'tab-panel' + (i === 0 ? ' active' : '');
     panel.innerHTML = `
         <div class="panel-layout">
-            <div class="left-col">
-                <div class="blm-caption">𝑟(θ,φ) = 1 + Re(Σ<sub>lm</sub> 𝐵<sub>lm</sub>(𝑞) · 𝑌<sub>lm</sub>(θ,φ)) · √𝐼(𝑞) / max|𝐵<sub>lm</sub>| &nbsp;—&nbsp; deformation from unit sphere shows anisotropy; size scales with √𝐼(𝑞)</div>
-                <div id="blm-${{i}}" class="blm-plot"></div>
-                <div id="iq-${{i}}" class="iq-plot"></div>
-                <div class="citation">Source: <a href="${{s.citation_url}}" target="_blank" rel="noopener">${{s.citation_label}}</a></div>
-            </div>
+            <div class="blm-caption">𝑟(θ,φ) = 1 + Re(Σ<sub>lm</sub> 𝐵<sub>lm</sub>(𝑞) · 𝑌<sub>lm</sub>(θ,φ)) / max|𝐵<sub>lm</sub>|</div>
+            <div id="blm-${{i}}" class="blm-plot"></div>
+            <div id="iq-${{i}}" class="iq-plot"></div>
+            <div class="citation">Source: <a href="${{s.citation_url}}" target="_blank" rel="noopener">${{s.citation_label}}</a></div>
             <div id="mol-${{i}}" class="mol-viewer"></div>
         </div>
     `;
@@ -390,7 +383,7 @@ function initTab(i) {{
     const s = structures[i];
     const t = themes[currentTheme];
 
-    // molecule viewer
+    // molecule viewer — XYZ is small, inline
     viewers[i] = $3Dmol.createViewer(document.getElementById('mol-' + i), {{
         backgroundColor: t.molBg
     }});
@@ -399,42 +392,50 @@ function initTab(i) {{
     viewers[i].zoomTo();
     viewers[i].render();
 
-    // I(q) plot
-    const iqLayout = Object.assign({{}}, s.iq.layout, {{
-        'font.color': t.text,
-        'xaxis.linecolor': t.text, 'yaxis.linecolor': t.text,
-        'xaxis.color':     t.text, 'yaxis.color':     t.text,
-        'xaxis.tickcolor': t.text, 'yaxis.tickcolor': t.text,
-    }});
-    const iqPromise = Plotly.newPlot('iq-' + i, s.iq.data, iqLayout, {{responsive: true, displayModeBar: false}});
+    // Plotly data is fetched on first tab open
+    fetch(s.data_url)
+        .then(r => r.json())
+        .then(d => {{
+            const iqLayout = Object.assign({{}}, d.iq.layout, {{
+                'font.color': t.text,
+                'xaxis.linecolor': t.text, 'yaxis.linecolor': t.text,
+                'xaxis.color':     t.text, 'yaxis.color':     t.text,
+                'xaxis.tickcolor': t.text, 'yaxis.tickcolor': t.text,
+            }});
+            const iqPromise = Plotly.newPlot('iq-' + i, d.iq.data, iqLayout, {{responsive: true, displayModeBar: false}});
 
-    // B_lm plot with slider
-    const blmLayout = Object.assign({{}}, s.blm.layout, {{
-        'font.color': t.text,
-        'scene.bgcolor': t.sceneBg,
-        'scene.xaxis.gridcolor': t.grid,
-        'scene.yaxis.gridcolor': t.grid,
-        'scene.zaxis.gridcolor': t.grid,
-        'scene.xaxis.color': t.text,
-        'scene.yaxis.color': t.text,
-        'scene.zaxis.color': t.text,
-    }});
-    const blmDiv = document.getElementById('blm-' + i);
-    const blmPromise = Plotly.newPlot(blmDiv, s.blm.data, blmLayout, {{responsive: true, displayModeBar: false}})
-        .then(() => Plotly.addFrames(blmDiv, s.blm.frames));
+            const blmLayout = Object.assign({{}}, d.blm.layout, {{
+                'font.color': t.text,
+                'scene.bgcolor': t.sceneBg,
+                'scene.xaxis.gridcolor': t.grid,
+                'scene.yaxis.gridcolor': t.grid,
+                'scene.zaxis.gridcolor': t.grid,
+                'scene.xaxis.color': t.text,
+                'scene.yaxis.color': t.text,
+                'scene.zaxis.color': t.text,
+            }});
+            const blmDiv = document.getElementById('blm-' + i);
+            const blmPromise = Plotly.newPlot(blmDiv, d.blm.data, blmLayout, {{responsive: true, displayModeBar: false}})
+                .then(() => Plotly.addFrames(blmDiv, d.blm.frames));
 
-    Promise.all([iqPromise, blmPromise]).then(() => {{
-        const q0 = s.iq.data[0].x[0];
-        cursorQ[i] = q0;
-        setIqCursor(i, q0);
-    }});
+            // store d so theme toggle and slider can reference it
+            structures[i]._d = d;
 
-    blmDiv.on('plotly_sliderchange', function(e) {{
-        const idx = parseInt(e.step.args[0][0]);
-        const q   = s.iq.data[0].x[idx];
-        cursorQ[i] = q;
-        setIqCursor(i, q);
-    }});
+            Promise.all([iqPromise, blmPromise]).then(() => {{
+                Plotly.Plots.resize(document.getElementById('iq-'  + i));
+                Plotly.Plots.resize(document.getElementById('blm-' + i));
+                const q0 = d.iq.data[0].x[0];
+                cursorQ[i] = q0;
+                setIqCursor(i, q0);
+            }});
+
+            blmDiv.on('plotly_sliderchange', function(e) {{
+                const idx = parseInt(e.step.args[0][0]);
+                const q   = d.iq.data[0].x[idx];
+                cursorQ[i] = q;
+                setIqCursor(i, q);
+            }});
+        }});
 }}
 
 function setIqCursor(tabIdx, q) {{
@@ -457,6 +458,7 @@ function toggleTheme() {{
 
     const t = themes[currentTheme];
     initialized.forEach(i => {{
+        if (!structures[i]._d) return;  // still loading
         Plotly.relayout('iq-' + i, {{
             'font.color':      t.text,
             'xaxis.linecolor': t.text, 'yaxis.linecolor': t.text,

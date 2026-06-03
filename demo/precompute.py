@@ -7,21 +7,13 @@ import sys
 import time
 import numpy as np
 from pathlib import Path
-
+from global_vals import *
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from Scattering import Molecule, FormFactors
+from global_vals import *
 
-STRUCT_DIR = Path(__file__).parent / "demo_structures"
-OUTPUT_DIR = Path(__file__).parent / "precomputed"
+
 OUTPUT_DIR.mkdir(exist_ok=True)
-
-# q grid in Å⁻¹ (momentum transfer, physics convention: q = 4π sin(θ)/λ)
-ENERGY = 12412.8   # eV (1 Å wavelength, standard SAXS)
-Q_MIN  = 0.00
-Q_MAX  = 0.50
-Q_STEP = 0.02
-
-lMax = 25
 
 for xyz in sorted(STRUCT_DIR.glob("*.xyz")):
     print(f"Processing {xyz.stem} ...", end=" ", flush=True)

@@ -66,9 +66,10 @@ def buildDB(
     lMax: int,
     out_path: str,
     sources_tsv: str | None = None,
+    makeup_tsv: str | None  = None,
     workers: int | None     = None,
     ) -> None:
-    
+
     """
     Compute Stuhrmann decompositions for all XYZ files and write to an HDF5 database.
 
@@ -84,6 +85,7 @@ def buildDB(
         /attrs:          lMax (int), energy (float)
         /q_grid:         float64 (Q,)  — momentum transfer grid in Å⁻¹
         /sources_tsv:    uint8 raw bytes of sources_tsv, if provided
+        /makeup_tsv:     uint8 raw bytes of makeup_tsv, if provided
         /<group>/<stem>/I_q:   float32 (Q,) — orientationally-averaged scattering intensity
 
     All datasets are compressed with ZFP lossless compression.
@@ -94,6 +96,7 @@ def buildDB(
         lMax:        Maximum spherical harmonic degree. Runtime scales as O((lMax+1)²) per molecule.
         out_path:    Output path for the HDF5 file.
         sources_tsv: Optional path to a provenance TSV to embed verbatim in the database.
+        makeup_tsv:  Optional path to the ion makeup TSV to embed verbatim in the database.
         workers:     Number of worker processes. Defaults to os.cpu_count().
     """
     
@@ -101,7 +104,7 @@ def buildDB(
     data_compress = hdf5plugin.Zfp(reversible=True)               # type: ignore[attr-defined]
     meta_compress = hdf5plugin.Bitshuffle(cname='zstd', clevel=22) # type: ignore[attr-defined]
 
-    with h5py.File(out_path, 'a') as hf:
+    with h5py.File(out_path, 'a', libver='latest') as hf:
 
         hf.attrs['lMax']   = lMax
         hf.attrs['energy'] = ff.energy
@@ -118,6 +121,15 @@ def buildDB(
             with open(sources_tsv, 'rb') as f:
                 hf.create_dataset(
                     'sources_tsv',
+                    data=np.frombuffer(f.read(), dtype=np.uint8),
+                    chunks=True,
+                    **meta_compress
+                    )
+
+        if makeup_tsv is not None and 'makeup_tsv' not in hf:
+            with open(makeup_tsv, 'rb') as f:
+                hf.create_dataset(
+                    'makeup_tsv',
                     data=np.frombuffer(f.read(), dtype=np.uint8),
                     chunks=True,
                     **meta_compress
@@ -198,6 +210,7 @@ def buildDB(
 
                     _written += 1
                     if _written % _LOG_EVERY == 0:
+                        hf.flush()
                         size_gb = os.path.getsize(out_path) / 1e9
                         kb_per_mol = size_gb * 1e6 / _written
                         est_gb = kb_per_mol * total / 1e6
