@@ -213,3 +213,42 @@ class Molecule(StuhrmannMixin):
     def size(self) -> int:
         """Number of atoms in the molecule. Read-only."""
         return len(self._elms)
+
+    def toHDF5(self, group: object) -> None:
+        """Serialize structural data into an open h5py Group.
+
+        Writes: coords (float64, (n,3)), angles (float64, (n,2)), r (float64, (n,))
+        all ZFP lossless; elms (str, (n,)) uncompressed; name as a group attribute.
+        I(q) is not stored here.
+        """
+        import h5py       # lazy — keeps Scattering independent of storage deps
+        import hdf5plugin # type: ignore[import]
+        _zfp = hdf5plugin.Zfp(reversible=True)  # type: ignore[attr-defined]
+        group.attrs['name'] = self._name                                        # type: ignore[union-attr]
+        group.create_dataset('coords', data=self._coords, chunks=True, **_zfp)  # type: ignore[union-attr]
+        group.create_dataset('angles', data=self._angles, chunks=True, **_zfp)  # type: ignore[union-attr]
+        group.create_dataset('r',      data=self._r,      chunks=True, **_zfp)  # type: ignore[union-attr]
+        group.create_dataset('elms',   data=np.array(self._elms, dtype=h5py.string_dtype()))  # type: ignore[union-attr]
+
+    @classmethod
+    def fromHDF5(cls, group: object) -> 'Molecule':
+        """Reconstruct a Molecule from an h5py Group written by toHDF5.
+
+        Loads coords, angles, and r directly from the file rather than recomputing.
+        """
+        coords = group['coords'][:]                                             # type: ignore[index]
+        angles = group['angles'][:]                                             # type: ignore[index]
+        r      = group['r'][:]                                                  # type: ignore[index]
+        elms   = [e.decode() if isinstance(e, bytes) else e
+                  for e in group['elms'][:]]                                   # type: ignore[index]
+        name   = str(group.attrs['name'])                                       # type: ignore[union-attr]
+        mol = cls.__new__(cls)
+        coords.flags.writeable = False
+        angles.flags.writeable = False
+        r.flags.writeable      = False
+        object.__setattr__(mol, '_coords', coords)
+        object.__setattr__(mol, '_angles', angles)
+        object.__setattr__(mol, '_r',      r)
+        object.__setattr__(mol, '_elms',   elms)
+        object.__setattr__(mol, '_name',   name)
+        return mol

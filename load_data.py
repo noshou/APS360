@@ -1,10 +1,9 @@
 import numpy as np
-import numpy.typing as npt
 import pandas as pd
 import h5py, os
 import hdf5plugin  # pip install hdf5plugin
 from beartype import beartype
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from itertools import islice
 import sys
 from tqdm import tqdm
@@ -20,14 +19,14 @@ def _worker_init(ff: FormFactors, lMax: int) -> None:
     _ff   = ff
     _lMax = lMax
 
-def _process_mol(xyz_path: str) -> tuple[str, npt.NDArray[np.float64]] | None:
+def _process_mol(xyz_path: str) -> tuple[str, np.ndarray, Molecule] | None:
     assert _ff is not None and _lMax is not None
     try:
         mol = Molecule.fromXYZ(xyz_path)
         I_q, _ = mol.stuhrmann(_ff, _lMax)
-    except ValueError:
+    except Exception:
         return None
-    return os.path.basename(xyz_path)[:-4], I_q
+    return os.path.basename(xyz_path)[:-4], I_q, mol
 
 @beartype
 def loadFormFact(
@@ -76,19 +75,25 @@ def buildDB(
     Molecule computation is parallelized across `workers` processes; HDF5 writes
     are serialized on the main process (h5py is not concurrency-safe for writes).
 
-    Only I(q) is stored per molecule. B_lm coefficients are computed internally
-    by the Stuhrmann decomposition but discarded — the NN predicts I(q) directly,
-    using B_lm as a physics-structured intermediate learned during training, not
-    as a supervised target.
+    B_lm coefficients are computed internally by the Stuhrmann decomposition but
+    discarded — the NN predicts I(q) directly, using B_lm as a physics-structured
+    intermediate learned during training, not as a supervised target.
 
     HDF5 layout:
-        /attrs:          lMax (int), energy (float)
-        /q_grid:         float64 (Q,)  — momentum transfer grid in Å⁻¹
-        /sources_tsv:    uint8 raw bytes of sources_tsv, if provided
-        /makeup_tsv:     uint8 raw bytes of makeup_tsv, if provided
-        /<group>/<stem>/I_q:   float32 (Q,) — orientationally-averaged scattering intensity
+        /attrs:                      lMax (int), energy (float)
+        /q_grid:                     float64 (Q,)   — momentum transfer grid in Å⁻¹
+        /sources_tsv:                uint8   (N,)   — raw bytes of sources_tsv, if provided
+        /makeup_tsv:                 uint8   (M,)   — raw bytes of makeup_tsv, if provided
+        /<group>/<stem>.attrs[name]: str            — molecule name from XYZ header
+        /<group>/<stem>/I_q:         float32 (Q,)   — orientationally-averaged scattering intensity
+        /<group>/<stem>/coords:      float64 (n, 3) — centroid-subtracted Cartesian coordinates in Å
+        /<group>/<stem>/angles:      float64 (n, 2) — spherical angles: col 0 = theta (0→π), col 1 = phi (0→2π)
+        /<group>/<stem>/r:           float64 (n,)   — radial distances from centroid in Å
+        /<group>/<stem>/elms:        str     (n,)   — element symbol per atom (variable-length UTF-8)
 
-    All datasets are compressed with ZFP lossless compression.
+    All floating-point datasets are compressed with ZFP lossless compression; the
+    uint8 TSV blobs use Bitshuffle+Zstd (ZFP is float-only). `elms` is stored
+    uncompressed as a variable-length string dataset.
 
     Args:
         groups:      Dict mapping group name to directory of .xyz files.
@@ -99,9 +104,9 @@ def buildDB(
         makeup_tsv:  Optional path to the ion makeup TSV to embed verbatim in the database.
         workers:     Number of worker processes. Defaults to os.cpu_count().
     """
-    
+
     # ZFP lossless for floating-point data; bitshuffle+Zstd for metadata (uint8 not ZFP-compatible).
-    data_compress = hdf5plugin.Zfp(reversible=True)               # type: ignore[attr-defined]
+    data_compress = hdf5plugin.Zfp(reversible=True)                # type: ignore[attr-defined]
     meta_compress = hdf5plugin.Bitshuffle(cname='zstd', clevel=22) # type: ignore[attr-defined]
 
     with h5py.File(out_path, 'a', libver='latest') as hf:
@@ -110,12 +115,7 @@ def buildDB(
         hf.attrs['energy'] = ff.energy
 
         if 'q_grid' not in hf:
-            hf.create_dataset(
-                'q_grid',
-                data=ff.qvals,
-                chunks=True,
-                **data_compress
-                )
+            hf.create_dataset('q_grid', data=ff.qvals, chunks=True, **data_compress)
 
         if sources_tsv is not None and 'sources_tsv' not in hf:
             with open(sources_tsv, 'rb') as f:
@@ -141,16 +141,16 @@ def buildDB(
         }
         total = sum(len(v) for v in all_xyz.values())
 
-        _TMP      = '__tmp__'
-        _Q        = len(ff.qvals)
-        _written  = 0
+        _TMP       = '__tmp__'
+        _Q         = len(ff.qvals)
+        _written   = 0
         _LOG_EVERY = 10_000
 
         _n_workers = workers or os.cpu_count() or 1
         _inflight  = _n_workers * 4
 
         with ProcessPoolExecutor(
-            max_workers=workers,
+            max_workers=_n_workers,
             initializer=_worker_init,
             initargs=(ff, lMax),
         ) as pool, tqdm(
@@ -167,7 +167,7 @@ def buildDB(
 
                 already_done = set(hf_group.keys())
                 pending = [p for p in xyz_paths
-                           if os.path.basename(p)[:-4] not in already_done]
+                            if os.path.basename(p)[:-4] not in already_done]
                 pbar.update(len(xyz_paths) - len(pending))
 
                 # Sliding window: keep at most _inflight tasks queued at once
@@ -176,48 +176,57 @@ def buildDB(
                 futures = {pool.submit(_process_mol, p): p for p in islice(it, _inflight)}
 
                 while futures:
-                    fut = next(as_completed(futures))
-                    del futures[fut]
-                    nxt = next(it, None)
-                    if nxt is not None:
-                        futures[pool.submit(_process_mol, nxt)] = nxt
-                    result = fut.result()
-                    if result is None:
+                    # Block until at least one future finishes, then drain ALL
+                    # currently-finished futures before refilling. Using wait()
+                    # with FIRST_COMPLETED avoids rebuilding the waiter set on
+                    # every single completion (the O(n²) trap of repeatedly
+                    # calling next(as_completed(futures))).
+                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
+
+                    for fut in done:
+                        del futures[fut]
+                        nxt = next(it, None)
+                        if nxt is not None:
+                            futures[pool.submit(_process_mol, nxt)] = nxt
+
+                        result = fut.result()
+                        if result is None:
+                            pbar.update()
+                            continue
+                        stem, I_q, mol = result
+                        pbar.set_postfix(g=group_name[:20], m=stem[:18], refresh=False)
                         pbar.update()
-                        continue
-                    stem, I_q = result
-                    pbar.set_postfix(g=group_name[:20], m=stem[:18], refresh=False)
-                    pbar.update()
 
-                    tmp_name = f'{_TMP}{stem}'
-                    try:
-                        tmp = hf_group.create_group(tmp_name)
-                        tmp.create_dataset(
-                            'I_q',
-                            data=I_q,
-                            chunks=True,
-                            **data_compress
-                        )
-                        # Verify shape written cleanly before committing.
-                        iq_ds = tmp['I_q']
-                        assert isinstance(iq_ds, h5py.Dataset) and iq_ds.shape == (_Q,)
-                        hf.move(f'{group_name}/{tmp_name}',
-                                f'{group_name}/{stem}')
-                    except Exception:
-                        if tmp_name in hf_group:
-                            del hf_group[tmp_name]
-                        raise
+                        tmp_name = f'{_TMP}{stem}'
+                        try:
+                            tmp = hf_group.create_group(tmp_name)
+                            tmp.create_dataset('I_q', data=I_q, chunks=True, **data_compress)
+                            mol.toHDF5(tmp)
+                            # Verify shapes written cleanly before committing.
+                            iq_ds     = tmp['I_q']
+                            coords_ds = tmp['coords']
+                            angles_ds = tmp['angles']
+                            r_ds      = tmp['r']
+                            _n        = coords_ds.shape[0]  # type: ignore[union-attr]
+                            assert (isinstance(iq_ds,     h5py.Dataset) and iq_ds.shape     == (_Q,)
+                                and isinstance(coords_ds, h5py.Dataset) and coords_ds.shape == (_n, 3)  # type: ignore[union-attr]
+                                and isinstance(angles_ds, h5py.Dataset) and angles_ds.shape == (_n, 2)  # type: ignore[union-attr]
+                                and isinstance(r_ds,      h5py.Dataset) and r_ds.shape      == (_n,))   # type: ignore[union-attr]
+                            hf.move(f'{group_name}/{tmp_name}', f'{group_name}/{stem}')
+                        except Exception:
+                            if tmp_name in hf_group:
+                                del hf_group[tmp_name]
+                            raise
 
-                    _written += 1
-                    if _written % _LOG_EVERY == 0:
-                        hf.flush()
-                        size_gb = os.path.getsize(out_path) / 1e9
-                        kb_per_mol = size_gb * 1e6 / _written
-                        est_gb = kb_per_mol * total / 1e6
-                        tqdm.write(
-                            f"[disk] {_written:,} written | "
-                            f"{size_gb:.2f} GB on disk | "
-                            f"{kb_per_mol:.1f} KB/mol | "
-                            f"est. total {est_gb:.0f} GB"
-                        )
-
+                        _written += 1
+                        if _written % _LOG_EVERY == 0:
+                            hf.flush()
+                            size_gb = os.path.getsize(out_path) / 1e9
+                            kb_per_mol = size_gb * 1e6 / _written
+                            est_gb = kb_per_mol * total / 1e6
+                            pbar.write(
+                                f"[disk] {_written:,} written | "
+                                f"{size_gb:.2f} GB on disk | "
+                                f"{kb_per_mol:.1f} KB/mol | "
+                                f"est. total {est_gb:.0f} GB"
+                            )

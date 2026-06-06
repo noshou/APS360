@@ -3,7 +3,7 @@ import numpy as np
 from beartype import beartype
 import numpy.typing as npt
 from xraydb import f0, f1_chantler, f2_chantler, chantler_energies
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Strip charge notation to get bare element symbol (e.g. Mn2+ → Mn, Na+ → Na)
 # Used for xraydb functions that don't accept ionic notation (f1/f2, chantler_energies)
@@ -40,6 +40,7 @@ class FormFactors:
     ions:   list[str]
     qvals:  npt.NDArray[np.float64]
     ff:     dict[str, npt.NDArray[np.complex128]]
+    ionIdx: dict[str, int] = field(init=False)
     energy: float
 
     # Form factor convention (matches xraydb):
@@ -52,6 +53,11 @@ class FormFactors:
         self.qvals.flags.writeable = False
         for arr in self.ff.values():
             arr.flags.writeable = False
+        object.__setattr__(
+            self, 
+            'ionIdx', 
+            {ion: i for i, ion in enumerate(self.ions)}
+        )
 
     @staticmethod
     def _validate_energy(ion: str, energy: float) -> None:
@@ -143,14 +149,14 @@ class FormFactors:
         Each ion is classified into one of three tiers:
 
         * **Dummy** — ``f0`` raises for the bare element (e.g. ``X1+``, ``M``).
-          These sites carry no electron density and are skipped entirely.
+        These sites carry no electron density and are skipped entirely.
         * **f0-only** — ``f0`` works but no Chantler tabulation exists for the
-          element or the energy is outside the tabulated range (e.g. ``Pu``,
-          ``Am``).  Only the Thomson scattering term ``f0(s)`` is returned as
-          complex128 (no anomalous corrections).
+        element or the energy is outside the tabulated range (e.g. ``Pu``,
+        ``Am``).  Only the Thomson scattering term ``f0(s)`` is returned as
+        complex128 (no anomalous corrections).
         * **Full** — both ``f0`` and the Chantler f1/f2 corrections are
-          available.  The complete form factor
-          ``f(q,E) = f0(s) + f1(E) − f0(0) + i·f2(E)`` is computed.
+        available.  The complete form factor
+        ``f(q,E) = f0(s) + f1(E) − f0(0) + i·f2(E)`` is computed.
 
         If ``log_path`` is given, skipped/fallback ions are written there, one
         per line, e.g.::
@@ -228,3 +234,4 @@ class FormFactors:
                 "Check that ion symbols are valid element names."
             )
         return cls(ions=list(ff_dict.keys()), qvals=qvals, ff=ff_dict, energy=energy)
+
