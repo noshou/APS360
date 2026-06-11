@@ -60,24 +60,18 @@ class StuhrmannMixin:
         N = len(self.elms)
         for start in range(0, N, CHUNK):
             sl   = slice(start, min(start + CHUNK, N))
-            Y    = sphHarm(lMax, self.theta[sl], self.phi[sl])
-            j    = sphBess(ff.qvals, lMax, self.r[sl])
-            f    = np.stack([ff.ff[ion] for ion in self.elms[sl]])
+            Y    = sphHarm(lMax, self.theta[sl], self.phi[sl])   # ((lMax+1)², chunk)
+            j    = sphBess(ff.qvals, lMax, self.r[sl])           # (lMax+1, Q, chunk)
+            f    = np.stack([ff.ff[ion] for ion in self.elms[sl]])  # (chunk, Q)
             for l in range(lMax + 1):
-                j_l = j[l]
-                for m in range(0, l + 1):
-                    k_reduced = l * (l + 1) // 2 + m
-                    k_full    = l * l + l + m
-                    Y_lm = Y[k_full].conj()
-                    B_lm[k_reduced] += (f.T * j_l * Y_lm[None, :]).sum(axis=1)
+                W  = f.T * j[l]                                  # (Q, chunk)
+                k0 = l * (l + 1) // 2
+                # Y rows for m=0..l at k_full = l²+l+m; take conjugate once for all m.
+                Y_l = Y[l * l + l : l * l + 2 * l + 1].conj()   # (l+1, chunk)
+                B_lm[k0 : k0 + l + 1] += Y_l @ W.T              # (l+1, Q)
 
-        I_q = np.zeros_like(ff.qvals, dtype=np.float64)
-        k_reduced = 0
-        for l in range(lMax + 1):
-            for m in range(0, l + 1):
-                # m=0 contributes once; m>0 contributes twice (±m symmetry)
-                I_q += (2.0 - (m == 0)) * np.abs(B_lm[k_reduced])**2
-                k_reduced += 1
-
-        I_q *= 4 * np.pi
-        return I_q, B_lm
+        # Precompute ±m symmetry weights: m=0 → 1, m>0 → 2.
+        weights = np.array([2.0 - (m == 0)
+                            for l in range(lMax + 1) for m in range(l + 1)])  # (N_reduced,)
+        I_q = (weights[:, None] * np.abs(B_lm) ** 2).sum(axis=0) * 4 * np.pi
+        return I_q.astype(np.float64), B_lm

@@ -1,9 +1,11 @@
 import torch.nn.functional as F
 from torch import sin, cos, exp, nn
-from .batch import Batch
+from ..batching import Batch
 from jaxtyping import jaxtyped
 from beartype import beartype
 from .layer_head import LayerHead
+
+
 
 class MessagePass(nn.Module):
     

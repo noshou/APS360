@@ -33,15 +33,11 @@ def sphHarm(
         raise ValueError("sphHarm: theta and phi must share shape and be non-empty")
 
     K = (lMax + 1) ** 2
-    Y = np.zeros((K, theta.size), dtype=np.complex128)
-
-    k = 0
+    Y = np.empty((K, theta.size), dtype=np.complex128)
+    # One scipy call per l (scalar l, array m) — 51 calls instead of 2601.
     for l in range(lMax + 1):
-        for m in range(-l, l + 1):
-            # scipy sph_harm_y(l, m, theta, phi): theta=polar (0→π), phi=azimuthal (0→2π)
-            Y[k] = sph_harm_y(l, m, theta, phi)
-            k += 1
-
+        ms = np.arange(-l, l + 1)
+        Y[l * l : l * l + 2 * l + 1] = sph_harm_y(l, ms[:, None], theta[None, :], phi[None, :])
     return Y
 
 @beartype

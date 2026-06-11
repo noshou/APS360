@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from torch import nn
 from jaxtyping import jaxtyped
 from beartype import beartype
-from .batch import Batch
+from ..batching import Batch
 from Preprocess import VOCAB
 from .layer_head import LayerHead
 
