@@ -154,18 +154,27 @@ def buildDB(
             initializer=_worker_init,
             initargs=(ff, lMax),
         ) as pool, tqdm(
-            total=total, unit='mol', file=sys.stdout, dynamic_ncols=True,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}',
+            total=total, unit='mol', file=sys.stderr, dynamic_ncols=True,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, {rate_fmt}]{postfix}',
+            miniters=100, mininterval=2.0,
         ) as pbar:
             for group_name, xyz_paths in all_xyz.items():
                 hf_group = hf.require_group(group_name)
 
-                # Drop any half-written entries left by a previous crash.
+                # Drop half-written tmp entries and any corrupt committed entries.
+                already_done = set()
                 for key in list(hf_group.keys()):
                     if key.startswith(_TMP):
                         del hf_group[key]
+                        continue
+                    try:
+                        mol_grp = hf_group[key]
+                        for ds in ('I_q', 'coords', 'angles', 'r', 'elms'):
+                            mol_grp[ds][()]
+                        already_done.add(key)
+                    except Exception:
+                        del hf_group[key]
 
-                already_done = set(hf_group.keys())
                 pending = [p for p in xyz_paths
                             if os.path.basename(p)[:-4] not in already_done]
                 pbar.update(len(xyz_paths) - len(pending))
@@ -202,16 +211,13 @@ def buildDB(
                             tmp = hf_group.create_group(tmp_name)
                             tmp.create_dataset('I_q', data=I_q, chunks=True, **data_compress)
                             mol.toHDF5(tmp)
-                            # Verify shapes written cleanly before committing.
-                            iq_ds     = tmp['I_q']
-                            coords_ds = tmp['coords']
-                            angles_ds = tmp['angles']
-                            r_ds      = tmp['r']
-                            _n        = coords_ds.shape[0]  # type: ignore[union-attr]
-                            assert (isinstance(iq_ds,     h5py.Dataset) and iq_ds.shape     == (_Q,)
-                                and isinstance(coords_ds, h5py.Dataset) and coords_ds.shape == (_n, 3)  # type: ignore[union-attr]
-                                and isinstance(angles_ds, h5py.Dataset) and angles_ds.shape == (_n, 2)  # type: ignore[union-attr]
-                                and isinstance(r_ds,      h5py.Dataset) and r_ds.shape      == (_n,))   # type: ignore[union-attr]
+                            # Read back chunk data to verify it landed before committing.
+                            _n = tmp['coords'].shape[0]
+                            assert (tmp['I_q'][()].shape    == (_Q,)
+                                and tmp['coords'][()].shape == (_n, 3)
+                                and tmp['angles'][()].shape == (_n, 2)
+                                and tmp['r'][()].shape      == (_n,)
+                                and len(tmp['elms'][()])    == _n)
                             hf.move(f'{group_name}/{tmp_name}', f'{group_name}/{stem}')
                         except Exception:
                             if tmp_name in hf_group:

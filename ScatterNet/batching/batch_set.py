@@ -1,0 +1,83 @@
+import torch
+from torch.utils.data import Dataset
+from .batch import Batch
+from beartype.typing import List
+import h5py
+from Preprocess import Encoding
+
+class BatchSet(Dataset):
+    """
+    A PyTorch Dataset where each item is a pre-built batch of molecules.
+
+    Molecules vary enormously in atom count (2-atom QM9 molecules up to
+    thousands-of-atom MOFs). A standard DataLoader with batch_size=N would
+    group arbitrary molecules together, forcing heavy zero-padding that wastes
+    GPU compute. Instead, Batcher pre-groups molecules by atom-count range into
+    size-homogeneous batches, and BatchSet exposes those batches as a Dataset.
+    Each __getitem__ returns a fully-padded Batch ready for the model.
+
+    Because each item is already a batch of N molecules, use DataLoader with
+    batch_size=1 and a passthrough collate function:
+
+        from torch.utils.data import DataLoader
+
+        train, val, test = Batcher(hdf5_db, enc, buckets, seed=42).get_sets()
+
+        train_loader = DataLoader(
+            train,
+            batch_size=1,
+            shuffle=True,
+            collate_fn=lambda x: x[0],   # unwrap the outer list added by DataLoader
+        )
+
+        for batch in train_loader:        # batch is a Batch, shape (N, ...)
+            loss = model(batch)
+
+    When averaging metrics across batches, weight by molecule count to
+    avoid bias from variable batch sizes:
+
+        total_loss, total_mols = 0, 0
+        for batch in val_loader:
+            n = batch.iqval.shape[0]
+            total_loss += criterion(pred, batch.iqval).item() * n
+            total_mols += n
+        val_loss = total_loss / total_mols
+    """
+
+    def __init__(
+        self,
+        hdf5_db: str,
+        enc: Encoding,
+        batches: list,
+    ):
+        """
+        Args:
+            hdf5_db:  path to raw HDF5 data.
+            enc:      Encoding instance for element→VOCAB mapping.
+            batches:  pre-built batches from Batcher.
+        """
+        self._batches = batches
+        self._enc     = enc
+        self._db_path = hdf5_db
+    
+    def __len__(self) -> int:
+        return len(self._batches)
+
+    def __getitem__(self, i: int) -> Batch:
+        """Load and return sub-batch ``i`` as a typed, shape-validated ``Batch``."""
+        rows  = self._batches[i]
+        vocab: List = []
+        iqval: List = []
+        radii: List = []
+        angle: List = []
+
+        with h5py.File(self._db_path, "r") as db:
+            for grp, stem, _ in rows:
+                mol = db[grp][stem]									   # type: ignore
+                elms = mol["elms"][:].tolist()                         # type: ignore
+                vocab.append(torch.tensor(self._enc._encode_ions(elms)))
+                iqval.append(torch.tensor(mol["I_q"][:]))              # type: ignore
+                radii.append(torch.tensor(mol["r"][:]))                # type: ignore
+                angle.append(torch.tensor(mol["angles"][:]))           # type: ignore
+
+        return Batch.from_lists(vocab, iqval, radii, angle)

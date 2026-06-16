@@ -5,6 +5,7 @@ from beartype import beartype
 from .layer_head import LayerHead
 from numpy import log2, floor
 from collections import OrderedDict
+import torch.nn.functional as F
 
 class IntensityMLP(nn.Module):
 
@@ -15,7 +16,7 @@ class IntensityMLP(nn.Module):
     contribution to I(q), using a bilinear interaction followed by a halving MLP.
 
     Architecture:
-        Bilinear(λ₁, 1 → λ₃) → Softplus → Linear(λ₃ → λ₃//2) → ... → Linear(· → 1)
+        Bilinear(λ₁, 1 → λ₃) → Mish → Linear(λ₃ → λ₃//2) → ... → Linear(· → 1) → Softplus
 
     The bilinear layer captures interactions between the atom's identity (λ₁)
     and its scattering strength (f_mag scalar) before compression to a scalar vote.
@@ -54,7 +55,7 @@ class IntensityMLP(nn.Module):
         for i in range(len(dims) - 1):
             ldicts[f"layer_{i}"] = nn.Linear(dims[i], dims[i+1])
             if i < len(dims) - 2:
-                ldicts[f"activation_{i}"] = nn.Softplus()
+                ldicts[f"activation_{i}"] = nn.Mish()
 
         self._mlp = nn.Sequential(ldicts)
 
@@ -68,7 +69,7 @@ class IntensityMLP(nn.Module):
             per-atom scalar contribution to I(q): (N, M, Q, 1)
         """
         # (N,M,Q,λ₁) x (N,M,Q,1) -> (N,M,Q,λ₃)
-        atomic_contribs = self._bilinear(msg_head.embeds, msg_head.f_mags)
+        atomic_contribs = F.mish(self._bilinear(msg_head.embeds, msg_head.f_mags))
 
         # (N,M,Q,λ₃) -> (N,M,Q,1)
-        return self._mlp(atomic_contribs)
+        return F.softplus(self._mlp(atomic_contribs))

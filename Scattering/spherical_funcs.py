@@ -9,12 +9,14 @@ def sphHarm(
     theta: npt.NDArray[np.float64],
     phi:   npt.NDArray[np.float64],
 ) -> npt.NDArray[np.complex128]:
-    """Compute complex spherical harmonics Y_l^m for all (l, m) with l ∈ [0, lMax], |m| ≤ l.
+    """Compute complex spherical harmonics Y_l^m for m ≥ 0 only, l ∈ [0, lMax].
 
     Uses physics convention: theta = polar colatitude (0→π), phi = azimuthal (0→2π).
-    Output is flattened over (l, m): row k corresponds to (l, m) where k = l² + l + m.
-    Layout: row 0 = Y_0^0; rows 1,2,3 = Y_1^{-1}, Y_1^0, Y_1^1; etc.
-    Total (lMax+1)² rows.
+    Output is flattened over (l, m) with triangular indexing: k = l*(l+1)//2 + m.
+    Layout: row 0 = Y_0^0; rows 1,2 = Y_1^0, Y_1^1; rows 3,4,5 = Y_2^0..Y_2^2; etc.
+    Total (lMax+1)*(lMax+2)//2 rows.
+
+    Negative-m modes are omitted — recover them via Y_l^{-m} = (-1)^m · conj(Y_l^m).
 
     Args:
         lMax:  Maximum degree. Must be non-negative.
@@ -22,7 +24,8 @@ def sphHarm(
         phi:   Azimuthal angles (0→2π), shape (N,).
 
     Returns:
-        Y: shape ((lMax+1)², N). Y[k, i] = Y_l^m(theta[i], phi[i]) where k = l² + l + m.
+        Y: shape ((lMax+1)*(lMax+2)//2, N). Y[k, i] = Y_l^m(theta[i], phi[i])
+        where k = l*(l+1)//2 + m.
 
     Raises:
         ValueError: If inputs are invalid.
@@ -32,12 +35,11 @@ def sphHarm(
     if theta.shape != phi.shape or theta.size == 0:
         raise ValueError("sphHarm: theta and phi must share shape and be non-empty")
 
-    K = (lMax + 1) ** 2
+    K = (lMax + 1) * (lMax + 2) // 2
     Y = np.empty((K, theta.size), dtype=np.complex128)
-    # One scipy call per l (scalar l, array m) — 51 calls instead of 2601.
     for l in range(lMax + 1):
-        ms = np.arange(-l, l + 1)
-        Y[l * l : l * l + 2 * l + 1] = sph_harm_y(l, ms[:, None], theta[None, :], phi[None, :])
+        ms = np.arange(0, l + 1)
+        Y[l * (l + 1) // 2 : l * (l + 1) // 2 + l + 1] = sph_harm_y(l, ms[:, None], theta[None, :], phi[None, :])
     return Y
 
 @beartype

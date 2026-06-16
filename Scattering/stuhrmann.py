@@ -60,14 +60,14 @@ class StuhrmannMixin:
         N = len(self.elms)
         for start in range(0, N, CHUNK):
             sl   = slice(start, min(start + CHUNK, N))
-            Y    = sphHarm(lMax, self.theta[sl], self.phi[sl])   # ((lMax+1)², chunk)
+            Y    = sphHarm(lMax, self.theta[sl], self.phi[sl])   # ((lMax+1)(lMax+2)//2, chunk)
             j    = sphBess(ff.qvals, lMax, self.r[sl])           # (lMax+1, Q, chunk)
             f    = np.stack([ff.ff[ion] for ion in self.elms[sl]])  # (chunk, Q)
+            Y_conj = Y.conj()                                    # (K, chunk) — once per chunk
             for l in range(lMax + 1):
                 W  = f.T * j[l]                                  # (Q, chunk)
                 k0 = l * (l + 1) // 2
-                # Y rows for m=0..l at k_full = l²+l+m; take conjugate once for all m.
-                Y_l = Y[l * l + l : l * l + 2 * l + 1].conj()   # (l+1, chunk)
+                Y_l = Y_conj[k0 : k0 + l + 1]                   # (l+1, chunk)
                 B_lm[k0 : k0 + l + 1] += Y_l @ W.T              # (l+1, Q)
 
         # Precompute ±m symmetry weights: m=0 → 1, m>0 → 2.

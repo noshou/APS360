@@ -23,8 +23,9 @@ class MessagePass(nn.Module):
 
     _lambda_2: int          # number of message passing rounds
     _project2: nn.Linear    # projects λ₁ dimension to 2 * λ₁ for GLU
+    _sigbilin: nn.Bilinear  # after λ₂ rounds, recalculates sigma estimates
     
-    def __init__(self, lambda_1: int, lambda_2: int):
+    def __init__(self, lambda_1: int, lambda_2: int, q_points: int):
         super().__init__()
 
         if lambda_2 <= 0:
@@ -32,7 +33,9 @@ class MessagePass(nn.Module):
         
         self._lambda_2 = lambda_2
         self._project2 = nn.Linear(lambda_1, 2 * lambda_1)
-            
+        self._sigbilin = nn.Bilinear(lambda_1, q_points, lambda_1)
+        self._sigmalin = nn.Linear(lambda_1, 1)
+
     @jaxtyped(typechecker=beartype)
     def forward(self, batch: Batch, embed_head: LayerHead, eps: float=1e-8) -> LayerHead:
         
@@ -79,16 +82,24 @@ class MessagePass(nn.Module):
             # need to unsqueeze embeds from N x M x Q x λ₁ -> N x 1 x M x Q x λ₁
             aggregate = ((rbf*embeds.unsqueeze(-4)).sum(dim=-3) / (rbf.sum(dim=-3) + eps)) 
 
-            # gate aggregate using SwiGLU
+            # gate aggregate using MishGLU
             # mask gated_aggregate instead of aggregate since
             # SwiGLU allows small outputs at x=0
             embed_proj = self._project2(aggregate)
             embed_proj1, embed_proj2 = embed_proj.chunk(2, dim=-1)
-            gated_aggregate = embed_proj1 * F.silu(embed_proj2)
+            gated_aggregate = embed_proj1 * F.mish(embed_proj2)
             gated_aggregate = gated_aggregate * batch.padding_mask().unsqueeze(-1).unsqueeze(-1)
             
             # update embedding vector using residual connection
             embeds = embeds + gated_aggregate
-            
+
+        # since we have "learned" from chemical env, we should update sigma values
+        # first:  bilinear layer with new embeds (N x M x Q x λ₁) + old sigmas (N x M x Q x 1)
+        #         where we transform sigmas to (N x M x 1 x Q). Results in a 
+        #         new tensor of shape (N x M x Q x λ₁)
+        # second: linear layer collapses to (N x M x Q x 1)
+        sig_bilin = F.mish(self._sigbilin(embeds, embed_head.sigmas.squeeze(-1).unsqueeze(-2)))
+        sig_lin   = F.softplus(self._sigmalin(sig_bilin))
+                
         # output layer head
-        return embed_head._replace(embeds=embeds)
+        return embed_head._replace(embeds=embeds, sigmas=sig_lin)

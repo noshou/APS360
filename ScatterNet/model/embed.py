@@ -20,11 +20,12 @@ class Embed(nn.Module):
                 Porod region (high q) needs short-range only
     """
 
-    _mbd:  nn.Embedding  # atom identity in learned space
-    _f0f1: nn.Linear     # approximate real form factor at each q
-    _f2:   nn.Linear     # approximate imaginary form factor at each q
-    _sig:  nn.Bilinear   # estimated bandwidth of gaussian decay
-
+    _mbd:    nn.Embedding  # atom identity in learned space
+    _f0f1:   nn.Linear     # approximate real form factor at each q
+    _f2:     nn.Linear     # approximate imaginary form factor at each q
+    _sig:    nn.Bilinear   # estimated bandwidth of gaussian decay
+    _prelu:  nn.PReLU      # prelu activation function
+    
     def __init__(self, lambda_1: int, qPoints: int) -> None:
         """
         Args:
@@ -32,11 +33,11 @@ class Embed(nn.Module):
             qPoints:   number of q-points (Q)
         """
         super().__init__()
-        self._mbd  = nn.Embedding(len(VOCAB)+1, lambda_1, padding_idx=0) # +1 since 0 is padding idx
-        self._f0f1 = nn.Linear(lambda_1, qPoints)
-        self._f2   = nn.Linear(lambda_1, qPoints)
-        self._sig  = nn.Bilinear(lambda_1, qPoints, qPoints)
-
+        self._mbd    = nn.Embedding(len(VOCAB)+1, lambda_1, padding_idx=0) # +1 since 0 is padding idx
+        self._f0f1   = nn.Linear(lambda_1, qPoints)
+        self._f2     = nn.Linear(lambda_1, qPoints)
+        self._sig    = nn.Bilinear(lambda_1, qPoints, qPoints)
+        self._prelu  = nn.PReLU(lambda_1)
     @jaxtyped(typechecker=beartype)
     def forward(self, batch: Batch, eps: float = 1e-8) -> LayerHead:
     
@@ -49,10 +50,11 @@ class Embed(nn.Module):
         """
         
         # get embedding: "what is this atom?" → (N, M, λ₁)
-        # since linear layers apply to last dimension, must keep this stable
-        embed = self._mbd(batch.vocab)
+        # since linear layers apply to last dimension, must keep this order stable
+        # since we want to activate using prelu, but nn.PReLU() acts on dim=1 for dim > 2, 
+        # first transpose embed to (N,λ₁,M), do prelu, then re-transpose to (N,M,λ₁)
+        embed = (self._prelu(self._mbd(batch.vocab).transpose(-1, -2))).transpose(-1, -2)
 
-        
         # estimate form factors → (N, M, Q)
         # as above, must keep this stable at 3 dimensions
         f_rel  = F.softplus(self._f0f1(embed)) + eps

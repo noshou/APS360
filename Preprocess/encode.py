@@ -186,6 +186,32 @@ class Encoding:
             conn.close()
         return results
 
+    @beartype
+    def get_meta_in_range(self, min_atoms: int, max_atoms: int) -> List[Tuple[str, str, int]]:
+        """Like get_in_range but omits VOCAB_idx, for lazy loading pipelines."""
+        _QUERY = """
+            SELECT grp, stem, atoms
+            FROM items
+            WHERE atoms BETWEEN ? AND ?
+            ORDER BY atoms ASC
+        """
+        conn = sqlite3.connect(self._path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(_QUERY, (min_atoms, max_atoms))
+            results = cursor.fetchall()
+        finally:
+            conn.close()
+        return results
+
     def max_atom_count(self) -> int:
         """Return the largest atom count across all molecules in the database."""
         return self._max
+    
+    def count(self) -> int:
+        """Return the total number of molecules in dataset"""
+        conn = sqlite3.connect(self._path)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        finally:
+            conn.close()

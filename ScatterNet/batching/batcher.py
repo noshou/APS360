@@ -1,40 +1,52 @@
 import bisect
-import torch
-from torch.utils.data import Dataset
 from Preprocess import Encoding
-from .batch import Batch
 from beartype.typing import List, Tuple
 import h5py
+from .batch_set import BatchSet
+import numpy as np
+from numpy.random import default_rng
 
-Row       = Tuple[str, str, int, List[int]]
-_RawBatch = List[Row]
-
-
-class Batcher(Dataset):
+_TRAIN = 0.7
+_VAL   = 0.15
+_TEST  = 0.15
+_SEED  = 9131039        
+class Batcher:
     
     """
-    Dataset of size-bucketed molecule sub-batches.
+    Factory that builds train, validation, and test BatchSets from an HDF5 dataset.
 
-    On construction, queries SQLite for each (min_atoms, max_atoms) bucket and
-    splits any bucket whose total atom count exceeds ``atom_size_ceil`` into
-    balanced sub-batches via recursive binary search on a prefix-sum array.
-    The resulting sub-batches are stored in ``_batches``; each index maps to
-    one sub-batch of molecules whose combined atom count is ≤ ``atom_size_ceil``.
-    
-    Each ``Row`` is ``(grp, stem, atoms, VOCAB_idx)``, the HDF5 keys and
-    encoded atom identities for one molecule.  Each ``_RawBatch`` is a list of
-    rows whose total atom count is ≤ ``atom_size_ceil``.
+    Call ``get_sets()`` to retrieve ``(train, val, test)`` as ``BatchSet`` objects
+    ready for use with ``DataLoader(batch_size=1, collate_fn=lambda x: x[0])``.
+
+    Construction proceeds in two steps:
+
+    1. ``_batches_init`` — for each (min_atoms, max_atoms) size bucket, queries
+       SQLite for matching molecules sorted by atom count, then recursively splits
+       any bucket whose total atom count exceeds ``atom_size_ceil`` into balanced
+       sub-lists via binary search on a prefix-sum array. Produces a flat list of
+       batches, each a list of (grp, stem, atoms) rows whose combined atom count
+       is ≤ ``atom_size_ceil``.
+
+    2. ``_batches_stratify`` — collapses any batch with fewer than 3 molecules into
+       its nearest neighbour (by median atom count, ties go down), then splits each
+       batch independently (default: 70/15/15) at the molecule level using a seeded RNG.
+       Wraps the three resulting lists in ``BatchSet`` instances.
     """
 
-    _batches: List[_RawBatch]
-    _db_path: str
-
+    _train: "BatchSet"
+    _val:   "BatchSet"
+    _test:  "BatchSet"
+    
     def __init__(
         self,
-        hdf5_db: str,
-        enc: Encoding,
-        batches: list[tuple[int,int]],
-        atom_size_ceil: int = -1
+        hdf5_db:        str,
+        enc:            Encoding,
+        batches:        list[tuple[int,int]],
+        atom_size_ceil: int   = -1,
+        seed:           int   = _SEED,
+        train_percent:  float = _TRAIN,
+        val_percent:    float = _VAL,
+        test_percent:   float = _TEST
     ): 
         
         """
@@ -42,11 +54,52 @@ class Batcher(Dataset):
             hdf5_db:        path to raw HDF5 data.
             enc:            Encoding instance for SQLite queries.
             batches:        list of (min_atoms, max_atoms) size buckets to load.
-            atom_size_ceil: maximum total atoms per sub-batch; buckets exceeding
-                            this are recursively split via binary search. If <=0, 
-                            set to double of largest atom size.
+            atom_size_ceil: maximum total atoms per batch; exceeded buckets are
+                            split via binary search. If <=0, set to 3× max atom count.
+            seed:           RNG seed for reproducible train/val/test splits.
+            train_percent:  fraction of molecules for training.
+            val_percent:    fraction for validation.
+            test_percent:   fraction for testing. The larger of
+                            val/test receives the floor-rounding remainder; ties go to test.
         """
         
+        if (
+            train_percent <= 0 or 
+            val_percent   <= 0 or 
+            test_percent  <= 0 or 
+            (train_percent + val_percent + test_percent) != 1.
+            ):
+            raise ValueError("Invalid values for train, validation, testing, batch sizes")
+        elif (seed < 0):
+            raise ValueError("Invalid seed; must be >= 0")
+        
+        if atom_size_ceil <= 0:
+            atom_size_ceil = 3 * enc.max_atom_count()
+        
+        all_batches = self._batches_init(hdf5_db, enc, batches, atom_size_ceil)
+        self._batches_stratify(seed, train_percent, val_percent, test_percent, hdf5_db, enc, all_batches)
+
+    
+    def _batches_init(
+        self,
+        hdf5_db: str,
+        enc: Encoding,
+        batches: list[tuple[int,int]],
+        atom_size_ceil: int,
+    ) -> list:
+        
+        """
+        Build the flat list of batches across all size buckets.
+
+        Args:
+            hdf5_db:        path to raw HDF5 data.
+            enc:            Encoding instance for SQLite queries.
+            batches:        list of (min_atoms, max_atoms) size buckets.
+            atom_size_ceil: maximum total atoms per batch.
+
+        Returns:
+            Flat list of batches, each a list of (grp, stem, atoms) rows.
+        """
         try:
             with h5py.File(hdf5_db, "r"):
                 pass
@@ -57,22 +110,16 @@ class Batcher(Dataset):
         except OSError as e:
             raise OSError(f"Could not open HDF5 file: {e}") from e
 
-        self._db_path = hdf5_db
-        self._batches = []
+        result: list = []
 
-        if atom_size_ceil <= 0:
-            atom_size_ceil = 2 * enc.max_atom_count()
-        
         def split_batch(
-            result: List[_RawBatch], 
-            lo: int, 
-            hi: int, 
-            query: _RawBatch, 
-            ceil: int
+            lo: int,
+            hi: int,
+            query: list,
         ) -> None:
             sub = query[lo:hi+1]
             count = sum(row[2] for row in sub)
-            if count <= ceil or hi <= lo:
+            if count <= atom_size_ceil or hi <= lo:
                 result.append(sub)
                 return
             prefix: List[int] = []
@@ -82,37 +129,89 @@ class Batcher(Dataset):
                 prefix.append(running)
             mid = bisect.bisect_left(prefix, count // 2)
             mid = max(0, min(mid, len(sub) - 2))
-            split_batch(result, lo,           lo + mid, query, ceil)
-            split_batch(result, lo + mid + 1, hi,       query, ceil)
+            split_batch(lo,           lo + mid, query)
+            split_batch(lo + mid + 1, hi,       query)
 
         for i, (min_a, max_a) in enumerate(batches):
             if min_a > max_a:
-                print(f"Invalid bound size in batch {i}: skipping...")
+                print(f"Invalid bucket {i} ({min_a}, {max_a}): skipping...")
                 continue
-            query = enc.get_in_range(min_a, max_a)
+            query = enc.get_meta_in_range(min_a, max_a)
             count = sum(row[2] for row in query)
             if count > atom_size_ceil:
-                split_batch(self._batches, 0, len(query) - 1, query, atom_size_ceil)
+                split_batch(0, len(query) - 1, query)
             else:
-                self._batches.append(query)
+                result.append(query)
 
-    def __len__(self) -> int:
-        return len(self._batches)
+        return result
+    
+    def _batches_stratify(
+        self,
+        seed:         int,
+        trn_p:        float,
+        val_p:        float,
+        tst_p:        float,
+        hdf5_db:      str,
+        enc:          Encoding,
+        batches_flat: list,
+    ):
+        # Collapse batches with fewer than 3 molecules into an adjacent batch.
+        # Merge direction: toward the neighbour whose median atom count is closer.
+        # Tie or edge case: merge down (into previous).
+        i = 0
+        while i < len(batches_flat):
+            if len(batches_flat[i]) < 3:
+                if len(batches_flat) == 1:
+                    raise ValueError("Only one batch and it has fewer than 3 molecules.")
+                if i == 0:
+                    batches_flat[1] = batches_flat[0] + batches_flat[1]
+                    batches_flat.pop(0)
+                    # don't advance i — recheck index 0 (the merged batch)
+                elif i == len(batches_flat) - 1:
+                    batches_flat[i - 1] = batches_flat[i - 1] + batches_flat[i]
+                    batches_flat.pop(i)
+                    i -= 1
+                else:
+                    sparse_med = np.median([r[2] for r in batches_flat[i]])
+                    prev_med   = np.median([r[2] for r in batches_flat[i - 1]])
+                    next_med   = np.median([r[2] for r in batches_flat[i + 1]])
+                    if abs(sparse_med - prev_med) <= abs(sparse_med - next_med):
+                        batches_flat[i - 1] = batches_flat[i - 1] + batches_flat[i]
+                        batches_flat.pop(i)
+                        i -= 1  # recheck the merged batch
+                    else:
+                        batches_flat[i + 1] = batches_flat[i] + batches_flat[i + 1]
+                        batches_flat.pop(i)
+            else:
+                i += 1
 
-    def __getitem__(self, i: int) -> Batch:
+        rng = default_rng(seed)
+
+        train_batches: list = []
+        val_batches:   list = []
+        test_batches:  list = []
+
+        for batch in batches_flat:
+            idx = rng.permutation(len(batch))
+            n   = len(batch)
+
+            n_trn = max(1, int(np.floor(trn_p * n)))
+            # remainder goes to whichever of val/test is larger; tie → test
+            if val_p > tst_p:
+                n_tst = max(1, int(np.floor(tst_p * n)))
+                n_val = max(1, n - n_trn - n_tst)
+            else:
+                n_val = max(1, int(np.floor(val_p * n)))
+                n_tst = max(1, n - n_trn - n_val)
+
+            train_batches.append([batch[j] for j in idx[:n_trn]])
+            val_batches  .append([batch[j] for j in idx[n_trn:n_trn + n_val]])
+            test_batches .append([batch[j] for j in idx[n_trn + n_val:n_trn + n_val + n_tst]])
+
+        self._train = BatchSet(hdf5_db, enc, train_batches)
+        self._val   = BatchSet(hdf5_db, enc, val_batches)
+        self._test  = BatchSet(hdf5_db, enc, test_batches)
+    
+    def get_sets(self) -> Tuple[BatchSet, BatchSet, BatchSet]:
+        return self._train, self._val, self._test
         
-        """Load and return sub-batch ``i`` as a typed, shape-validated ``Batch``."""
-        
-        rows  = self._batches[i]
-        vocab = [torch.tensor(row[3]) for row in rows]
-        iqval: List = []
-        radii: List = []
-        angle: List = []
-
-        with h5py.File(self._db_path, "r") as db:
-            for grp, stem, _, _ in rows:
-                iqval.append(torch.tensor(db[grp][stem]["I_q"][:]))    # type: ignore
-                radii.append(torch.tensor(db[grp][stem]["r"][:]))      # type: ignore
-                angle.append(torch.tensor(db[grp][stem]["angles"][:])) # type: ignore
-
-        return Batch.from_lists(vocab, iqval, radii, angle)
