@@ -12,20 +12,17 @@ class Batch:
     Batch of molecules.
 
     All tensors are zero-padded to the longest molecule in the batch (M atoms).
-    Coordinates are spherical, centroid-relative.
+    Coordinates are centroid-subtracted Cartesian.
 
     Fields:
         vocab: VOCAB integer indices per atom (N, M)
         iqval: target I(q) intensities (N, Q)
-        radii: radial distance r from centroid per atom (N, M)
-        angle: [θ, φ] spherical angles from centroid per atom (N, M, 2)
+        coord: centroid-subtracted Cartesian coordinates per atom (N, M, 3)
     """
     
     vocab: Int[torch.Tensor,   "N M"]    # N molecules, M max atoms (padded)
     iqval: Float[torch.Tensor, "N Q"]    # N molecules, Q q-points
-    radii: Float[torch.Tensor, "N M"]    # interatomic distances per atom
-    angle: Float[torch.Tensor, "N M 2"]  # theta + phi per atom
-
+    coord: Float[torch.Tensor, "N M 3"]  # Cartesian coordinates
     @jaxtyped(typechecker=beartype)
     def padding_mask(self) -> Bool[torch.Tensor, "N M"]:
         """Boolean mask. True for real atoms, False for padding (vocab == 0)."""
@@ -36,23 +33,22 @@ class Batch:
         cls,
         vocabs: list[Int[torch.Tensor,   "M"]],
         iqvals: list[Float[torch.Tensor, "Q"]],
-        rads:   list[Float[torch.Tensor, "M"]],
-        angles: list[Float[torch.Tensor, "M 2"]],
+        coords: list[Float[torch.Tensor, "M 3"]]
     ) -> "Batch":
         
         """
         Pad variable-length per-molecule tensors and construct a Batch.
-        Forces all tensors to be exact same shape.
+        Forces all tensors to be exact same shape. Since vocabs are the 
+        only ones guaranteed not to have collisions with padding value of 0, 
+        users can only mask off of vocab.
         
         Args:
             vocabs: list of N vocab index tensors, each shape (M_i,)
             iqvals: list of N I(q) tensors, each shape (Q,)
-            rads:   list of N radii tensors, each shape (M_i,)
-            angles: list of N angle tensors, each shape (M_i, 2)
+            coords: list of N x,y,z coordinates, each shape (M, 3)
         """
         return cls(
             vocab=pad_sequence(vocabs, batch_first=True, padding_value=0),
             iqval=pad_sequence(iqvals, batch_first=True, padding_value=0).to(torch.float32),
-            radii=pad_sequence(rads,   batch_first=True, padding_value=0).to(torch.float32),
-            angle=pad_sequence(angles, batch_first=True, padding_value=0).to(torch.float32),
+            coord=pad_sequence(coords, batch_first=True, padding_value=0).to(torch.float32)
         )

@@ -1,10 +1,9 @@
 import torch
-from torch import nn
-from jaxtyping import Float, jaxtyped
-from beartype import beartype
-from beartype.typing import Tuple
-from .batching import Batch
-from .model import Embed, MessagePass, OutputHead
+from torch               import nn
+from jaxtyping           import Float, jaxtyped
+from beartype            import beartype
+from ScatterNet.batching import Batch
+from ScatterNet.model    import Embed, MessagePass, OutputHead
 
 
 class ScatterNet(nn.Module):
@@ -18,6 +17,7 @@ class ScatterNet(nn.Module):
     lambda_2 : number of message-passing rounds
     lambda_3 : IntensityMLP hidden width
     lambda_4 : number of halving steps in IntensityMLP
+    lambda_5 : number of RFF features in MessagePass
     qPoints  : number of q-grid points (Q)
     """
 
@@ -31,21 +31,23 @@ class ScatterNet(nn.Module):
         lambda_2: int,
         lambda_3: int,
         lambda_4: int,
-        qPoints:  int,
+        lambda_5: int,
+        q_points: int,
+        msg_seed: int
     ) -> None:
         super().__init__()
-        self._embed = Embed(lambda_1, qPoints)
-        self._msg   = MessagePass(lambda_1, lambda_2, qPoints)
+        self._embed = Embed(lambda_1, q_points)
+        self._msg   = MessagePass(lambda_1, lambda_2, lambda_5, msg_seed)
         self._out   = OutputHead(lambda_1, lambda_3, lambda_4)
 
     @jaxtyped(typechecker=beartype)
-    def forward(self, batch: Batch) -> Tuple[Float[torch.Tensor, "N Q"], Float[torch.Tensor, "N M Q"]]:
+    def forward(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:
         """
         Args:
             batch: input batch of molecules
         Returns:
-            predicted I(q) per molecule (N x Q), and the sigma values (N x M x Q).
+            predicted I(q) per molecule (N x Q).
         """
         embed_head = self._embed(batch)
         msg_head   = self._msg(batch, embed_head)
-        return self._out(batch, msg_head), msg_head.sigmas.squeeze(-1)
+        return self._out(batch, msg_head)

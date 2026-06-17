@@ -37,8 +37,12 @@ class _IonVocab:
     def __contains__(self, ion: str) -> bool:
         return ion in self.index
 
-    def __getitem__(self, ion: str) -> int:
-        return self.index[ion]
+    def __getitem__(self, ion: str | int) -> str | int:
+        
+        if   isinstance(ion, str):
+            return self.index[ion]
+        elif isinstance(ion, int):
+            return self.ions[ion-1]
 
     @property
     def size(self) -> int:

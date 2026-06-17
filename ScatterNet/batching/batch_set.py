@@ -21,7 +21,7 @@ class BatchSet(Dataset):
 
         from torch.utils.data import DataLoader
 
-        train, val, test = Batcher(hdf5_db, enc, buckets, seed=42).get_sets()
+        train, val, test = Batcher(hdf5_db, enc, buckets).get_sets()
 
         train_loader = DataLoader(
             train,
@@ -68,8 +68,7 @@ class BatchSet(Dataset):
         rows  = self._batches[i]
         vocab: List = []
         iqval: List = []
-        radii: List = []
-        angle: List = []
+        coord: List = []
 
         with h5py.File(self._db_path, "r") as db:
             for grp, stem, _ in rows:
@@ -77,7 +76,6 @@ class BatchSet(Dataset):
                 elms = mol["elms"][:].tolist()                         # type: ignore
                 vocab.append(torch.tensor(self._enc._encode_ions(elms)))
                 iqval.append(torch.tensor(mol["I_q"][:]))              # type: ignore
-                radii.append(torch.tensor(mol["r"][:]))                # type: ignore
-                angle.append(torch.tensor(mol["angles"][:]))           # type: ignore
+                coord.append(torch.tensor(mol["coords"][:]))           # type: ignore
 
-        return Batch.from_lists(vocab, iqval, radii, angle)
+        return Batch.from_lists(vocab, iqval, coord)

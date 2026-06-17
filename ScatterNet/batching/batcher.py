@@ -9,7 +9,6 @@ from numpy.random import default_rng
 _TRAIN = 0.7
 _VAL   = 0.15
 _TEST  = 0.15
-_SEED  = 9131039        
 class Batcher:
     
     """
@@ -21,18 +20,18 @@ class Batcher:
     Construction proceeds in two steps:
 
     1. ``_batches_init`` — for each (min_atoms, max_atoms) size bucket, queries
-       SQLite for matching molecules sorted by atom count, then recursively splits
-       any bucket whose total atom count exceeds ``atom_size_ceil`` into balanced
-       sub-lists via binary search on a prefix-sum array. Produces a flat list of
-       batches, each a list of (grp, stem, atoms) rows whose combined atom count
-       is ≤ ``atom_size_ceil``.
+        SQLite for matching molecules sorted by atom count, then recursively splits
+        any bucket whose total atom count exceeds ``atom_size_ceil`` into balanced
+        sub-lists via binary search on a prefix-sum array. Produces a flat list of
+        batches, each a list of (grp, stem, atoms) rows whose combined atom count
+        is ≤ ``atom_size_ceil``.
 
     2. ``_batches_stratify`` — collapses any batch with fewer than 3 molecules into
-       its nearest neighbour (by median atom count, ties go down), then splits each
-       batch independently (default: 70/15/15) at the molecule level using a seeded RNG.
-       Wraps the three resulting lists in ``BatchSet`` instances.
+        its nearest neighbour (by median atom count, ties go down), then splits each
+        batch independently (default: 70/15/15) at the molecule level using a seeded RNG.
+        Wraps the three resulting lists in ``BatchSet`` instances.
     """
-
+    
     _train: "BatchSet"
     _val:   "BatchSet"
     _test:  "BatchSet"
@@ -42,8 +41,8 @@ class Batcher:
         hdf5_db:        str,
         enc:            Encoding,
         batches:        list[tuple[int,int]],
+        seed:           int,
         atom_size_ceil: int   = -1,
-        seed:           int   = _SEED,
         train_percent:  float = _TRAIN,
         val_percent:    float = _VAL,
         test_percent:   float = _TEST

@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from jaxtyping import Float, jaxtyped
 from beartype import beartype
+from beartype.typing import Tuple
 from ..batching import Batch
 from .layer_head import LayerHead
 from .intensity_mlp import IntensityMLP
@@ -38,7 +39,7 @@ class OutputHead(nn.Module):
         self,
         batch: Batch,
         msg_head: LayerHead,
-    ) -> Float[torch.Tensor, "N Q"]:
+    ) -> Tuple[Float[torch.Tensor, "N Q"], Float[torch.Tensor, "N,M,Q"]]:
         """
         Args:
             batch:    input batch; uses padding_mask (N,M) to zero padded atoms
@@ -55,5 +56,5 @@ class OutputHead(nn.Module):
         mask   = batch.padding_mask().unsqueeze(-1)                   # (N,M,1)
         weighted = contribs * f_mags * mask                           # (N,M,Q)
 
-        # sum atom contributions -> (N,Q)
-        return weighted.sum(dim=1)
+        # sum atom contributions -> (N,Q), form factors -> (N,M,Q)
+        return weighted.sum(dim=1), f_mags

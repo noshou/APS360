@@ -1,87 +1,80 @@
+import numpy as np 
+import torch
 import torch.nn.functional as F
-from torch import sin, cos, exp, nn
-from ..batching import Batch
-from jaxtyping import jaxtyped
-from beartype import beartype
-from .layer_head import LayerHead
 
-
-
+from torch        import cos, nn
+from ..batching   import Batch
+from jaxtyping    import jaxtyped
+from beartype     import beartype
+from .layer_head  import LayerHead
+from numpy.random import Generator
 class MessagePass(nn.Module):
-    
-    """
-    MessagePass: 
-        λ₂ rounds of Gaussian-weighted neighbour aggregation.
-        Each round, atom i collects a weighted mean of neighbour embeddings,
-        weighted by rbf = exp(-d²/2σ²), where σ is atom i's learned bandwidth.
-        Geometry is fixed per batch; only embed.embeds evolves across rounds.
-    
-    Training: O(M²) full distance matrix.
-    
-    Inference: replace with KD-tree + σ cutoff for O(M·K).
-    """
 
     _lambda_2: int          # number of message passing rounds
+    _lambda_5: int          # resolution for RFF
     _project2: nn.Linear    # projects λ₁ dimension to 2 * λ₁ for GLU
-    _sigbilin: nn.Bilinear  # after λ₂ rounds, recalculates sigma estimates
-    
-    def __init__(self, lambda_1: int, lambda_2: int, q_points: int):
+    _rng_gen_: Generator    # random number generator
+    _omegafrq: nn.Parameter
+    _biasterm: nn.Parameter    
+    def __init__(self, lambda_1: int, lambda_2: int, lambda_5: int, seed):
         super().__init__()
 
         if lambda_2 <= 0:
             raise ValueError(f"invalid lambda_2 (must be > 0): {lambda_2}")
         
         self._lambda_2 = lambda_2
+        self._lambda_5 = lambda_5
         self._project2 = nn.Linear(lambda_1, 2 * lambda_1)
-        self._sigbilin = nn.Bilinear(lambda_1, q_points, lambda_1)
-        self._sigmalin = nn.Linear(lambda_1, 1)
-
+        self._rng_gen_ = np.random.default_rng(seed=seed)
+        self._omegafrq = nn.Parameter(torch.from_numpy(self._rng_gen_.standard_normal((self._lambda_5, 3))).float())
+        self._biasterm = nn.Parameter(torch.from_numpy(self._rng_gen_.uniform(0, 2*np.pi, size=(self._lambda_5))).float())
+        
     @jaxtyped(typechecker=beartype)
     def forward(self, batch: Batch, embed_head: LayerHead, eps: float=1e-8) -> LayerHead:
         
         """
-        Run λ₂ rounds of message passing on the given batch.
+        Run λ₂ rounds of RFF-based message passing on the given batch.
 
         Args:
-            batch:      molecule geometry; provides radii (N,M) and angle (N,M,2)
-            embed_head: output of Embed; embeds (N,M,1,λ₁) and sigmas (N,M,Q,1)
+            batch:      molecule geometry; uses coord (N,M,3) Cartesian positions
+            embed_head: output of Embed; embeds (N,M,1,λ₁), f_mags (N,M,Q,1)
 
         Returns:
-            new LayerHead with embeds updated to (N,M,Q,λ₁); f_mags and sigmas unchanged
+            new LayerHead with embeds updated; f_mags unchanged
         """
 
-        # broadcast theta, phi angles
-        t_i = batch.angle[:,:,0].unsqueeze(-1)
-        t_j = batch.angle[:,:,0].unsqueeze(-2)
-        p_i = batch.angle[:,:,1].unsqueeze(-1)
-        p_j = batch.angle[:,:,1].unsqueeze(-2)
-
-        # broadcast radial distances
-        r_i = batch.radii.unsqueeze(-1)
-        r_j = batch.radii.unsqueeze(-2)
-
-        # d_ij² = r_i² + r_j² - 2·r_i·r_j·(sin(θ_i)sin(θ_j)cos(φ_i - φ_j) + cos(θ_i)cos(θ_j))
-        # d_ij_sq is N x M_i x M_j, so need to transform to N x M_i x M_j x 1 x 1
-        d_ij_sq = r_i ** 2 + r_j ** 2 - 2 * r_i * r_j * (sin(t_i) * sin(t_j) * cos(p_i-p_j) + cos(t_i) * cos(t_j))
-        d_ij_sq = d_ij_sq.unsqueeze(-1).unsqueeze(-1)
-
-        # now we calculate radial basis kernel, mask padded atoms 
-        # where rbf has dimension N X M_i x M_j x Q x 1
-        # since sigma has dimensions N x M x Q x 1, we must unsqueeze it to N x M_i x 1 x Q x 1
-        # we clamp sigma since masked elements result in NaN which could cause issues
-        rbf = exp(-(d_ij_sq/(2*embed_head.sigmas.clamp(min=eps).unsqueeze(-3)**2)))
-        rbf = rbf * batch.padding_mask().unsqueeze(-2).unsqueeze(-1).unsqueeze(-1)
+        # calc dot product btwn atom's position and d-th frequency vector, add phase shift (bias)
+        # proj[N, M, λ₅] = Σ_k  omega[d, k] * coord[n, m, k]  +  bias[d]
+        proj = batch.coord @ self._omegafrq.T + self._biasterm
         
+        # calculate matrix of rff features per atom
+        zrff = (2/self._lambda_5) ** 0.5 * cos(proj)
+        zrff = zrff * batch.padding_mask().unsqueeze(-1)
+                    
+        # aggregate total rff features per atom per frequency per molecule
+        # features[N, λ₅] = Σ_m  zrff[n, m, λ₅]
+        features = zrff.sum(dim=1)
+        
+        # normalize against locality to get weighted average vs weighted sum
+        # weighted[N, M] = Σ_d  zrff[n, m, λ₅] * denom_sum[n, λ₅]
+        weighted = torch.einsum('nmd, nd -> nm', zrff, features)
+
         # create mutable embed, message pass λ₂ times
         embeds = embed_head.embeds
         for _ in range(self._lambda_2):
             
-            # aggregate over M_j neighbours to get chemical environment
-            # we use weighted average since sum would skew towards larger aggregates
-            # aggregate has dimension N x M x Q x λ₁, since M_j collapses with sum dim=-3
-            # need to unsqueeze embeds from N x M x Q x λ₁ -> N x 1 x M x Q x λ₁
-            aggregate = ((rbf*embeds.unsqueeze(-4)).sum(dim=-3) / (rbf.sum(dim=-3) + eps)) 
-
+            # aggregate over all M neighbours to get chemical environment 
+            # chem_env[N, Q, λ₅, λ₁] = Σ_m  zrff[N, M, λ₅] * embeds[N, M, Q, λ₁]
+            chem_env = torch.einsum('nmd, nmql -> nqdl', zrff, embeds)              
+            
+            # aggregate neighbourhood embeddings by takeing dot product 
+            # of each atom against the chemical environment
+            # locality[N, M, Q, λ₁] = Σ_d  zrff[n, m, λ₅] * chem_env[n, q, λ₅, λ₁]
+            locality = torch.einsum('nmd, nqdl -> nmql', zrff, chem_env)
+            
+            # aggregate (N,M,Q,λ₁)
+            aggregate = locality / weighted.unsqueeze(-1).unsqueeze(-1).clamp(min=eps) 
+            
             # gate aggregate using MishGLU
             # mask gated_aggregate instead of aggregate since
             # SwiGLU allows small outputs at x=0
@@ -93,13 +86,5 @@ class MessagePass(nn.Module):
             # update embedding vector using residual connection
             embeds = embeds + gated_aggregate
 
-        # since we have "learned" from chemical env, we should update sigma values
-        # first:  bilinear layer with new embeds (N x M x Q x λ₁) + old sigmas (N x M x Q x 1)
-        #         where we transform sigmas to (N x M x 1 x Q). Results in a 
-        #         new tensor of shape (N x M x Q x λ₁)
-        # second: linear layer collapses to (N x M x Q x 1)
-        sig_bilin = F.mish(self._sigbilin(embeds, embed_head.sigmas.squeeze(-1).unsqueeze(-2)))
-        sig_lin   = F.softplus(self._sigmalin(sig_bilin))
-                
         # output layer head
-        return embed_head._replace(embeds=embeds, sigmas=sig_lin)
+        return embed_head._replace(embeds=embeds)
