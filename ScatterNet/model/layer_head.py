@@ -14,3 +14,4 @@ class LayerHead(NamedTuple):
     
     embeds: Float[torch.Tensor, "N M * λ₁"] # atom embeddings
     f_mags: Float[torch.Tensor, "N M Q 1"]  # form factor magnitudes
+    sigmas: Float[torch.Tensor, "N M Q 1"]  # per-atom positional scaling factor

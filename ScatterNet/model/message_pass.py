@@ -4,30 +4,35 @@ import torch.nn.functional as F
 
 from torch        import cos, nn
 from ..batching   import Batch
-from jaxtyping    import jaxtyped
+from jaxtyping    import jaxtyped, Float
 from beartype     import beartype
 from .layer_head  import LayerHead
 from numpy.random import Generator
 class MessagePass(nn.Module):
 
-    _lambda_2: int          # number of message passing rounds
-    _lambda_5: int          # resolution for RFF
-    _project2: nn.Linear    # projects λ₁ dimension to 2 * λ₁ for GLU
-    _rng_gen_: Generator    # random number generator
-    _omegafrq: nn.Parameter
-    _biasterm: nn.Parameter    
-    def __init__(self, lambda_1: int, lambda_2: int, lambda_5: int, seed):
+    _lambda_2: int                         # number of message passing rounds
+    _lambda_5: int                         # resolution for RFF
+    _proj_agg: nn.Linear                   # projects λ₁ dimension to 2 * λ₁ for aggregate GLU
+    _proj_sig: nn.Linear                   # projects Q  dimension to 2 * Q  for sigma GLU
+    _omegafrq: Float[torch.Tensor, "λ₅ 3"] # rotational frequencies; isotropic when sampled randomly enough times
+    _biasterm: nn.Parameter                # phase shift "bias" term, can be learned since it just simply rotates
+    _sigbilin: nn.Bilinear                 # bilinear layer for updating sigmas
+    
+    def __init__(self, lambda_1: int, lambda_2: int, lambda_5: int, seed: int, q_points: int):
         super().__init__()
 
         if lambda_2 <= 0:
             raise ValueError(f"invalid lambda_2 (must be > 0): {lambda_2}")
+
+        rng = np.random.default_rng(seed=seed)
         
         self._lambda_2 = lambda_2
         self._lambda_5 = lambda_5
-        self._project2 = nn.Linear(lambda_1, 2 * lambda_1)
-        self._rng_gen_ = np.random.default_rng(seed=seed)
-        self._omegafrq = nn.Parameter(torch.from_numpy(self._rng_gen_.standard_normal((self._lambda_5, 3))).float())
-        self._biasterm = nn.Parameter(torch.from_numpy(self._rng_gen_.uniform(0, 2*np.pi, size=(self._lambda_5))).float())
+        self._proj_agg = nn.Linear(lambda_1, 2 * lambda_1)
+        self._proj_sig = nn.Linear(q_points, 2 * q_points)
+        self.register_buffer('_omegafrq', torch.from_numpy(rng.standard_normal((lambda_5, 3))).float())
+        self._biasterm = nn.Parameter(torch.from_numpy(rng.uniform(0, 2*np.pi, size=(self._lambda_5))).float())
+        self._sigbilin = nn.Bilinear(lambda_1, q_points, q_points)
         
     @jaxtyped(typechecker=beartype)
     def forward(self, batch: Batch, embed_head: LayerHead, eps: float=1e-8) -> LayerHead:
@@ -42,49 +47,66 @@ class MessagePass(nn.Module):
         Returns:
             new LayerHead with embeds updated; f_mags unchanged
         """
-
-        # calc dot product btwn atom's position and d-th frequency vector, add phase shift (bias)
-        # proj[N, M, λ₅] = Σ_k  omega[d, k] * coord[n, m, k]  +  bias[d]
-        proj = batch.coord @ self._omegafrq.T + self._biasterm
         
-        # calculate matrix of rff features per atom
-        zrff = (2/self._lambda_5) ** 0.5 * cos(proj)
-        zrff = zrff * batch.padding_mask().unsqueeze(-1)
-                    
-        # aggregate total rff features per atom per frequency per molecule
-        # features[N, λ₅] = Σ_m  zrff[n, m, λ₅]
-        features = zrff.sum(dim=1)
-        
-        # normalize against locality to get weighted average vs weighted sum
-        # weighted[N, M] = Σ_d  zrff[n, m, λ₅] * denom_sum[n, λ₅]
-        weighted = torch.einsum('nmd, nd -> nm', zrff, features)
-
-        # create mutable embed, message pass λ₂ times
+        # create mutable embed and sigmas, message pass λ₂ times
         embeds = embed_head.embeds
+        sigmas = embed_head.sigmas
         for _ in range(self._lambda_2):
             
-            # aggregate over all M neighbours to get chemical environment 
-            # chem_env[N, Q, λ₅, λ₁] = Σ_m  zrff[N, M, λ₅] * embeds[N, M, Q, λ₁]
-            chem_env = torch.einsum('nmd, nmql -> nqdl', zrff, embeds)              
             
-            # aggregate neighbourhood embeddings by takeing dot product 
-            # of each atom against the chemical environment
-            # locality[N, M, Q, λ₁] = Σ_d  zrff[n, m, λ₅] * chem_env[n, q, λ₅, λ₁]
-            locality = torch.einsum('nmd, nqdl -> nmql', zrff, chem_env)
-            
-            # aggregate (N,M,Q,λ₁)
-            aggregate = locality / weighted.unsqueeze(-1).unsqueeze(-1).clamp(min=eps) 
-            
+            # RFF kernel approximates RBF kernel exp(-||r_i - r_j||² / 2σ²)
+            # scaling coordinates by sigma is equivalent to scaling the kernel bandwidth:
+            # exp(-||r_i - r_j||² / 2σ²) = exp(-||r_i/σ - r_j/σ||² / 2)
+            # large sigma → small scaled coords → long-range aggregation (low q)
+            # small sigma → large scaled coords → short-range aggregation (high q)
+            # crds: (N, M, 1, 3) / (N, M, Q, 1) → (N, M, Q, 3)
+            crds = batch.coord.unsqueeze(-2) / sigmas
+
+            # project each atom's scaled position onto λ₅ frequency vectors, add phase shift
+            # proj[n, m, q, d] = Σ_k  omega[d, k] * crds[n, m, q, k]  +  bias[d]
+            # proj: (N, M, Q, λ₅)
+            proj = crds @ self._omegafrq.T + self._biasterm
+
+            # RFF features: z[n,m,q,d] = sqrt(2/λ₅) * cos(proj[n,m,q,d])
+            # dot product z[i]·z[j] ≈ exp(-||r_i/σ - r_j/σ||² / 2)
+            # zrff: (N, M, Q, λ₅)
+            zrff = (2/self._lambda_5) ** 0.5 * cos(proj)
+            zrff = zrff * batch.padding_mask().unsqueeze(-1).unsqueeze(-1)
+
+            # precompute sum of RFF features over atoms (loop-invariant given fixed zrff)
+            # features[n, q, d] = Σ_m  zrff[n, m, q, d]
+            # features: (N, Q, λ₅)
+            features = zrff.sum(dim=1)
+
+            # denominator: kernel weight sum per atom
+            # weighted[n, m, q] = Σ_d  zrff[n,m,q,d] * features[n,q,d] ≈ Σ_{m'} k(m, m')
+            # weighted: (N, M, Q)
+            weighted = torch.einsum('nmqd, nqd -> nmq', zrff, features)
+
+            # numerator: kernel-weighted sum of neighbour embeddings
+            # chem_env[n, q, d, l] = Σ_m  zrff[n,m,q,d] * embeds[n,m,q,l]
+            # chem_env: (N, Q, λ₅, λ₁)
+            chem_env = torch.einsum('nmqd, nmql -> nqdl', zrff, embeds)
+
+            # locality[n, m, q, l] = Σ_d  zrff[n,m,q,d] * chem_env[n,q,d,l]
+            #                      ≈ Σ_{m'} k(m, m') * embeds[m']
+            # locality: (N, M, Q, λ₁)
+            locality = torch.einsum('nmqd, nqdl -> nmql', zrff, chem_env)
+
+            # weighted average: aggregate[n,m,q,l] = locality / weighted
+            # (N, M, Q, λ₁) / (N, M, Q, 1)
+            aggregate = locality / weighted.unsqueeze(-1).abs().clamp(min=eps)
+
             # gate aggregate using MishGLU
             # mask gated_aggregate instead of aggregate since
-            # SwiGLU allows small outputs at x=0
-            embed_proj = self._project2(aggregate)
+            # MishGLU allows small outputs at x=0
+            embed_proj = self._proj_agg(aggregate)
             embed_proj1, embed_proj2 = embed_proj.chunk(2, dim=-1)
             gated_aggregate = embed_proj1 * F.mish(embed_proj2)
             gated_aggregate = gated_aggregate * batch.padding_mask().unsqueeze(-1).unsqueeze(-1)
-            
-            # update embedding vector using residual connection
-            embeds = embeds + gated_aggregate
 
-        # output layer head
-        return embed_head._replace(embeds=embeds)
+            # update embeddings and sigmas via residual connections
+            embeds = embeds + gated_aggregate
+            sigmas = sigmas + F.softplus(self._sigbilin(embeds, embed_head.f_mags.transpose(-1, -2))) + eps
+
+        return embed_head._replace(embeds=embeds, sigmas=sigmas)

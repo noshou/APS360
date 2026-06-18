@@ -1,10 +1,11 @@
 import torch
+
 from torch               import nn
 from jaxtyping           import Float, jaxtyped
 from beartype            import beartype
-from ScatterNet.batching import Batch
-from ScatterNet.model    import Embed, MessagePass, OutputHead
-
+from beartype.typing     import Tuple
+from .batching import Batch
+from .model    import Embed, MessagePass, OutputHead
 
 class ScatterNet(nn.Module):
 
@@ -32,16 +33,16 @@ class ScatterNet(nn.Module):
         lambda_3: int,
         lambda_4: int,
         lambda_5: int,
-        q_points: int,
-        msg_seed: int
+        msg_seed: int,
+        q_points: int
     ) -> None:
         super().__init__()
         self._embed = Embed(lambda_1, q_points)
-        self._msg   = MessagePass(lambda_1, lambda_2, lambda_5, msg_seed)
+        self._msg   = MessagePass(lambda_1, lambda_2, lambda_5, msg_seed, q_points)
         self._out   = OutputHead(lambda_1, lambda_3, lambda_4)
 
     @jaxtyped(typechecker=beartype)
-    def forward(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:
+    def forward(self, batch: Batch) -> Tuple[Float[torch.Tensor, "N Q"], Float[torch.Tensor, "N,M,Q"]]:
         """
         Args:
             batch: input batch of molecules

@@ -39,7 +39,7 @@ class OutputHead(nn.Module):
         self,
         batch: Batch,
         msg_head: LayerHead,
-    ) -> Tuple[Float[torch.Tensor, "N Q"], Float[torch.Tensor, "N,M,Q"]]:
+    ) -> Tuple[Float[torch.Tensor, "N Q"], Float[torch.Tensor, "N M Q"]]:
         """
         Args:
             batch:    input batch; uses padding_mask (N,M) to zero padded atoms

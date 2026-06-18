@@ -22,6 +22,7 @@ class Embed(nn.Module):
     _f0f1:   nn.Linear     # approximate real form factor at each q
     _f2:     nn.Linear     # approximate imaginary form factor at each q
     _prelu:  nn.PReLU      # prelu activation function
+    _sigma:  nn.Bilinear   # computes positional scaling factor based on embed and  f_mag
     
     def __init__(self, lambda_1: int, qPoints: int) -> None:
         """
@@ -30,11 +31,11 @@ class Embed(nn.Module):
             qPoints:   number of q-points (Q)
         """
         super().__init__()
-        self._mbd    = nn.Embedding(len(VOCAB)+1, lambda_1, padding_idx=0) # +1 since 0 is padding idx
-        self._f0f1   = nn.Linear(lambda_1, qPoints)
-        self._f2     = nn.Linear(lambda_1, qPoints)
-        self._prelu  = nn.PReLU(lambda_1)
-    
+        self._mbd   = nn.Embedding(len(VOCAB)+1, lambda_1, padding_idx=0) # +1 since 0 is padding idx
+        self._f0f1  = nn.Linear(lambda_1, qPoints)
+        self._f2    = nn.Linear(lambda_1, qPoints)
+        self._prelu = nn.PReLU(lambda_1)
+        self._sigma = nn.Bilinear(lambda_1, qPoints, qPoints)
     @jaxtyped(typechecker=beartype)
     def forward(self, batch: Batch, eps: float = 1e-8) -> LayerHead:
     
@@ -58,12 +59,18 @@ class Embed(nn.Module):
         f_img  = self._f2(embed)
         f_mag  = torch.hypot(f_rel, f_img) + eps
 
-        # get padding mask (N,M) -> (N,M,1,1)
-        masks = batch.padding_mask().unsqueeze(-1).unsqueeze(-1)
+        # get padding mask (N,M) -> (N,M,1)
+        masks = batch.padding_mask().unsqueeze(-1)
+
+        # clauclate sigmas (N, M, Q, 1)
+        sigma = (F.softplus(self._sigma(embed, f_mag)) + eps).unsqueeze(-1) * masks.unsqueeze(-1)
+        
+        # squeeze padding mask (N,M,1) -> (N,M,1,1)
+        masks = masks.unsqueeze(-1)
         
         # pad the layer heads to have correct dimensions, drop masked atoms:
         # embeds → (N, M, 1, λ₁); f_mags → (N, M, Q, 1)
         embeds = embed.unsqueeze(-2)
         f_mags = f_mag.unsqueeze(-1) * masks
         
-        return LayerHead(embeds=embeds, f_mags=f_mags)
+        return LayerHead(embeds=embeds, f_mags=f_mags, sigmas=sigma)
