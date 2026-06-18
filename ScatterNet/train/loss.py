@@ -11,6 +11,7 @@ from Preprocess          import VOCAB
 class Loss():
 
     _fmag_table: Float[torch.Tensor, "V Q"] # V = len(VOCAB) + 1
+    _q_weights_: Float[torch.Tensor, "1 Q"] # krastky weighting 
     
     def __init__(self, qgrid, energy):
         
@@ -24,49 +25,53 @@ class Loss():
         # 2. ion is special case, map to appropriate base case
         # 3. ion is not in vocab, use ground state
         for idx, ion in enumerate(VOCAB.ions):
-            if   ion in VOCAB.TRANSURANICS:
+            key = ion.lower()
+            if key in VOCAB.TRANSURANICS:
                 f_mag = torch.tensor(xraydb.f0(ion, sgrid)).float()
-            elif ion in VOCAB.SPECIAL_CASES.keys():
+            elif key in VOCAB.SPECIAL_CASES:
+                resolved = VOCAB.SPECIAL_CASES[key]
                 f_mag = torch.tensor(
                     np.hypot(
-                        xraydb.f0(VOCAB.SPECIAL_CASES[ion], sgrid) + 
-                        xraydb.f1_chantler(VOCAB.SPECIAL_CASES[ion], energy),
-                        xraydb.f2_chantler(VOCAB.SPECIAL_CASES[ion], energy)
+                        xraydb.f0(resolved, sgrid) +
+                        xraydb.f1_chantler(resolved, energy),
+                        xraydb.f2_chantler(resolved, energy)
                     )
                 ).float()
             else:
+                elem = re.sub(r'[0-9+\-]+$', '', key)
                 f_mag = torch.tensor(
                     np.hypot(
-                        xraydb.f0(ion, sgrid) + 
-                        xraydb.f1_chantler(re.sub(r'[0-9+\-]+$', '', ion), energy),
-                        xraydb.f2_chantler(re.sub(r'[0-9+\-]+$', '', ion), energy)
+                        xraydb.f0(ion, sgrid) +
+                        xraydb.f1_chantler(elem, energy),
+                        xraydb.f2_chantler(elem, energy)
                     )
-                ).float() 
+                ).float()
             self._fmag_table[idx + 1] = f_mag
         
-        return 
-    
+        self._q_weights_ = (1 + qgrid**2).unsqueeze(0)
+
     
     @jaxtyped(typechecker=beartype)
-    def _MSLE(
+    def _kratky_MSLE(
         self,
         output_head: Float[torch.Tensor, "N Q"], 
-        batch: Batch
+        batch: Batch,
         ) -> Float[torch.Tensor, "N Q"]: 
         
-        """Mean squared log error between predicted and ground-truth I(q).
-
-        Computes (log(1 + Î(q)) - log(1 + I(q)))² over all molecules and q-points.
+        """
+        Kratky regularized mean squared log error between predicted and ground-truth I(q).
+        Since low q intensities trend towards zero, allows better expressivity at high q. 
+        
+        Computes (1+q_i²)((ln(1 + Î(q)) - ln(1 + I(q))))² over all molecules and q-points.
 
         Args:
             output_head: predicted intensities from OutputHead, shape (N, Q)
             batch:       input batch; uses batch.iqval as ground truth, shape (N, Q)
-
         Returns:
             scalar loss tensor
         """
         preds = torch.log1p(output_head)
-        truth = torch.log1p(batch.iqval)
+        truth = self._q_weights_ * torch.log1p(batch.iqval)
         
         return (preds - truth) ** 2
 

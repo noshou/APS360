@@ -12,7 +12,7 @@ class _IonVocab:
     """
 
     # AS OF 2026: 98 neutral elements + 111 ionic forms + 2 special cases (sival, cval)
-    SPECIAL_CASES: ClassVar[dict[str, str]] = {"sival": "si", "cval": "c"}
+    SPECIAL_CASES: ClassVar[dict[str, str]] = {"siva": "si", "cval": "c"}
     
     # transuranics have f0 but no f1/f2
     TRANSURANICS:  ClassVar[frozenset[str]] = frozenset({

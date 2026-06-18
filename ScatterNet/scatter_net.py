@@ -42,7 +42,7 @@ class ScatterNet(nn.Module):
         self._out   = OutputHead(lambda_1, lambda_3, lambda_4)
 
     @jaxtyped(typechecker=beartype)
-    def forward(self, batch: Batch) -> Tuple[Float[torch.Tensor, "N Q"], Float[torch.Tensor, "N,M,Q"]]:
+    def forward(self, batch: Batch) -> Tuple[Float[torch.Tensor, "N Q"], Float[torch.Tensor, "N M Q"]]:
         """
         Args:
             batch: input batch of molecules
