@@ -1,8 +1,8 @@
 import torch
 
-from jaxtyping           import Float, jaxtyped
-from beartype            import beartype
-from typing              import Iterable
+from collections.abc    import Iterable
+from jaxtyping          import Float, jaxtyped
+from beartype           import beartype
 
 from ScatterNet.batching import Batch
 from Preprocess          import VOCAB
@@ -18,7 +18,10 @@ class CompositionBaseline(Baseline):
     Beating this baseline proves the model uses 3D coordinates, not just chemistry.
     """
 
-    _per_elem_iq: Float[torch.Tensor, "V Q"]
+    _per_elem_iq: Float[torch.Tensor, "V Q"] | None
+
+    def __init__(self) -> None:
+        self._per_elem_iq = None
 
     def fit(self, loader: Iterable[Batch]) -> "CompositionBaseline":
         """Build a per-element mean I(q) table from the training loader."""
@@ -34,8 +37,8 @@ class CompositionBaseline(Baseline):
             presence = (counts > 0).float()
             presence[:, 0] = 0.0
 
-            batch_sums = presence.T @ batch.iqval.float()  # (V, Q)
-            batch_presence = presence.sum(dim=0)           # (V,)
+            batch_sums     = presence.T @ batch.iqval.float()  # (V, Q)
+            batch_presence = presence.sum(dim=0)               # (V,)
 
             if sums is None or total_presence is None:
                 sums           = batch_sums
@@ -53,8 +56,10 @@ class CompositionBaseline(Baseline):
     @jaxtyped(typechecker=beartype)
     def __call__(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:
         """Return element-fraction-weighted mean I(q) per molecule."""
-        N, M = batch.vocab.shape
-        V    = len(VOCAB) + 1
+        if self._per_elem_iq is None:
+            raise RuntimeError("CompositionBaseline must be fit before calling")
+        N, M   = batch.vocab.shape
+        V      = len(VOCAB) + 1
         device = batch.vocab.device
 
         counts = torch.zeros(N, V, device=device).scatter_add_(
@@ -62,7 +67,6 @@ class CompositionBaseline(Baseline):
         )
         counts[:, 0] = 0.0
 
-        # normalise by total real atoms per molecule to get per-element fractions
         row_totals = counts.sum(dim=1, keepdim=True).clamp(min=1)
         weights    = counts / row_totals  # (N, V)
 

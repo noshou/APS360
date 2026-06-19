@@ -13,9 +13,10 @@ class Embed(nn.Module):
     """
     Embed each atom into a learned representation and estimate its scattering strength.
 
-    Produces two outputs per atom:
-        - embeds: identity embedding in learned space (λ₁-dimensional)
-        - f_mags: learned form factor magnitude |f(q)| per q-point (N, M, Q, 1)
+    Produces three outputs per atom:
+        - embeds: learned identity embedding, shape (N, M, 1, λ₁)
+        - f_mags: form factor magnitude |f(q)| per q-point, shape (N, M, Q, 1)
+        - sigmas: RFF kernel bandwidth per q-point, shape (N, M, Q, 1)
     """
 
     _mbd:    nn.Embedding  # atom identity in learned space
@@ -37,14 +38,15 @@ class Embed(nn.Module):
         self._prelu = nn.PReLU(lambda_1)
         self._sigma = nn.Bilinear(lambda_1, qPoints, qPoints)
     @jaxtyped(typechecker=beartype)
-    def forward(self, batch: Batch, eps: float = 1e-8) -> LayerHead:
+    def forward(self, batch: Batch, eps: float) -> LayerHead:
     
         """
         Args:
             batch: input batch; uses batch.vocab (N, M) atom indices
+            eps:   numerical floor to avoid zero form factors and sigmas
 
         Returns:
-            EmbedHead with embeds (N,M,1,λ₁), f_mags (N,M,Q,1)
+            LayerHead with embeds (N,M,1,λ₁), f_mags (N,M,Q,1), sigmas (N,M,Q,1)
         """
         
         # get embedding: "what is this atom?" → (N, M, λ₁)
@@ -55,14 +57,14 @@ class Embed(nn.Module):
 
         # estimate form factors → (N, M, Q)
         # as above, must keep this stable at 3 dimensions
-        f_rel  = F.softplus(self._f0f1(embed)) + eps
+        f_rel  = self._f0f1(embed) + eps
         f_img  = self._f2(embed)
         f_mag  = torch.hypot(f_rel, f_img) + eps
 
         # get padding mask (N,M) -> (N,M,1)
         masks = batch.padding_mask().unsqueeze(-1)
 
-        # clauclate sigmas (N, M, Q, 1)
+        # compute sigmas (N, M, Q, 1)
         sigma = (F.softplus(self._sigma(embed, f_mag)) + eps).unsqueeze(-1) * masks.unsqueeze(-1)
         
         # squeeze padding mask (N,M,1) -> (N,M,1,1)

@@ -1,23 +1,27 @@
 import torch
-from torch import nn
-from jaxtyping import Float, jaxtyped
-from beartype import beartype
+import torch.nn.functional as F
+
+from torch           import nn
+from jaxtyping       import Float, jaxtyped
+from beartype        import beartype
 from beartype.typing import Tuple
-from ..batching import Batch
-from .layer_head import LayerHead
-from .intensity_mlp import IntensityMLP
+from ..batching      import Batch
+from .layer_head     import LayerHead
+from collections     import OrderedDict
+from numpy           import log2, floor
 
 class OutputHead(nn.Module):
-
+    
     """
-    OutputHead: collapses per-atom intensity contributions to a predicted I(q) curve.
+    Collapses per-atom contributions into a predicted I(q) curve.
 
-    For each atom, IntensityMLP produces a scalar contribution per q-point.
-    Those contributions are weighted by the atom's form factor magnitude and
-    summed over all atoms to give the predicted I(q) for each molecule.
+    For each atom, combines its embedding with its form factor magnitude via a bilinear
+    layer, passes through an MLP, weights by f_mags^2 (Debye diagonal prior), and sums
+    over atoms to produce I(q) per molecule.
     """
-
-    _mlp: IntensityMLP
+    
+    _bilinear: nn.Bilinear   
+    _mlp:      nn.Sequential 
 
     def __init__(
         self,
@@ -25,14 +29,25 @@ class OutputHead(nn.Module):
         lambda_3: int,
         lambda_4: int,
     ) -> None:
-        """
-        Args:
-            lambda_1: atom embedding dimension
-            lambda_3: hidden dimension of IntensityMLP
-            lambda_4: number of halving steps in IntensityMLP compression
-        """
         super().__init__()
-        self._mlp = IntensityMLP(lambda_1, lambda_3, lambda_4)
+        
+        if lambda_4 <= 0:
+            raise ValueError("lambda_4 must be > 0")
+        if lambda_4 > floor(log2(lambda_3)):
+            raise ValueError(f"lambda_4 must be <= {int(floor(log2(lambda_3)))} for lambda_3={lambda_3}")
+
+        self._bilinear = nn.Bilinear(lambda_1, 1, lambda_3)
+
+        dims = [lambda_3 // 2**i for i in range(lambda_4 + 1)]
+        if dims[-1] != 1:
+            dims.append(1)
+
+        ldicts = OrderedDict()
+        for i in range(len(dims) - 1):
+            ldicts[f"layer_{i}"] = nn.Linear(dims[i], dims[i+1])
+            if i < len(dims) - 2:
+                ldicts[f"activation_{i}"] = nn.Mish()
+        self._mlp = nn.Sequential(ldicts)
 
     @jaxtyped(typechecker=beartype)
     def forward(
@@ -40,21 +55,21 @@ class OutputHead(nn.Module):
         batch: Batch,
         msg_head: LayerHead,
     ) -> Tuple[Float[torch.Tensor, "N Q"], Float[torch.Tensor, "N M Q"]]:
-        """
-        Args:
-            batch:    input batch; uses padding_mask (N,M) to zero padded atoms
-            msg_head: output of MessagePass; embeds (N,M,Q,λ₁), f_mags (N,M,Q,1)
+        
+        # 1. Pass through bilinear layer: (N,M,Q, λ₁) x (N,M,Q,1) -> (N,M,Q,λ₃)
+        atomic_contrib = F.mish(self._bilinear(msg_head.embeds, msg_head.f_mags))
 
-        Returns:
-            predicted I(q) per molecule: (N, Q)
-        """
-        # (N,M,Q,1) -> (N,M,Q)
-        contribs = self._mlp(msg_head).squeeze(-1)
+        # 2. MLP compression -> (N,M,Q,1) -> Squeeze to (N,M,Q)
+        contribs = F.softplus(self._mlp(atomic_contrib)).squeeze(-1)
 
-        # weight by form factor magnitude and zero out padded atoms
-        f_mags = msg_head.f_mags.squeeze(-1)                          # (N,M,Q)
-        mask   = batch.padding_mask().unsqueeze(-1)                   # (N,M,1)
-        weighted = contribs * f_mags * mask                           # (N,M,Q)
+        # 3. Squeeze true form factors down to (N,M,Q)
+        f_mags = msg_head.f_mags.squeeze(-1)                          
+        
+        # 4. Get mask and cast to float to prevent multiplication type errors
+        mask = batch.padding_mask().unsqueeze(-1).to(contribs.dtype) # (N,M,1)
+        
+        # 5. Apply weights and mask zeroing
+        weighted = contribs * f_mags**2 * mask  # (N,M,Q)
 
-        # sum atom contributions -> (N,Q), form factors -> (N,M,Q)
+        # 6. Sum along atom dimension M -> (N,Q)
         return weighted.sum(dim=1), f_mags

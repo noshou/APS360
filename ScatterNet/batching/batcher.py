@@ -19,14 +19,14 @@ class Batcher:
 
     Construction proceeds in two steps:
 
-    1. ``_batches_init`` — for each (min_atoms, max_atoms) size bucket, queries
-        SQLite for matching molecules sorted by atom count, then recursively splits
-        any bucket whose total atom count exceeds ``atom_size_ceil`` into balanced
+    1. ``_batches_init``: for each (min_atoms, max_atoms) size bucket, queries
+        the HDF5 metadata for matching molecules sorted by atom count, then recursively
+        splits any bucket whose total atom count exceeds ``atom_size_ceil`` into balanced
         sub-lists via binary search on a prefix-sum array. Produces a flat list of
         batches, each a list of (grp, stem, atoms) rows whose combined atom count
-        is ≤ ``atom_size_ceil``.
+        is <= ``atom_size_ceil``.
 
-    2. ``_batches_stratify`` — collapses any batch with fewer than 3 molecules into
+    2. ``_batches_stratify``: collapses any batch with fewer than 3 molecules into
         its nearest neighbour (by median atom count, ties go down), then splits each
         batch independently (default: 70/15/15) at the molecule level using a seeded RNG.
         Wraps the three resulting lists in ``BatchSet`` instances.

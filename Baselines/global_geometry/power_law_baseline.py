@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from typing          import Iterable
+from collections.abc import Iterable
 from jaxtyping       import Float, jaxtyped
 from beartype        import beartype
 from ScatterNet.batching import Batch

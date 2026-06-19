@@ -3,13 +3,12 @@ import re
 import numpy as np
 import torch
 
-from abc             import ABC, abstractmethod
-from typing          import Iterable
-from jaxtyping       import Float, jaxtyped
-from beartype        import beartype
+from abc                 import ABC, abstractmethod
+from collections.abc     import Iterable
+from jaxtyping           import Float, jaxtyped
+from beartype            import beartype
 from ScatterNet.batching import Batch
 from Preprocess          import VOCAB
-
 
 @jaxtyped(typechecker=beartype)
 def build_fmag_table(

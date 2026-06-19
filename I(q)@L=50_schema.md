@@ -13,13 +13,13 @@ Produced by `buildDB()` in `load_data.py`. The file is opened in append mode (`'
 
 | Path           | dtype   | Shape  | Compression          | Description                                     |
 | -------------- | ------- | ------ | -------------------- | ----------------------------------------------- |
-| `/q_grid`      | float64 | `(Q,)` | ZFP lossless         | Momentum transfer grid in Å⁻¹; `Q = len(qvals)` |
+| `/q_grid`      | float64 | `(Q,)` | ZFP lossless         | Momentum transfer grid in angstrom^-1; `Q = len(qvals)` |
 | `/sources_tsv` | uint8   | `(N,)` | Bitshuffle + Zstd-22 | Raw bytes of provenance TSV (optional)          |
 | `/makeup_tsv`  | uint8   | `(M,)` | Bitshuffle + Zstd-22 | Raw bytes of ion makeup TSV (optional)          |
 
 Both TSV datasets are written once and never overwritten on subsequent runs.
 
-## Molecule data — `/<group>/<stem>/`
+## Molecule data -- `/<group>/<stem>/`
 
 Each `.xyz` file produces one HDF5 group nested two levels deep.
 
@@ -41,8 +41,8 @@ Each `.xyz` file produces one HDF5 group nested two levels deep.
 | attribute | `name`         | Molecule name string (from XYZ line 2)                                                                      |
 | dataset   | `I_q`          | Orientationally-averaged scattering intensity, float32 `(Q,)`, ZFP lossless                                 |
 | dataset   | `coords`       | Centroid-subtracted Cartesian coordinates, float64 `(n, 3)`, ZFP lossless                                   |
-| dataset   | `angles`       | Spherical angles, float64 `(n, 2)`: col 0 = theta (polar, 0→π), col 1 = phi (azimuthal, 0→2π), ZFP lossless |
-| dataset   | `r`            | Radial distances from centroid in Å, float64 `(n,)`, ZFP lossless                                           |
+| dataset   | `angles`       | Spherical angles, float64 `(n, 2)`: col 0 = theta (polar, 0 to pi), col 1 = phi (azimuthal, 0 to 2pi), ZFP lossless |
+| dataset   | `r`            | Radial distances from centroid in angstroms, float64 `(n,)`, ZFP lossless                                   |
 | dataset   | `elms`         | Element symbol per atom, variable-length UTF-8 string `(n,)`, uncompressed                                  |
 
 `Q` is the number of points in `/q_grid` and is fixed for the whole file. `n` varies per molecule.
@@ -55,7 +55,7 @@ theta[i] = arccos(z[i] / r[i])   (0 if r = 0)
 phi[i]   = arctan2(y[i], x[i])
 ```
 
-Form factors are **not** stored — they are recomputed from `xraydb`.
+Form factors are **not** stored -- they are recomputed from `xraydb`.
 
 ## Groups
 
@@ -90,6 +90,34 @@ The `groups` argument maps each group name to a directory of `.xyz` files. Every
 
 `elms` is a variable-length UTF-8 string dataset and is stored uncompressed.
 
+## B-tree corruption recovery (rcsb_med, June 2026)
+
+The `rcsb_med` group B-tree was corrupted mid-build (at roughly 40% completion, ~40k of 101,989 entries written). Standard h5py operations on it (`del`, `keys()`) raised checksum errors. Recovery procedure:
+
+### Step 1 -- OHDR binary scan
+
+Scan the raw file with `mmap.find(b'OHDR')`, skip non-v2 headers (version byte != 2), then call `H5Oopen_by_addr` via ctypes on h5py's bundled libhdf5 to open each candidate object directly by byte offset, bypassing the corrupted B-tree. Each call is wrapped in a `signal.SIGALRM` timeout (1 s) to prevent infinite hangs on pathological corrupted objects. Valid molecule groups are written incrementally to a recovery file (checkpoint every 200 molecules for resume safety).
+
+Result: 37 GB file, 4.7 M OHDR signatures, ~26 min, 25 timeouts.
+
+**Warning -- zombie objects**: OHDR scan finds ALL HDF5 objects ever written to the file, including orphaned objects from previous build runs that were logically deleted but not physically zeroed. After recovery, cross-check every recovered key against the source XYZ directory and delete any key with no matching `<stem>.xyz`. In this run: 107,616 raw hits, 67,616 were garbage (old unprefixed hydration_shells orphans from a previous naming convention), leaving 40,000 legitimate rcsb_med entries.
+
+### Step 2 -- Fresh file rebuild
+
+`del hf['rcsb_med']` also fails with checksum errors on a corrupted group. Solution: build a new file from scratch using `h5py.File.copy()` (H5Ocopy -- raw chunk copy, no decompression) to transfer all intact top-level groups/datasets from the original, then copy rcsb_med from the recovery file. Rename rebuilt file over original.
+
+Result: ~12 min to rebuild.
+
+### Step 3 -- Resume build_db
+
+With the recovered 40,000 entries in place, `build_db.py` resumes normally: it opens the file in append mode, skips entries that already exist, and fills in the remaining 61,989 rcsb_med entries plus all subsequent groups (rcsb_sml, si_ge_clusters, tmQM, viro3D).
+
+### Key tools
+
+- `h5clear -s <file>`: reset write-open flags left by an interrupted write
+- `H5Oopen_by_addr` (ctypes): open HDF5 objects by raw byte offset, bypassing B-trees
+- `signal.SIGALRM`: bound hanging C-library calls to a fixed timeout
+
 ## Crash safety
 
 Entries are written under a temporary name `__tmp__<stem>` and atomically moved to `<stem>` only after shape assertions pass. Any `__tmp__*` keys found at startup are cleaned up before processing resumes.
@@ -99,8 +127,8 @@ Entries are written under a temporary name `__tmp__<stem>` and atomically moved 
 | Parameter | Value       |
 | --------- | ----------- |
 | energy    | 12 500 eV   |
-| qMin      | 0 Å⁻¹       |
-| qMax      | 0.5 Å⁻¹     |
-| step      | 0.01 Å⁻¹    |
+| qMin      | 0 angstrom^-1       |
+| qMax      | 0.5 angstrom^-1     |
+| step      | 0.01 angstrom^-1    |
 | Q         | 51 points   |
 | lMax      | set at call |

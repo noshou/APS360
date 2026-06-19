@@ -3,24 +3,27 @@ import re
 import numpy as np
 import torch
 
+from torch               import nn
 from jaxtyping           import jaxtyped, Float
 from beartype            import beartype
 from ScatterNet.batching import Batch
 from Preprocess          import VOCAB
 
-class Loss():
+class Loss(nn.Module):
 
     _fmag_table: Float[torch.Tensor, "V Q"] # V = len(VOCAB) + 1
-    _q_weights_: Float[torch.Tensor, "1 Q"] # krastky weighting 
+    _q_weights_: Float[torch.Tensor, "1 Q"] # kratky weighting 
     
     def __init__(self, qgrid, energy):
         
-        self._fmag_table = torch.zeros(len(VOCAB)+1, len(qgrid))
+        super().__init__()
         
+        fmag_table = torch.zeros(len(VOCAB)+1, len(qgrid))
+
         # convert q vector to s vector
         sgrid = (qgrid / (4 * torch.pi)).numpy()
-        
-        # special cases: 
+
+        # special cases:
         # 1. ion is transuranic,  skip f1/f2
         # 2. ion is special case, map to appropriate base case
         # 3. ion is not in vocab, use ground state
@@ -46,11 +49,11 @@ class Loss():
                         xraydb.f2_chantler(elem, energy)
                     )
                 ).float()
-            self._fmag_table[idx + 1] = f_mag
-        
-        self._q_weights_ = (1 + qgrid**2).unsqueeze(0)
+            fmag_table[idx + 1] = f_mag
 
-    
+        self.register_buffer('_fmag_table', fmag_table)
+        self.register_buffer('_q_weights_', (1 + qgrid**2).unsqueeze(0))
+
     @jaxtyped(typechecker=beartype)
     def _kratky_MSLE(
         self,
@@ -59,21 +62,22 @@ class Loss():
         ) -> Float[torch.Tensor, "N Q"]: 
         
         """
-        Kratky regularized mean squared log error between predicted and ground-truth I(q).
-        Since low q intensities trend towards zero, allows better expressivity at high q. 
-        
-        Computes (1+q_i²)((ln(1 + Î(q)) - ln(1 + I(q))))² over all molecules and q-points.
+        Kratky-weighted MSLE between predicted and ground-truth I(q).
+
+        Applies per-q weight (1+q^2) to emphasize high-q structure that would otherwise
+        be dominated by the steep low-q signal. Uses log1p to handle the wide dynamic
+        range of I(q) values.
+
+        Computes (1+q_i^2) * (log1p(I_hat(q)) - log1p(I(q)))^2 per molecule and q-point.
 
         Args:
-            output_head: predicted intensities from OutputHead, shape (N, Q)
+            output_head: predicted intensities, shape (N, Q)
             batch:       input batch; uses batch.iqval as ground truth, shape (N, Q)
         Returns:
-            scalar loss tensor
+            per-molecule per-q losses, shape (N, Q)
         """
-        preds = torch.log1p(output_head)
-        truth = self._q_weights_ * torch.log1p(batch.iqval)
-        
-        return (preds - truth) ** 2
+        residual = torch.log1p(output_head) - torch.log1p(batch.iqval)
+        return self._q_weights_ * residual ** 2
 
     @jaxtyped(typechecker=beartype)
     def _ff_penalty(
@@ -84,13 +88,12 @@ class Loss():
         ) -> Float[torch.Tensor, "N Q"]:
         
         # retreive real form factor magnitudes, N x M x Q, log normalize them
-        f_mag_real = torch.log1p(self._fmag_table.to(batch.vocab.device)[batch.vocab])
-        self._fmag_table = self._fmag_table.to(batch.vocab.device)
+        f_mag_real = torch.log1p(self._fmag_table[batch.vocab])
         f_mag_pred = torch.log1p(f_mag_pred)
-        
-        # since number of atoms can fluctuate depending on batch, 
-        # we normalize our penalization term to n_atoms 
-        n_atoms = batch.padding_mask().sum(dim=1, keepdim=True).float()  # (N, 1)
+
+        # since number of atoms can fluctuate depending on batch,
+        # we normalize our penalization term to n_atoms
+        n_atoms = batch.padding_mask().sum(dim=1, keepdim=True).float().clamp(min=1)  # (N, 1)
         
         # calculate l2 loss (log normalized), reduce to N x Q dimenions
         mask = batch.padding_mask().unsqueeze(-1)  # (N, M, 1)
@@ -105,7 +108,7 @@ class Loss():
         lambda_6: float 
     ) -> Float[torch.Tensor, ""]:
         
-        msle_loss  = self._MSLE(output_head, batch)
+        msle_loss  = self._kratky_MSLE(output_head, batch)
         ff_penalty = self._ff_penalty(f_mag_pred, batch, lambda_6)
         
         return (msle_loss + ff_penalty).mean()
