@@ -1,5 +1,8 @@
 # I(q)@L=50 Database
 
+## NOTE
+The network architecture is beign validated on QM9, tmQM, hydration_shells, mofs, and cluster groups **only**. 
+
 Produced by `buildDB()` in `load_data.py`. The file is opened in append mode (`'a'`), so existing entries are skipped on resume.
 
 ## Root attributes
