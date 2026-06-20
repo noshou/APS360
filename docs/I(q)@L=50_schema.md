@@ -1,10 +1,5 @@
 # I(q)@L=50 Database
 
-Two files are maintained:
-
-- **`I(q)@L=50.h5`** — full database including COD (41.6 GB)
-- **`I(q)@L=50_train.h5`** — training subset with COD excluded (23.4 GB); this is the file used for model training
-
 Produced by `buildDB()` in `load_data.py`. The file is opened in append mode (`'a'`), so existing entries are skipped on resume.
 
 ## Root attributes
@@ -66,41 +61,25 @@ Form factors are **not** stored -- they are recomputed from `xraydb`.
 
 The `groups` argument maps each group name to a directory of `.xyz` files. Every group becomes a top-level HDF5 group containing one subgroup per molecule.
 
-### Training file groups (`I(q)@L=50_train.h5`)
-
-| Group                                   | Number of Molecules | Molecule Size Range | Description |
-| --------------------------------------- | ------------------- | ------------------- | ----------- |
-| QM9                                     | 133,844             | 3-29                |             |
-| tmQM                                    | 108,541             | 7-569               |             |
-| rcsb_med                                | 46,495              | 3,000-18,222        |             |
-| hydration_shells                        | 48,571              | 3-147               |             |
-| mofs                                    | 30,868              | 10-24,948           |             |
-| (Na,Co,Ag,Pb,Mo,Fe)_monoatomic_clusters | 1,282               | 2-380               |             |
-| binary_clusters                         | 371                 | 2-55*               |             |
-| si_ge_clusters                          | 217                 | 4-60                |             |
-| ar_ne_clusters                          | 127                 | 2-55                |             |
-| (NaCl)_nCl-                             | 70                  | 3-71                |             |
+| Group                                   | Number of Molecules | Molecule Size Range | Descriptions |
+| --------------------------------------- | ------------------- | ------------------- | ------------ |
+| COD                                     | 532,612             | 1-78,818            |              |
+| QM9                                     | 133,844             | 3-29                |              |
+| tmQM                                    | 108,540             | 7-569               |              |
+| rcsb_med                                | 101,989             | 3,000 - 18,222      |              |
+| rcsb_sml                                | 96,184              | 28-6,121            |              |
+| viro3D                                  | 85,063              | 180-64,938          |              |
+| hydration_shells                        | 48,571              | 3-147               |              |
+| mofs                                    | 30,871              | 10-24,948           |              |
+| (Na,Co,Ag,Pb,Mo,Fe)_monoatomic_clusters | 1,282               | 2-380               |              |
+| binary_clusters                         | 317                 | 2-55*               |              |
+| si_ge_clusters                          | 217                 | 4-60                |              |
+| ar_ne_clusters                          | 127                 | 2-55                |              |
+| (NaCl)_nCl-                             | 70                  | 3-71                |              |
 
 **one outlier (CuAu55_CuAu38.xyz) is at 1,482*
 
-**TRAINING TOTAL: 370,386 molecules**
-
-### Full database additional group (`I(q)@L=50.h5` only)
-
-| Group | Number of Molecules | Molecule Size Range | Description |
-| ----- | ------------------- | ------------------- | ----------- |
-| COD   | 532,612             | 1-78,818            | Excluded from training file; crystallographic structures with high redundancy |
-
-**FULL DATABASE TOTAL: 902,998 molecules**
-
-### Planned future groups (logged in `sources_tsv`, not yet computed)
-
-| Group    | Planned Molecules | Molecule Size Range | Description |
-| -------- | ----------------- | ------------------- | ----------- |
-| rcsb_sml | 96,184            | 28-6,121            | Smaller RCSB PDB structures; requires additional compute |
-| viro3D   | 85,063            | 180-64,938          | Virus protein structure predictions                      |
-
-`sources_tsv` already contains provenance entries for all planned groups. Molecule data will be added via `build_db.py` when compute is available.
+**TOTAL MOLECULES: 1,139,743**
 
 ## Compression codecs
 
