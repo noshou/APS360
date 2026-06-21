@@ -1,5 +1,33 @@
 # I(q)@L=50 Database
 
+## Retrieving the dataset
+
+The HDF5 files are hosted on HuggingFace at **[noshou/iq_train_set](https://huggingface.co/datasets/noshou/iq_train_set)**.
+
+Download with the HuggingFace CLI (recommended — resumes interrupted downloads):
+
+```bash
+pip install huggingface_hub
+huggingface-cli download noshou/iq_train_set "I(q)@L=50.h5" \
+    --repo-type dataset --local-dir Preprocess/
+```
+
+Or in Python:
+
+```python
+from huggingface_hub import hf_hub_download
+hf_hub_download(
+    repo_id   = "noshou/iq_train_set",
+    filename  = "I(q)@L=50.h5",
+    repo_type = "dataset",
+    local_dir = "Preprocess/",
+)
+```
+
+Place the downloaded file at `Preprocess/I(q)@L=50.h5` (the path all pipeline scripts expect).
+
+---
+
 Two files are maintained:
 
 - **`I(q)@L=50.h5`** — full database including COD (41.6 GB)

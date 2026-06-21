@@ -14,8 +14,8 @@ from Baselines.local_geometry  import NNBaseline, PairPeakBaseline
 
 # ── config ────────────────────────────────────────────────────────────────────
 
-HDF5_PATH    = "I(q)@L=50.h5"
-DB_NAME      = "scatternet"
+HDF5_PATH    = "Preprocess/I(q)@L=50.h5"
+DB_NAME      = "Preprocess/scatternet"
 RESULTS_PATH = "Baselines/baseline_results.json"
 BATCHER_SEED = 0
 ATOM_SIZE_CEIL: int = -1
@@ -86,7 +86,7 @@ BUCKETS: list[tuple[int, int]] = [
 
 with h5py.File(HDF5_PATH, "r") as f:
     q_grid = torch.tensor(f["q_grid"][:]).float()   # type: ignore[index]
-    energy = float(f["energy"][()])                  # type: ignore[index]
+energy = 12_500.0  # eV; not stored in HDF5, fixed pipeline constant
 
 enc = Encoding(DB_NAME, HDF5_PATH)
 

@@ -11,8 +11,8 @@ import h5py
 import os
 import sys
 
-SRC  = "I(q)@L=50.h5"
-DST  = "I(q)@L=50_train.h5"
+SRC  = "Preprocess/I(q)@L=50.h5"
+DST  = "Preprocess/I(q)@L=50_train.h5"
 SKIP = {"COD"}  # add groups to skip here
 
 if not os.path.exists(SRC):

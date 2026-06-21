@@ -11,8 +11,8 @@ from ScatterNet.train     import Loss
 
 # ── hyperparameters ──────────────────────────────────────────────────────────
 
-HDF5_PATH  = "I(q)@L=50.h5"
-DB_NAME    = "scatternet"
+HDF5_PATH  = "Preprocess/I(q)@L=50.h5"
+DB_NAME    = "Preprocess/scatternet"
 CKPT_BEST   = "scatternet_best.pt"   # lean inference checkpoint (fp16 weights only)
 CKPT_RESUME = "scatternet_resume.pt" # full state for resuming training (overwritten each epoch)
 METRICS_PATH = "scatternet_metrics.json"
@@ -48,7 +48,7 @@ ATOM_SIZE_CEIL    = -1   # -1 = auto (3x max atom count in bucket)
 
 with h5py.File(HDF5_PATH, "r") as f:
     q_grid = torch.tensor(f["q_grid"][:]).float()       # type: ignore[index]
-    energy = float(f["energy"][()])                     # type: ignore[index]
+energy = 12_500.0  # eV; not stored in HDF5, fixed pipeline constant
 
 q_points = len(q_grid)
 

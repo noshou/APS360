@@ -99,7 +99,9 @@ class Encoding:
                         if stem.startswith("__tmp__") or not isinstance(mol_obj, h5py.Group):
                             continue
                         try:
-                            enc = self._encode_ions(mol_obj["elms"][:].tolist())  # type: ignore
+                            raw = mol_obj["elms"][:].tolist()  # type: ignore
+                            elms = [e.decode() if isinstance(e, bytes) else e for e in raw]
+                            enc = self._encode_ions(elms)
                         except (LookupError, ValueError):
                             continue
 
@@ -206,6 +208,14 @@ class Encoding:
 
     def max_atom_count(self) -> int:
         """Return the largest atom count across all molecules in the database."""
+        if hasattr(self, "_max") and self._max is not None:
+            return self._max
+        conn = sqlite3.connect(self._path)
+        try:
+            row = conn.execute("SELECT MAX(atoms) FROM items").fetchone()
+            self._max = row[0] if row[0] is not None else 0
+        finally:
+            conn.close()
         return self._max
     
     def count(self) -> int:

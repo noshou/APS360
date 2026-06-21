@@ -207,9 +207,9 @@ class Batcher:
             val_batches  .append([batch[j] for j in idx[n_trn:n_trn + n_val]])
             test_batches .append([batch[j] for j in idx[n_trn + n_val:n_trn + n_val + n_tst]])
 
-        self._train = BatchSet(hdf5_db, enc, train_batches)
-        self._val   = BatchSet(hdf5_db, enc, val_batches)
-        self._test  = BatchSet(hdf5_db, enc, test_batches)
+        self._train = BatchSet(hdf5_db, enc, [b for b in train_batches if b])
+        self._val   = BatchSet(hdf5_db, enc, [b for b in val_batches   if b])
+        self._test  = BatchSet(hdf5_db, enc, [b for b in test_batches  if b])
     
     def get_sets(self) -> Tuple[BatchSet, BatchSet, BatchSet]:
         return self._train, self._val, self._test

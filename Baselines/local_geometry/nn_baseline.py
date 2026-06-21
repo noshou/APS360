@@ -50,12 +50,21 @@ class NNBaseline(Baseline):
                 preds.append(torch.zeros(qgrid.shape[0], device=device))
                 continue
 
+            # subsample to avoid O(M²) OOM on large molecules
+            MAX_M = 4096
+            vocab_n = batch.vocab[n][mask[n]]
+            if m > MAX_M:
+                sub = torch.randperm(m, device=device)[:MAX_M]
+                coords_n = coords_n[sub]
+                vocab_n  = vocab_n[sub]
+                m = MAX_M
+
             diff  = coords_n.unsqueeze(0) - coords_n.unsqueeze(1)  # (m, m, 3)
             dists = diff.norm(dim=-1)                               # (m, m)
             dists.fill_diagonal_(float('inf'))
             r_nn  = dists.min(dim=1).values.mean()
 
-            f0  = ftable[batch.vocab[n][mask[n]], 0]
+            f0  = ftable[vocab_n, 0]
             i0  = f0.sum() ** 2
 
             qr   = qgrid * r_nn

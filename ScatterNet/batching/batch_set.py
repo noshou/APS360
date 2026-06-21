@@ -73,7 +73,8 @@ class BatchSet(Dataset):
         with h5py.File(self._db_path, "r") as db:
             for grp, stem, _ in rows:
                 mol = db[grp][stem]									   # type: ignore
-                elms = mol["elms"][:].tolist()                         # type: ignore
+                raw  = mol["elms"][:].tolist()                         # type: ignore
+                elms = [e.decode() if isinstance(e, bytes) else e for e in raw]
                 vocab.append(torch.tensor(self._enc._encode_ions(elms)))
                 iqval.append(torch.tensor(mol["I_q"][:]))              # type: ignore
                 coord.append(torch.tensor(mol["coords"][:]))           # type: ignore

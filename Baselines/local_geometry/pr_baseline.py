@@ -54,6 +54,15 @@ class PairPeakBaseline(Baseline):
                 preds.append(torch.zeros(qgrid.shape[0], device=device))
                 continue
 
+            # subsample to avoid O(M²) OOM on large molecules
+            MAX_M = 4096
+            vocab_n = batch.vocab[n][mask[n]]
+            if m > MAX_M:
+                sub = torch.randperm(m, device=device)[:MAX_M]
+                coords_n = coords_n[sub]
+                vocab_n  = vocab_n[sub]
+                m = MAX_M
+
             diff  = coords_n.unsqueeze(0) - coords_n.unsqueeze(1)  # (m, m, 3)
             dists = diff.norm(dim=-1)                               # (m, m)
             idx   = torch.triu_indices(m, m, offset=1)
@@ -62,7 +71,7 @@ class PairPeakBaseline(Baseline):
             hist    = torch.histc(dists, bins=self._n_bins, min=0.0, max=dists.max().item())
             r_peak  = (hist.argmax().float() + 0.5) * dists.max() / self._n_bins
 
-            f0  = ftable[batch.vocab[n][mask[n]], 0]
+            f0  = ftable[vocab_n, 0]
             i0  = f0.sum() ** 2
 
             qr   = qgrid * r_peak
