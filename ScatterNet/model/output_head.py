@@ -16,8 +16,11 @@ class OutputHead(nn.Module):
     Collapses per-atom contributions into a predicted I(q) curve.
 
     For each atom, combines its embedding with its form factor magnitude via a bilinear
-    layer, passes through an MLP, weights by f_mags^2 (Debye diagonal prior), and sums
-    over atoms to produce I(q) per molecule.
+    layer, passes the result through an MLP, weights by f_mags^2 (Debye diagonal prior),
+    and sums over atoms to produce I(q) per molecule.
+
+    The forward pass is gradient checkpointed in ScatterNet to avoid storing the
+    (N, M, Q, lambda_3) bilinear output tensor during backward.
     """
     
     _bilinear: nn.Bilinear   

@@ -165,7 +165,7 @@ class Batcher:
                 if i == 0:
                     batches_flat[1] = batches_flat[0] + batches_flat[1]
                     batches_flat.pop(0)
-                    # don't advance i — recheck index 0 (the merged batch)
+                    # don't advance i; recheck index 0 (the merged batch)
                 elif i == len(batches_flat) - 1:
                     batches_flat[i - 1] = batches_flat[i - 1] + batches_flat[i]
                     batches_flat.pop(i)

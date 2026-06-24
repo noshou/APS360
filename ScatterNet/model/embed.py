@@ -32,6 +32,7 @@ class Embed(nn.Module):
             lambda_1:  embedding dimension (λ₁)
             qPoints:   number of q-points (Q)
         """
+        
         super().__init__()
         self._mbd   = nn.Embedding(len(VOCAB)+1, lambda_1, padding_idx=0) # +1 since 0 is padding idx
         self._f0f1  = nn.Linear(lambda_1, qPoints)
@@ -53,7 +54,7 @@ class Embed(nn.Module):
         
         # get embedding: "what is this atom?" → (N, M, λ₁)
         # since linear layers apply to last dimension, must keep this order stable
-        # since we want to activate using prelu, but nn.PReLU() acts on dim=1 for dim > 2, 
+        # since we want to activate using prelu, but nn.PReLU() acts on dim=1 for |dim| >= 2, 
         # first transpose embed to (N,λ₁,M), do prelu, then re-transpose to (N,M,λ₁)
         embed = (self._prelu(self._mbd(batch.vocab).transpose(-1, -2))).transpose(-1, -2)
 

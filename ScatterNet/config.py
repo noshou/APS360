@@ -73,7 +73,7 @@ class RunConfig:
     lambda_7:     float          = 0.1    # sigma inverse-L1 regularisation weight
     eps_sigma:    float          = 1e-4   # floor inside the sigma penalty (separate from eps_msgp)
     
-    # data — override to restrict atom-size range (e.g. for smoke tests)
+    # data: override to restrict atom-size range (e.g. for smoke tests)
     buckets: list[tuple[int, int]] = field(default_factory=lambda: DEFAULT_BUCKETS)
     
     # cap batches per epoch (None = no limit; useful for quick sanity checks)

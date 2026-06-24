@@ -1,27 +1,31 @@
 import torch
 
-from torch           import nn
-from jaxtyping       import Float, jaxtyped
-from beartype        import beartype
-from beartype.typing import Tuple
-from .batching       import Batch
-from .model          import Embed, MessagePass, OutputHead
+from torch                  import nn
+from torch.utils.checkpoint import checkpoint
+from jaxtyping              import Float, jaxtyped
+from beartype               import beartype
+from beartype.typing        import Tuple
+from .batching              import Batch
+from .model                 import Embed, MessagePass, OutputHead
 
 class ScatterNet(nn.Module):
 
     """
     Full ScatterNet pipeline: Embed -> MessagePass -> OutputHead -> I(q).
 
-    Hyperparameters
-    ---------------
-    lambda_1: atom embedding dimension
-    lambda_2: number of message-passing rounds
-    lambda_3: OutputHead hidden width
-    lambda_4: number of halving steps in OutputHead MLP
-    lambda_5: number of RFF features in MessagePass
-    q_points: number of q-grid points (Q)
-    eps_embd: numerical floor for Embed (avoids division by zero)
-    eps_msgp: numerical floor for MessagePass (avoids division by zero)
+    Both MessagePass and OutputHead use gradient checkpointing to reduce peak
+    activation memory. This allows training on large molecules without OOM at
+    the cost of recomputing intermediates during backward.
+
+    Hyperparameters:
+        lambda_1: atom embedding dimension
+        lambda_2: number of message passing rounds
+        lambda_3: OutputHead hidden width
+        lambda_4: number of halving steps in OutputHead MLP
+        lambda_5: number of RFF features in MessagePass
+        q_points: number of q-grid points (Q)
+        eps_embd: numerical floor for Embed (avoids division by zero)
+        eps_msgp: numerical floor for MessagePass (avoids division by zero)
     """
 
     _embed:    Embed
@@ -68,4 +72,4 @@ class ScatterNet(nn.Module):
         
         embed_head = self._embed(batch, self._eps_embd)
         msg_head   = self._msg(batch, embed_head, self._eps_msgp)
-        return self._out(batch, msg_head)
+        return checkpoint(self._out, batch, msg_head, use_reentrant=False)  # type: ignore[return-value]
