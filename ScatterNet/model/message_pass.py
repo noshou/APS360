@@ -22,14 +22,15 @@ class MessagePass(nn.Module):
     peak activation memory, which is critical for large molecules where the
     (N, M, Q, lambda_5) RFF tensor would otherwise be stored lambda_2 times.
 
-    Each round runs in two passes over M-sized chunks of atoms (controlled by
-    msg_chunk) to avoid materialising the full (N, M, Q, lambda_5) tensor at once:
-        Pass 1: accumulate features (N, Q, lambda_5) and chem_env (N, Q, lambda_5, lambda_1)
-                by summing over all atom chunks. The full chem_env captures global
-                context: every atom contributes to every other atom's neighbourhood.
-        Pass 2: for each chunk, compute locality and weighted aggregate using the
-                globally-accumulated chem_env and features, then apply MishGLU and
-                update the chunk's embeddings and sigma bandwidths.
+    Each round chunks over both the N (molecule) and M (atom) dimensions to avoid
+    large intermediate tensors:
+
+        N-chunking: molecules are independent, so chem_env (N, Q, lambda_5, lambda_1)
+            is computed per N-chunk rather than for the full batch. Without this,
+            batches of many small molecules produce chem_env tensors of many GB.
+
+        M-chunking: within each N-chunk, atoms are processed in M-chunks to avoid
+            materialising the full (N_chunk, M, Q, lambda_5) RFF tensor at once.
 
     Per round:
         1. Scale atom coordinates by per-atom, per-q sigma bandwidths.
@@ -41,7 +42,7 @@ class MessagePass(nn.Module):
 
     _lambda_2:  int                          # number of message passing rounds
     _lambda_5:  int                          # number of RFF features
-    _msg_chunk: int                          # atoms per M-chunk to cap peak tensor size
+    _msg_chunk: int                          # N- and M-chunk size; caps peak tensor to (chunk, chunk, Q, lambda_5)
     _proj_agg:  nn.Linear                   # projects lambda_1 to 2*lambda_1 for MishGLU gate
     _omegafrq:  Float[torch.Tensor, "λ₅ 3"] # fixed random frequency matrix for RFF
     _biasterm:  nn.Parameter                # learned phase shift; preserves rotational invariance
@@ -75,12 +76,13 @@ class MessagePass(nn.Module):
         eps:          float,
     ):
         """
-        One round of RFF message passing, chunked along the M (atom) dimension.
+        One round of RFF message passing, chunked over both N (molecules) and M (atoms).
         Invoked via gradient checkpoint in forward.
 
-        Two passes over M-chunks avoid materialising the full (N, M, Q, lambda_5)
-        RFF tensor. The globally-accumulated chem_env ensures every atom still
-        attends to all others, preserving the all-pairs interaction.
+        N-chunking keeps chem_env (N_chunk, Q, lambda_5, lambda_1) small regardless of
+        batch size. Molecules are independent so N-chunking is mathematically exact.
+        M-chunking keeps the RFF tensor (N_chunk, M_chunk, Q, lambda_5) small for large
+        molecules. Both use msg_chunk as their chunk size.
 
         Args:
             embeds:       atom embeddings, shape (N, M, Q, lambda_1)
@@ -105,79 +107,89 @@ class MessagePass(nn.Module):
         # large sigma -> small scaled coords -> long-range aggregation (low q)
         # small sigma -> large scaled coords -> short-range aggregation (high q)
 
-        # Pass 1: accumulate global context across all atom chunks.
-        # features[n, q, d]    = sum_m  zrff[n,m,q,d]
-        # chem_env[n, q, d, l] = sum_m  zrff[n,m,q,d] * embeds[n,m,q,l]
-        # Neither output has the M dimension, so they fit in memory regardless of M.
-        features = coord.new_zeros(N, Q, self._lambda_5)
-        chem_env = coord.new_zeros(N, Q, self._lambda_5, L)
+        new_embeds_n = []
+        new_sigmas_n = []
 
-        for m0 in range(0, M, C):
-            m1 = min(m0 + C, M)
+        for n0 in range(0, N, C):
+            n1 = min(n0 + C, N)
+            Nc = n1 - n0
 
-            # crds_c: (N, chunk, 1, 3) / (N, chunk, Q, 1) -> (N, chunk, Q, 3)
-            crds_c = coord[:, m0:m1].unsqueeze(-2) / sigmas[:, m0:m1].clamp(min=eps)
+            emb_n   = embeds[n0:n1]        # (Nc, M, Q, L)
+            sig_n   = sigmas[n0:n1]        # (Nc, M, Q, 1)
+            coord_n = coord[n0:n1]         # (Nc, M, 3)
+            mask_n  = padding_mask[n0:n1]  # (Nc, M)
+            fmag_n  = f_mags[n0:n1]        # (Nc, M, Q, 1)
 
-            # proj_c[n, m, q, d] = sum_k  omega[d, k] * crds_c[n, m, q, k]  +  bias[d]
-            # proj_c: (N, chunk, Q, lambda_5)
-            proj_c = crds_c @ self._omegafrq.T + self._biasterm
+            # Pass 1: accumulate global context for this N-chunk across all M-chunks.
+            # features[nc, q, d]    = sum_m  zrff[nc,m,q,d]
+            # chem_env[nc, q, d, l] = sum_m  zrff[nc,m,q,d] * embeds[nc,m,q,l]
+            # Neither has the M dimension, so size is O(Nc * Q * lambda_5 * lambda_1).
+            features = coord_n.new_zeros(Nc, Q, self._lambda_5)
+            chem_env = coord_n.new_zeros(Nc, Q, self._lambda_5, L)
 
-            # RFF features: z[n,m,q,d] = sqrt(2/lambda_5) * cos(proj[n,m,q,d])
-            # dot product z[i] . z[j] ≈ exp(-||r_i/sigma - r_j/sigma||^2 / 2)
-            # zrff_c: (N, chunk, Q, lambda_5)
-            zrff_c   = (2/self._lambda_5) ** 0.5 * cos(proj_c)
-            mask_c   = padding_mask[:, m0:m1].unsqueeze(-1).unsqueeze(-1)
-            zrff_c   = zrff_c * mask_c
+            for m0 in range(0, M, C):
+                m1 = min(m0 + C, M)
 
-            features = features + zrff_c.sum(dim=1)
-            chem_env = chem_env + torch.einsum('nmqd, nmql -> nqdl', zrff_c, embeds[:, m0:m1])
+                # crds_c: (Nc, m_chunk, 1, 3) / (Nc, m_chunk, Q, 1) -> (Nc, m_chunk, Q, 3)
+                crds_c = coord_n[:, m0:m1].unsqueeze(-2) / sig_n[:, m0:m1].clamp(min=eps)
 
-        # Pass 2: compute per-chunk aggregate and update embeddings and sigmas.
-        # Each atom chunk uses the fully-accumulated chem_env and features, so every
-        # atom's output still depends on all other atoms (all-pairs interaction preserved).
-        new_embeds_chunks = []
-        new_sigmas_chunks = []
+                # proj_c[n, m, q, d] = sum_k  omega[d, k] * crds_c[n, m, q, k]  +  bias[d]
+                proj_c = crds_c @ self._omegafrq.T + self._biasterm
 
-        for m0 in range(0, M, C):
-            m1 = min(m0 + C, M)
+                # RFF features: z[n,m,q,d] = sqrt(2/lambda_5) * cos(proj[n,m,q,d])
+                # dot product z[i] . z[j] ≈ exp(-||r_i/sigma - r_j/sigma||^2 / 2)
+                zrff_c   = (2/self._lambda_5) ** 0.5 * cos(proj_c)
+                mask_c   = mask_n[:, m0:m1].unsqueeze(-1).unsqueeze(-1)
+                zrff_c   = zrff_c * mask_c
 
-            crds_c = coord[:, m0:m1].unsqueeze(-2) / sigmas[:, m0:m1].clamp(min=eps)
-            proj_c = crds_c @ self._omegafrq.T + self._biasterm
-            zrff_c = (2/self._lambda_5) ** 0.5 * cos(proj_c)
-            mask_c = padding_mask[:, m0:m1].unsqueeze(-1).unsqueeze(-1)
-            zrff_c = zrff_c * mask_c
+                features = features + zrff_c.sum(dim=1)
+                chem_env = chem_env + torch.einsum('nmqd, nmql -> nqdl', zrff_c, emb_n[:, m0:m1])
 
-            # locality[n, m, q, l] = sum_d  zrff[n,m,q,d] * chem_env[n,q,d,l]
-            #                      ≈ sum_{m'} k(m, m') * embeds[m']
-            # locality_c: (N, chunk, Q, lambda_1)
-            locality_c = torch.einsum('nmqd, nqdl -> nmql', zrff_c, chem_env)
+            # Pass 2: compute per-M-chunk aggregate using the fully-accumulated chem_env.
+            # Every atom still attends to all others via chem_env (all-pairs preserved).
+            new_emb_m = []
+            new_sig_m = []
 
-            # denominator: kernel weight sum per atom
-            # weighted[n, m, q] = sum_d  zrff[n,m,q,d] * features[n,q,d] ≈ sum_{m'} k(m, m')
-            # weights can be negative due to cosine features, clamp to avoid division issues
-            # weighted_c: (N, chunk, Q)
-            weighted_c = torch.einsum('nmqd, nqd -> nmq', zrff_c, features).abs().clamp(min=0)
+            for m0 in range(0, M, C):
+                m1 = min(m0 + C, M)
 
-            # weighted average: aggregate[n,m,q,l] = locality / weighted
-            # (N, chunk, Q, lambda_1) / (N, chunk, Q, 1)
-            agg_c = torch.nan_to_num(locality_c / weighted_c.unsqueeze(-1), nan=0.0, posinf=0.0, neginf=0.0)
+                crds_c = coord_n[:, m0:m1].unsqueeze(-2) / sig_n[:, m0:m1].clamp(min=eps)
+                proj_c = crds_c @ self._omegafrq.T + self._biasterm
+                zrff_c = (2/self._lambda_5) ** 0.5 * cos(proj_c)
+                mask_c = mask_n[:, m0:m1].unsqueeze(-1).unsqueeze(-1)
+                zrff_c = zrff_c * mask_c
 
-            # gate aggregate using MishGLU
-            # mask gated output instead of agg since MishGLU allows small outputs at x=0
-            p1_c, p2_c = self._proj_agg(agg_c).chunk(2, dim=-1)
-            gate_c  = p1_c * F.mish(p2_c)
-            gate_c  = gate_c * mask_c
+                # locality[n, m, q, l] = sum_d  zrff[n,m,q,d] * chem_env[n,q,d,l]
+                #                      ≈ sum_{m'} k(m, m') * embeds[m']
+                locality_c = torch.einsum('nmqd, nqdl -> nmql', zrff_c, chem_env)
 
-            # update embeddings and sigmas via residual connections
-            emb_c  = embeds[:, m0:m1] + gate_c
-            f_in_c = f_mags[:, m0:m1].transpose(-1, -2).expand(-1, -1, emb_c.shape[2], -1)
-            sig_c  = sigmas[:, m0:m1] + F.softplus(self._sigbilin(emb_c, f_in_c)) + eps
+                # denominator: kernel weight sum per atom
+                # weighted[n, m, q] = sum_d  zrff[n,m,q,d] * features[n,q,d] ≈ sum_{m'} k(m, m')
+                # weights can be negative due to cosine features, clamp to avoid division issues
+                weighted_c = torch.einsum('nmqd, nqd -> nmq', zrff_c, features).abs().clamp(min=0)
 
-            new_embeds_chunks.append(emb_c)
-            new_sigmas_chunks.append(sig_c)
+                # weighted average: aggregate[n,m,q,l] = locality / weighted
+                agg_c = torch.nan_to_num(locality_c / weighted_c.unsqueeze(-1), nan=0.0, posinf=0.0, neginf=0.0)
 
-        new_embeds = torch.cat(new_embeds_chunks, dim=1)
-        new_sigmas = torch.cat(new_sigmas_chunks, dim=1)
+                # gate aggregate using MishGLU
+                # mask gated output instead of agg since MishGLU allows small outputs at x=0
+                p1_c, p2_c = self._proj_agg(agg_c).chunk(2, dim=-1)
+                gate_c  = p1_c * F.mish(p2_c)
+                gate_c  = gate_c * mask_c
+
+                # update embeddings and sigmas via residual connections
+                emb_c  = emb_n[:, m0:m1] + gate_c
+                f_in_c = fmag_n[:, m0:m1].transpose(-1, -2).expand(-1, -1, emb_c.shape[2], -1)
+                sig_c  = sig_n[:, m0:m1] + F.softplus(self._sigbilin(emb_c, f_in_c)) + eps
+
+                new_emb_m.append(emb_c)
+                new_sig_m.append(sig_c)
+
+            new_embeds_n.append(torch.cat(new_emb_m, dim=1))  # (Nc, M, Q, L)
+            new_sigmas_n.append(torch.cat(new_sig_m, dim=1))  # (Nc, M, Q, 1)
+
+        new_embeds = torch.cat(new_embeds_n, dim=0)  # (N, M, Q, L)
+        new_sigmas = torch.cat(new_sigmas_n, dim=0)  # (N, M, Q, 1)
 
         return new_embeds, new_sigmas
 

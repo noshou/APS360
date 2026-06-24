@@ -166,12 +166,11 @@ def main(cfg: RunConfig | None = None):
 
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1:
-        print(f"using {n_gpus} GPUs via DataParallel")
-        model = torch.nn.DataParallel(model)
+        print(f"found {n_gpus} GPUs; using cuda:0 (DataParallel requires custom Batch scatter)")
 
     criterion = Loss(q_grid, energy).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scaler    = torch.cuda.amp.GradScaler(enabled=cfg.use_amp)  # type: ignore[attr-defined]
+    scaler    = torch.amp.GradScaler("cuda", enabled=cfg.use_amp)  # type: ignore[attr-defined]
 
     start_epoch = 1
     history: list = []
@@ -179,8 +178,7 @@ def main(cfg: RunConfig | None = None):
 
     if cfg.resume:
         ckpt = torch.load(cfg.resume, map_location=device)
-        raw_model = model.module if isinstance(model, torch.nn.DataParallel) else model
-        raw_model.load_state_dict(ckpt["model"])
+        model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
         best_val    = ckpt.get("val_loss", float("inf"))
@@ -258,10 +256,9 @@ def main(cfg: RunConfig | None = None):
         with open(cfg.metrics, "w") as fh:
             json.dump({"epochs": history}, fh, indent=2)
 
-        raw_model  = model.module if isinstance(model, torch.nn.DataParallel) else model
         torch.save({
             "epoch":     epoch,
-            "model":     raw_model.state_dict(),
+            "model":     model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "val_loss":  val_loss,
             "q_grid":    q_grid,
@@ -271,7 +268,7 @@ def main(cfg: RunConfig | None = None):
 
         if val_loss < best_val:
             best_val = val_loss
-            fp16_state = {k: v.half() for k, v in raw_model.state_dict().items()}
+            fp16_state = {k: v.half() for k, v in model.state_dict().items()}
             torch.save({
                 "epoch":    epoch,
                 "model":    fp16_state,
