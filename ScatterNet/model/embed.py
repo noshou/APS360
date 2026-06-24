@@ -26,6 +26,7 @@ class Embed(nn.Module):
     _sigma:  nn.Bilinear   # computes positional scaling factor based on embed and  f_mag
     
     def __init__(self, lambda_1: int, qPoints: int) -> None:
+        
         """
         Args:
             lambda_1:  embedding dimension (λ₁)
@@ -37,6 +38,7 @@ class Embed(nn.Module):
         self._f2    = nn.Linear(lambda_1, qPoints)
         self._prelu = nn.PReLU(lambda_1)
         self._sigma = nn.Bilinear(lambda_1, qPoints, qPoints)
+        
     @jaxtyped(typechecker=beartype)
     def forward(self, batch: Batch, eps: float) -> LayerHead:
     

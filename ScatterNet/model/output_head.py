@@ -54,7 +54,11 @@ class OutputHead(nn.Module):
         self,
         batch: Batch,
         msg_head: LayerHead,
-    ) -> Tuple[Float[torch.Tensor, "N Q"], Float[torch.Tensor, "N M Q"]]:
+    ) -> Tuple[
+            Float[torch.Tensor, "N Q"], 
+            Float[torch.Tensor, "N M Q"],
+            Float[torch.Tensor, "N M Q"]
+        ]:
         
         # 1. Pass through bilinear layer: (N,M,Q, λ₁) x (N,M,Q,1) -> (N,M,Q,λ₃)
         atomic_contrib = F.mish(self._bilinear(msg_head.embeds, msg_head.f_mags))
@@ -72,4 +76,4 @@ class OutputHead(nn.Module):
         weighted = contribs * f_mags**2 * mask  # (N,M,Q)
 
         # 6. Sum along atom dimension M -> (N,Q)
-        return weighted.sum(dim=1), f_mags
+        return weighted.sum(dim=1), f_mags, msg_head.sigmas.squeeze(-1)

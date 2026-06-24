@@ -51,14 +51,21 @@ class ScatterNet(nn.Module):
         self._eps_msgp = eps_msgp
         
     @jaxtyped(typechecker=beartype)
-    def forward(self, batch: Batch) -> Tuple[Float[torch.Tensor, "N Q"], Float[torch.Tensor, "N M Q"]]:
+    def forward(self, batch: Batch) -> Tuple[
+            Float[torch.Tensor, "N Q"], 
+            Float[torch.Tensor, "N M Q"],
+            Float[torch.Tensor, "N M Q"]
+        ]:
+        
         """
         Args:
             batch: input batch of molecules
         Returns:
-            iq:     predicted I(q) per molecule, shape (N, Q)
-            f_mags: per-atom form factor magnitudes, shape (N, M, Q)
+            iq:     predicted I(q) per molecule,       shape (N, Q)
+            f_mags: per-atom form factor magnitudes,   shape (N, M, Q)
+            sigmas: per-atom gaussian kernel bandwith, shape (N, M, Q)
         """
+        
         embed_head = self._embed(batch, self._eps_embd)
         msg_head   = self._msg(batch, embed_head, self._eps_msgp)
         return self._out(batch, msg_head)

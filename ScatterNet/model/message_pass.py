@@ -106,6 +106,7 @@ class MessagePass(nn.Module):
 
             # update embeddings and sigmas via residual connections
             embeds = embeds + gated_aggregate
-            sigmas = sigmas + F.softplus(self._sigbilin(embeds, embed_head.f_mags.transpose(-1, -2))) + eps
+            f_in   = embed_head.f_mags.transpose(-1, -2).expand(-1, -1, embeds.shape[2], -1)
+            sigmas = sigmas + F.softplus(self._sigbilin(embeds, f_in)) + eps
 
         return embed_head._replace(embeds=embeds, sigmas=sigmas)

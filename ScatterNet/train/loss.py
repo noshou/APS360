@@ -100,16 +100,34 @@ class Loss(nn.Module):
         return ((lambda_6*((f_mag_pred-f_mag_real)**2)*mask).sum(dim=1))/n_atoms
     
     @jaxtyped(typechecker=beartype)
+    def _sg_penalty(
+        self,
+        sigmas:   Float[torch.Tensor, "N M Q"],
+        lambda_7: float,
+        batch:    Batch,
+        eps:      float
+    ) -> Float[torch.Tensor, "N Q"]:
+
+        mask    = batch.padding_mask().unsqueeze(-1)          # (N, M, 1)
+        n_atoms = mask.sum(dim=1).clamp(min=1)               # (N, 1)
+        inv_sig = (lambda_7 / (sigmas + eps)) * mask         # (N, M, Q)
+        return inv_sig.sum(dim=1) / n_atoms                  # (N, Q)        
+    
+    @jaxtyped(typechecker=beartype)
     def loss(
         self,
         output_head: Float[torch.Tensor, "N Q"],
-        f_mag_pred: Float[torch.Tensor, "N M Q"], 
+        f_mag_pred:  Float[torch.Tensor, "N M Q"],
+        sigma_pred:  Float[torch.Tensor, "N M Q"],
         batch: Batch, 
-        lambda_6: float 
+        lambda_6: float,
+        lambda_7: float,
+        eps: float 
     ) -> Float[torch.Tensor, ""]:
         
         msle_loss  = self._kratky_MSLE(output_head, batch)
         ff_penalty = self._ff_penalty(f_mag_pred, batch, lambda_6)
+        sg_penalty = self._sg_penalty(sigma_pred, lambda_7, batch, eps)
         
-        return (msle_loss + ff_penalty).mean()
+        return (msle_loss + ff_penalty + sg_penalty).mean()
     

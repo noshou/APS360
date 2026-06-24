@@ -1,0 +1,30 @@
+# paths — override these for Kaggle (see kaggle_train.py for an example)
+hdf5:        Preprocess/I(q)@L=50.h5
+db:          Preprocess/scatternet
+ckpt_best:   scatternet_best.pt
+ckpt_resume: scatternet_resume.pt
+metrics:     scatternet_metrics.json
+
+# model architecture
+lambda_1: 64
+lambda_2: 3
+lambda_3: 128
+lambda_4: 3
+lambda_5: 256
+msg_seed: 42
+eps_embd: 1.0e-8
+eps_msgp: 1.0e-3
+
+# loss
+lambda_6:   0.1
+lambda_7:   0.1    # sigma inverse-L1 regularisation weight
+eps_sigma:  1.0e-4 # floor inside the sigma penalty
+
+# optimiser / training loop
+lr:            3.0e-4
+weight_decay:  1.0e-5
+grad_clip:     1.0
+epochs:        50
+batcher_seed:  0
+atom_size_ceil: -1
+num_workers: 4
