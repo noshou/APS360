@@ -48,6 +48,7 @@ def _parse_args():
     p.add_argument("--batcher_seed",  type=int,   default=None)
     p.add_argument("--atom_size_ceil",type=int,   default=None)
     p.add_argument("--num_workers",   type=int,   default=None)
+    p.add_argument("--use_amp",       type=lambda x: x.lower() != "false", default=None)
     return p.parse_args()
 
 
@@ -63,14 +64,15 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
     n_elem = 0
     with torch.no_grad():
         for batch in loader:
-            batch            = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
-            iq, fmags, sigmas = model(batch)
-            loss             = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7, cfg.eps_sigma)
+            batch             = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
+            with torch.autocast(device_type=device, enabled=cfg.use_amp):
+                iq, fmags, sigmas = model(batch)
+                loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7, cfg.eps_sigma)
             n = batch.iqval.shape[0]
             total_loss += loss.item() * n
             total_mols += n
-            log_pred   = torch.log1p(iq)
-            log_target = torch.log1p(batch.iqval)
+            log_pred   = torch.log1p(iq.float())
+            log_target = torch.log1p(batch.iqval.float())
             ss_res += ((log_pred - log_target) ** 2).sum().item()
             sum_y  += log_target.sum().item()
             sum_y2 += (log_target ** 2).sum().item()
@@ -116,6 +118,7 @@ def main(cfg: RunConfig | None = None):
             batcher_seed  = A.batcher_seed,
             atom_size_ceil= A.atom_size_ceil,
             num_workers   = A.num_workers,
+            use_amp       = A.use_amp,
         )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -161,8 +164,14 @@ def main(cfg: RunConfig | None = None):
         eps_msgp  = cfg.eps_msgp,
     ).to(device)
 
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1:
+        print(f"using {n_gpus} GPUs via DataParallel")
+        model = torch.nn.DataParallel(model)
+
     criterion = Loss(q_grid, energy).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scaler    = torch.cuda.amp.GradScaler(enabled=cfg.use_amp)  # type: ignore[attr-defined]
 
     start_epoch = 1
     history: list = []
@@ -170,7 +179,8 @@ def main(cfg: RunConfig | None = None):
 
     if cfg.resume:
         ckpt = torch.load(cfg.resume, map_location=device)
-        model.load_state_dict(ckpt["model"])
+        raw_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+        raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
         best_val    = ckpt.get("val_loss", float("inf"))
@@ -196,22 +206,27 @@ def main(cfg: RunConfig | None = None):
         train_sum_y2   = 0.0
         train_n_elem   = 0
 
+        torch.cuda.empty_cache()
+
         for _bi, batch in enumerate(train_loader):
             if cfg.max_batches is not None and _bi >= cfg.max_batches:
                 break
-            batch             = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
-            iq, fmags, sigmas = model(batch)
-            loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7, cfg.eps_sigma)
+            batch = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
             optimizer.zero_grad()
-            loss.backward()
+            with torch.autocast(device_type=device, enabled=cfg.use_amp):
+                iq, fmags, sigmas = model(batch)
+                loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7, cfg.eps_sigma)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             n = batch.iqval.shape[0]
             train_loss_sum += loss.item() * n
             train_mols     += n
             with torch.no_grad():
-                log_pred      = torch.log1p(iq)
-                log_target    = torch.log1p(batch.iqval)
+                log_pred      = torch.log1p(iq.float())
+                log_target    = torch.log1p(batch.iqval.float())
                 train_ss_res += ((log_pred - log_target) ** 2).sum().item()
                 train_sum_y  += log_target.sum().item()
                 train_sum_y2 += (log_target ** 2).sum().item()
@@ -243,9 +258,10 @@ def main(cfg: RunConfig | None = None):
         with open(cfg.metrics, "w") as fh:
             json.dump({"epochs": history}, fh, indent=2)
 
+        raw_model  = model.module if isinstance(model, torch.nn.DataParallel) else model
         torch.save({
             "epoch":     epoch,
-            "model":     model.state_dict(),
+            "model":     raw_model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "val_loss":  val_loss,
             "q_grid":    q_grid,
@@ -255,7 +271,7 @@ def main(cfg: RunConfig | None = None):
 
         if val_loss < best_val:
             best_val = val_loss
-            fp16_state = {k: v.half() for k, v in model.state_dict().items()}
+            fp16_state = {k: v.half() for k, v in raw_model.state_dict().items()}
             torch.save({
                 "epoch":    epoch,
                 "model":    fp16_state,
