@@ -39,48 +39,91 @@ DEFAULT_BUCKETS: list[tuple[int, int]] = [
 
 @dataclass
 class RunConfig:
-    
+    """
+    Full configuration for a ScatterNet training run.
+
+    Paths
+    -----
+    hdf5:           Path to the raw HDF5 dataset containing I(q) curves and coordinates.
+    db:             Stem path for the SQLite encoding database (Preprocess writes <db>-ENCODING.sqlite3).
+    ckpt_best:      Where to save the checkpoint with the lowest validation loss.
+    ckpt_resume:    Where to save the latest checkpoint for run resumption.
+    metrics:        JSON file that accumulates per-epoch train/val/test loss and R2.
+    resume:         Path to a checkpoint to resume from (None = train from scratch).
+
+    Model
+    -----
+    lambda_1:       Atom embedding dimension. Larger = more expressive per-atom features.
+    lambda_2:       Number of message passing rounds. Controls depth of neighbourhood aggregation.
+    lambda_3:       OutputHead hidden width. Halved lambda_4 times before the final linear.
+    lambda_4:       Number of halving steps in the OutputHead MLP (must satisfy 2^lambda_4 <= lambda_3).
+    lambda_5:       Number of Random Fourier Features. Controls RBF kernel approximation quality.
+    msg_seed:       RNG seed for the fixed RFF frequency matrix (reproducible across runs).
+    msg_chunk:      Atoms processed per M-chunk in MessagePass. Peak GPU tensor is
+                    (N, msg_chunk, Q, lambda_5); lower values trade speed for less memory.
+    eps_embd:       Numerical floor in the Embed module (avoids division by zero).
+    eps_msgp:       Numerical floor in MessagePass sigma clamping and aggregate denominator.
+
+    Loss
+    ----
+    lambda_6:       Weight on the form-factor penalty term.
+    lambda_7:       Weight on the sigma inverse-L1 regularisation (prevents RFF bandwidth collapse).
+    eps_sigma:      Floor inside the sigma penalty (separate from eps_msgp).
+
+    Training
+    --------
+    lr:             Adam learning rate.
+    weight_decay:   Adam L2 weight decay.
+    grad_clip:      Max gradient norm for gradient clipping (torch.nn.utils.clip_grad_norm_).
+    epochs:         Number of full passes over all batches.
+    batcher_seed:   RNG seed for the train/val/test molecule split (reproducible splits).
+    atom_size_ceil: Maximum total atoms per batch; batches exceeding this are split via binary
+                    search. -1 = auto (3x the largest molecule in the dataset).
+    num_workers:    DataLoader worker processes (0 = load in main process; use 0 for CPU debugging).
+    max_batches:    Cap on batches per epoch (None = no limit; useful for quick sanity checks).
+
+    Data
+    ----
+    buckets:        List of (min_atoms, max_atoms) size buckets to load. Molecules outside all
+                    buckets are ignored. Override to restrict the atom-size range (e.g. smoke tests).
+    """
+
     # paths
-    hdf5:         str            = "Preprocess/I(q)@L=50.h5"
-    db:           str            = "Preprocess/scatternet"
-    ckpt_best:    str            = "scatternet_best.pt"
-    ckpt_resume:  str            = "scatternet_resume.pt"
-    metrics:      str            = "scatternet_metrics.json"
-    resume:       Optional[str]  = None
-    
+    hdf5:           str            = "Preprocess/I(q)@L=50.h5"
+    db:             str            = "Preprocess/scatternet"
+    ckpt_best:      str            = "scatternet_best.pt"
+    ckpt_resume:    str            = "scatternet_resume.pt"
+    metrics:        str            = "scatternet_metrics.json"
+    resume:         Optional[str]  = None
+
     # model
-    lambda_1:     int            = 128
-    lambda_2:     int            = 5
-    lambda_3:     int            = 128
-    lambda_4:     int            = 4
-    lambda_5:     int            = 256
-    msg_seed:     int            = 42
-    eps_embd:     float          = 1e-8
-    eps_msgp:     float          = 1e-3
-    
+    lambda_1:       int            = 128
+    lambda_2:       int            = 5
+    lambda_3:       int            = 128
+    lambda_4:       int            = 4
+    lambda_5:       int            = 256
+    msg_seed:       int            = 42
+    msg_chunk:      int            = 1024
+    eps_embd:       float          = 1e-8
+    eps_msgp:       float          = 1e-3
+
     # loss
-    lambda_6:     float          = 0.1
-    
+    lambda_6:       float          = 0.1
+    lambda_7:       float          = 0.1
+    eps_sigma:      float          = 1e-4
+
     # training
-    lr:           float          = 3e-4
-    weight_decay: float          = 1e-5
-    grad_clip:    float          = 1.0
-    epochs:       int            = 50
-    batcher_seed: int            = 0
-    atom_size_ceil: int          = -1
-    
-    # loss
-    lambda_7:     float          = 0.1    # sigma inverse-L1 regularisation weight
-    eps_sigma:    float          = 1e-4   # floor inside the sigma penalty (separate from eps_msgp)
-    
-    # data: override to restrict atom-size range (e.g. for smoke tests)
+    lr:             float          = 3e-4
+    weight_decay:   float          = 1e-5
+    grad_clip:      float          = 1.0
+    epochs:         int            = 50
+    batcher_seed:   int            = 0
+    atom_size_ceil: int            = -1
+    num_workers:    int            = 4
+    max_batches:    Optional[int]  = None
+
+    # data
     buckets: list[tuple[int, int]] = field(default_factory=lambda: DEFAULT_BUCKETS)
-    
-    # cap batches per epoch (None = no limit; useful for quick sanity checks)
-    max_batches: Optional[int]     = None
-    
-    # data loading workers (0 = main process; set to 0 for local CPU debugging)
-    num_workers: int               = 4
 
 
 def load_config(config_path: Optional[str] = None, **cli_overrides) -> RunConfig:

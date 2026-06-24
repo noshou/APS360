@@ -33,6 +33,7 @@ def _parse_args():
     p.add_argument("--lambda_4",      type=int,   default=None)
     p.add_argument("--lambda_5",      type=int,   default=None)
     p.add_argument("--msg_seed",      type=int,   default=None)
+    p.add_argument("--msg_chunk",     type=int,   default=None)
     p.add_argument("--eps_embd",      type=float, default=None)
     p.add_argument("--eps_msgp",      type=float, default=None)
     # loss
@@ -102,6 +103,7 @@ def main(cfg: RunConfig | None = None):
             lambda_4      = A.lambda_4,
             lambda_5      = A.lambda_5,
             msg_seed      = A.msg_seed,
+            msg_chunk     = A.msg_chunk,
             eps_embd      = A.eps_embd,
             eps_msgp      = A.eps_msgp,
             lambda_6      = A.lambda_6,
@@ -147,15 +149,16 @@ def main(cfg: RunConfig | None = None):
     # ── model ─────────────────────────────────────────────────────────────────
 
     model = ScatterNet(
-        lambda_1 = cfg.lambda_1,
-        lambda_2 = cfg.lambda_2,
-        lambda_3 = cfg.lambda_3,
-        lambda_4 = cfg.lambda_4,
-        lambda_5 = cfg.lambda_5,
-        msg_seed = cfg.msg_seed,
-        q_points = q_points,
-        eps_embd = cfg.eps_embd,
-        eps_msgp = cfg.eps_msgp,
+        lambda_1  = cfg.lambda_1,
+        lambda_2  = cfg.lambda_2,
+        lambda_3  = cfg.lambda_3,
+        lambda_4  = cfg.lambda_4,
+        lambda_5  = cfg.lambda_5,
+        msg_seed  = cfg.msg_seed,
+        msg_chunk = cfg.msg_chunk,
+        q_points  = q_points,
+        eps_embd  = cfg.eps_embd,
+        eps_msgp  = cfg.eps_msgp,
     ).to(device)
 
     criterion = Loss(q_grid, energy).to(device)

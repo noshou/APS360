@@ -18,14 +18,15 @@ class ScatterNet(nn.Module):
     the cost of recomputing intermediates during backward.
 
     Hyperparameters:
-        lambda_1: atom embedding dimension
-        lambda_2: number of message passing rounds
-        lambda_3: OutputHead hidden width
-        lambda_4: number of halving steps in OutputHead MLP
-        lambda_5: number of RFF features in MessagePass
-        q_points: number of q-grid points (Q)
-        eps_embd: numerical floor for Embed (avoids division by zero)
-        eps_msgp: numerical floor for MessagePass (avoids division by zero)
+        lambda_1:  atom embedding dimension
+        lambda_2:  number of message passing rounds
+        lambda_3:  OutputHead hidden width
+        lambda_4:  number of halving steps in OutputHead MLP
+        lambda_5:  number of RFF features in MessagePass
+        msg_chunk: atoms per M-chunk in MessagePass; peak tensor is (N, msg_chunk, Q, lambda_5)
+        q_points:  number of q-grid points (Q)
+        eps_embd:  numerical floor for Embed (avoids division by zero)
+        eps_msgp:  numerical floor for MessagePass (avoids division by zero)
     """
 
     _embed:    Embed
@@ -42,14 +43,15 @@ class ScatterNet(nn.Module):
         lambda_4: int,
         lambda_5: int,
         msg_seed: int,
+        msg_chunk: int,
         q_points: int,
         eps_embd: float,
         eps_msgp: float
     ) -> None:
-        
+
         super().__init__()
         self._embed    = Embed(lambda_1, q_points)
-        self._msg      = MessagePass(lambda_1, lambda_2, lambda_5, msg_seed, q_points)
+        self._msg      = MessagePass(lambda_1, lambda_2, lambda_5, msg_seed, q_points, msg_chunk)
         self._out      = OutputHead(lambda_1, lambda_3, lambda_4)
         self._eps_embd = eps_embd
         self._eps_msgp = eps_msgp
