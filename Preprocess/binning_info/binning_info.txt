@@ -1,6 +1,6 @@
 ================================================================================
 BINNING ANALYSIS — I(q)@L=50.h5
-Generated: 2026-06-20 
+Generated: 2026-06-25
 ================================================================================
 
 DATASET SUMMARY
@@ -106,11 +106,11 @@ Pad ratio range:      0.10 – 1.00  (mean 0.94)
 All bins ≥ 0.60 pad:  True (last bin excluded — 78k outlier)
 
 NOTE ON atom_size_ceil:
-  Default = 3 × max_atom_count = 3 × 78,819 = 236,457 atoms/batch.
+  Set to 78,819 atoms/batch (explicit; previously auto = 3 × 78,819 = 236,457).
   This controls actual training batch size, not the bins above.
-  For bin (6047,78819): molecules sorted by size, prefix-sum split at 236k.
-  The 78k outlier gets isolated into its own 1-molecule sub-batch,
-  which _batches_stratify merges into its nearest neighbour automatically.
+  For bin (6047,78819): molecules sorted by size, prefix-sum split at 78,819.
+  Most molecules (mean 7,550 atoms) fit ~10 per sub-batch; the 78k outlier
+  is isolated into its own 1-molecule sub-batch automatically.
 
 ================================================================================
 FILES

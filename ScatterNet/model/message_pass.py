@@ -40,15 +40,24 @@ class MessagePass(nn.Module):
         5. Update sigma bandwidths via a bilinear layer on the new embeddings.
     """
 
-    _lambda_2:  int                          # number of message passing rounds
-    _lambda_5:  int                          # number of RFF features
-    _msg_chunk: int                          # N- and M-chunk size; caps peak tensor to (chunk, chunk, Q, lambda_5)
+    _lambda_2:  int                         # number of message passing rounds
+    _lambda_5:  int                         # number of RFF features
+    _msg_chunk: int                         # N- and M-chunk size; caps peak tensor to (chunk, chunk, Q, lambda_5)
     _proj_agg:  nn.Linear                   # projects lambda_1 to 2*lambda_1 for MishGLU gate
     _omegafrq:  Float[torch.Tensor, "λ₅ 3"] # fixed random frequency matrix for RFF
     _biasterm:  nn.Parameter                # learned phase shift; preserves rotational invariance
     _sigbilin:  nn.Bilinear                 # updates sigma bandwidths from embeddings and form factors
 
-    def __init__(self, lambda_1: int, lambda_2: int, lambda_5: int, seed: int, q_points: int, msg_chunk: int):
+    def __init__(
+        self, 
+        lambda_1:  int, 
+        lambda_2:  int, 
+        lambda_5:  int, 
+        seed:      int, 
+        q_points:  int, 
+        msg_chunk: int
+        ):
+        
         super().__init__()
 
         if lambda_2 <= 0:

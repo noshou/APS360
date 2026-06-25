@@ -23,13 +23,13 @@ class ScatterNet(nn.Module):
         lambda_3:  OutputHead hidden width
         lambda_4:  number of halving steps in OutputHead MLP
         lambda_5:  number of RFF features in MessagePass
-        msg_chunk: atoms per M-chunk in MessagePass; peak tensor is (N, msg_chunk, Q, lambda_5)
+        atm_chunk: atoms per chunk in MessagePass and OutputHead; peak tensor is (N, atm_chunk, Q, lambda_5)
         q_points:  number of q-grid points (Q)
         eps_embd:  numerical floor for Embed (avoids division by zero)
         eps_msgp:  numerical floor for MessagePass (avoids division by zero)
     """
 
-    _embed:    Embed
+    _emd:      Embed
     _msg:      MessagePass
     _out:      OutputHead
     _eps_embd: Float 
@@ -43,16 +43,16 @@ class ScatterNet(nn.Module):
         lambda_4: int,
         lambda_5: int,
         msg_seed: int,
-        msg_chunk: int,
+        atm_chunk: int,
         q_points: int,
         eps_embd: float,
         eps_msgp: float
     ) -> None:
 
         super().__init__()
-        self._embed    = Embed(lambda_1, q_points)
-        self._msg      = MessagePass(lambda_1, lambda_2, lambda_5, msg_seed, q_points, msg_chunk)
-        self._out      = OutputHead(lambda_1, lambda_3, lambda_4)
+        self._emb      = Embed(lambda_1, q_points)
+        self._msg      = MessagePass(lambda_1, lambda_2, lambda_5, msg_seed, q_points, atm_chunk)
+        self._out      = OutputHead(lambda_1, lambda_3, lambda_4, atm_chunk)
         self._eps_embd = eps_embd
         self._eps_msgp = eps_msgp
         
@@ -72,6 +72,6 @@ class ScatterNet(nn.Module):
             sigmas: per-atom gaussian kernel bandwith, shape (N, M, Q)
         """
         
-        embed_head = self._embed(batch, self._eps_embd)
+        embed_head = self._emb(batch, self._eps_embd)
         msg_head   = self._msg(batch, embed_head, self._eps_msgp)
-        return checkpoint(self._out, batch, msg_head, use_reentrant=False)  # type: ignore[return-value]
+        return       self._out(batch, msg_head)
