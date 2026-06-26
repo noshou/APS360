@@ -18,7 +18,6 @@ def make_batch(vocab, iqval, coord):
         [torch.tensor(c, dtype=torch.float32) for c in coord],
     )
 
-
 # ── _kratky_MSLE ──────────────────────────────────────────────────────────────
 
 def test_kratky_perfect_prediction_is_zero():
