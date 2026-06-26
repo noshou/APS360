@@ -97,6 +97,8 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
             sum_y  += log_target.sum().item()
             sum_y2 += (log_target ** 2).sum().item()
             n_elem += log_target.numel()
+            del iq, fmags, sigmas, loss, log_pred, log_target
+            torch.cuda.empty_cache()
     mean_loss = total_loss / total_mols
     ss_tot    = sum_y2 - sum_y ** 2 / n_elem
     r2        = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
@@ -222,7 +224,7 @@ def _worker(rank: int, cfg: RunConfig):
                 break
 
             batch = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type="cuda", enabled=cfg.use_amp):
                 iq, fmags, sigmas = model(batch)
@@ -256,12 +258,17 @@ def _worker(rank: int, cfg: RunConfig):
                 train_sum_y2 += (log_target ** 2).sum().item()
                 train_n_elem += log_target.numel()
 
+            del iq, fmags, sigmas, loss, log_pred, log_target
+            torch.cuda.empty_cache()
+
         train_loss   = train_loss_sum / train_mols
         train_ss_tot = train_sum_y2 - train_sum_y ** 2 / train_n_elem
         train_r2     = 1.0 - train_ss_res / train_ss_tot if train_ss_tot > 0 else 0.0
 
         val_loss,  val_r2  = evaluate(val_loader,  model, criterion, cfg, device)
+        torch.cuda.empty_cache()
         test_loss, test_r2 = evaluate(test_loader, model, criterion, cfg, device)
+        torch.cuda.empty_cache()
 
         if rank == 0:
             print(
