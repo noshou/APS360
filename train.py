@@ -15,6 +15,11 @@ from ScatterNet.config   import RunConfig, load_config
 from ScatterNet.train    import Loss
 
 
+def _first(x):
+    """collate_fn that unwraps the single-element list from batch_size=1."""
+    return x[0]
+
+
 # CLI
 
 def _parse_args():
@@ -151,9 +156,9 @@ def _worker(rank: int, cfg: RunConfig):
 
     pin = device != "cpu"
     pw  = cfg.num_workers > 0
-    train_loader = DataLoader(train_set, batch_size=1, shuffle=True,  collate_fn=lambda x: x[0], num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
-    val_loader   = DataLoader(val_set,   batch_size=1, shuffle=False, collate_fn=lambda x: x[0], num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
-    test_loader  = DataLoader(test_set,  batch_size=1, shuffle=False, collate_fn=lambda x: x[0], num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
+    train_loader = DataLoader(train_set, batch_size=1, shuffle=True,  collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
+    val_loader   = DataLoader(val_set,   batch_size=1, shuffle=False, collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
+    test_loader  = DataLoader(test_set,  batch_size=1, shuffle=False, collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
 
     # model
 
