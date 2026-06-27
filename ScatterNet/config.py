@@ -59,8 +59,11 @@ class RunConfig:
     lambda_4:       Number of halving steps in the OutputHead MLP (must satisfy 2^lambda_4 <= lambda_3).
     lambda_5:       Number of Random Fourier Features. Controls RBF kernel approximation quality.
     msg_seed:       RNG seed for the fixed RFF frequency matrix (reproducible across runs).
-    atm_chunk:      Atoms processed per chunk in MessagePass and OutputHead. Peak GPU tensor is
-                    (N, atm_chunk, Q, lambda_5); lower values trade speed for less memory.
+    atm_chunk:      Atoms processed per M-chunk in MessagePass and OutputHead. Controls peak size
+                    of the RFF tensor (Nc, atm_chunk, Q, lambda_5) within one N-chunk.
+    mol_chunk:      Molecules processed per N-chunk in MessagePass. Controls peak size of
+                    chem_env (mol_chunk, Q, lambda_5, lambda_1); only one N-chunk's chem_env
+                    exists at a time (freed after each N-chunk checkpoint recomputation).
     eps_embd:       Numerical floor in the Embed module (avoids division by zero).
     eps_msgp:       Numerical floor in MessagePass sigma clamping and aggregate denominator.
 
@@ -106,6 +109,7 @@ class RunConfig:
     lambda_5:       int            = 256
     msg_seed:       int            = 42
     atm_chunk:      int            = 1024
+    mol_chunk:      int            = 32
     eps_embd:       float          = 1e-8
     eps_msgp:       float          = 1e-3
 

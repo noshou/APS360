@@ -172,6 +172,7 @@ def _worker(rank: int, cfg: RunConfig):
         lambda_5  = cfg.lambda_5,
         msg_seed  = cfg.msg_seed,
         atm_chunk = cfg.atm_chunk,
+        mol_chunk = cfg.mol_chunk,
         q_points  = q_points,
         eps_embd  = cfg.eps_embd,
         eps_msgp  = cfg.eps_msgp,
