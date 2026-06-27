@@ -312,9 +312,16 @@ class MessagePass(nn.Module):
                         chem_env = crd_s.new_zeros(Nc_s, Q, self._lambda_5, self._lambda_1),
                     )
                     cont = self._pass_1(cont, eps)
+                    # Divide by M (shard atom count) so that features and chem_env
+                    # represent per-atom averages rather than sums.  M cancels exactly
+                    # in agg_c = locality / weighted (both scale with M), so the
+                    # mathematical result is unchanged.  Without this, locality_c in
+                    # _pass_2 reaches O(M × embed × λ₅ × zrff) ≈ 50k × 5 × 128 × 0.125
+                    # ≈ 4 M, which overflows fp16 (max 65504) → inf → NaN in the
+                    # subsequent linear projection.
                     cont = cont._replace(
-                        features = _all_reduce(cont.features),
-                        chem_env = _all_reduce(cont.chem_env),
+                        features = _all_reduce(cont.features) / M,
+                        chem_env = _all_reduce(cont.chem_env) / M,
                     )
                     cont = self._pass_2(cont, eps)
                     return cont.emb_n, cont.sig_n
