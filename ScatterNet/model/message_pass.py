@@ -316,6 +316,13 @@ class MessagePass(nn.Module):
                     cont = self._pass_2(cont, eps)
                     return cont.emb_n, cont.sig_n
 
+                # use_reentrant=True runs _n_chunk_round under no_grad() during
+                # forward, so no internal autograd graph is built. Without this,
+                # use_reentrant=False keeps the full internal graph alive (including
+                # _pass_2._step closures that hold cont.chem_env), meaning all
+                # N-chunks' chem_env tensors are live simultaneously. With
+                # use_reentrant=True, chem_env is created and freed per N-chunk;
+                # during backward each N-chunk is rerun once under enable_grad().
                 new_emb, new_sig = checkpoint(  # type: ignore[misc]
                     _n_chunk_round,
                     embeds[n0:n1],
@@ -323,7 +330,7 @@ class MessagePass(nn.Module):
                     f_mags[n0:n1],
                     sigmas[n0:n1],
                     coord[n0:n1],
-                    use_reentrant=False,
+                    use_reentrant=True,
                 )
                 new_embeds_n.append(new_emb)
                 new_sigmas_n.append(new_sig)
