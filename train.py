@@ -220,6 +220,9 @@ def _worker(rank: int, cfg: RunConfig):
 
         torch.cuda.empty_cache()
 
+        import time as _time
+        _t0 = _time.time()
+
         for _bi, batch in enumerate(train_loader):
             if cfg.max_batches is not None and _bi >= cfg.max_batches:
                 break
@@ -261,6 +264,11 @@ def _worker(rank: int, cfg: RunConfig):
 
             del iq, fmags, sigmas, loss, log_pred, log_target
             torch.cuda.empty_cache()
+
+            if rank == 0 and (_bi + 1) % 50 == 0:
+                elapsed  = _time.time() - _t0
+                rate     = (_bi + 1) / elapsed
+                print(f"  ep {epoch}  batch {_bi+1:5d}  loss {train_loss_sum/max(train_mols,1):.4f}  {rate:.1f} batch/s", flush=True)
 
         train_loss   = train_loss_sum / train_mols
         train_ss_tot = train_sum_y2 - train_sum_y ** 2 / train_n_elem
