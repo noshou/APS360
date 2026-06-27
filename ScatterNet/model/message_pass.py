@@ -150,13 +150,13 @@ class MessagePass(nn.Module):
 
         def _step(emb_slice, crd_slice, sig_slice, msk_slice):
             # crds_c: (Nc, mc, 1, 3) / (Nc, mc, Q, 1) -> (Nc, mc, Q, 3)
-            # fp32 for division + projection: small sigma at init gives crds_c ~ 60000,
-            # proj_c = crds_c @ omega sums 3 dims → ~180000, overflowing fp16 → inf → cos=NaN.
-            # _omegafrq is a fp32 buffer so the matmul stays fp32 naturally.
-            # cos output ∈ [-1, 1] is safe to cast back to the original dtype.
-            crds_c = crd_slice.float().unsqueeze(-2) / sig_slice.float().clamp(min=eps)
+            # eps_msgp (sigma floor) must keep proj_c = crds_c @ omega within fp16 range (~65504).
+            # With max coord ~60 Å and omega ~ N(0,1) over 3 dims, proj_c ≈ (coord/sigma) × 3×3.5.
+            # eps=0.1 → crds_c ≤ 600 → proj_c ≤ 2100, safely within fp16.
+            # eps=1e-3 → crds_c ≤ 60000 → proj_c ≤ 180000, overflows fp16 → inf → cos=NaN.
+            crds_c = crd_slice.unsqueeze(-2) / sig_slice.clamp(min=eps)
             proj_c = crds_c @ self._omegafrq.T + self._biasterm
-            zrff_c = ((2/self._lambda_5) ** 0.5 * cos(proj_c)).to(crd_slice.dtype)
+            zrff_c = (2/self._lambda_5) ** 0.5 * cos(proj_c)
             zrff_c = zrff_c * msk_slice.unsqueeze(-1).unsqueeze(-1)
             step_features = zrff_c.sum(dim=1)
             # chem_env[nc, q, d, l] = Σ_m  zrff[nc, mc, q, d] * emb[nc, mc, q, l]
@@ -196,9 +196,9 @@ class MessagePass(nn.Module):
         """
 
         def _step(emb_slice, ffs_slice, sig_slice, crd_slice, msk_slice):
-            crds_c = crd_slice.float().unsqueeze(-2) / sig_slice.float().clamp(min=eps)
+            crds_c = crd_slice.unsqueeze(-2) / sig_slice.clamp(min=eps)
             proj_c = crds_c @ self._omegafrq.T + self._biasterm
-            zrff_c = ((2/self._lambda_5) ** 0.5 * cos(proj_c)).to(crd_slice.dtype)
+            zrff_c = (2/self._lambda_5) ** 0.5 * cos(proj_c)
             mask_c = msk_slice.unsqueeze(-1).unsqueeze(-1)
             zrff_c = zrff_c * mask_c
 
