@@ -150,15 +150,12 @@ class MessagePass(nn.Module):
 
         def _step(emb_slice, crd_slice, sig_slice, msk_slice):
             # crds_c: (Nc, mc, 1, 3) / (Nc, mc, Q, 1) -> (Nc, mc, Q, 3)
-            # fp32 for division + projection: coord/sigma can reach ~60000 and
-            # @ omega sums 3 terms → ~180000, which overflows fp16 max (65504) to
-            # inf, then cos(inf) = NaN. omega buffer is fp32 so the matmul stays fp32.
+            # fp32 for division + projection: small sigma at init gives crds_c ~ 60000,
+            # proj_c = crds_c @ omega sums 3 dims → ~180000, overflowing fp16 → inf → cos=NaN.
+            # _omegafrq is a fp32 buffer so the matmul stays fp32 naturally.
+            # cos output ∈ [-1, 1] is safe to cast back to the original dtype.
             crds_c = crd_slice.float().unsqueeze(-2) / sig_slice.float().clamp(min=eps)
-            # proj_c[n, m, q, λ₅] = sum_k  omega[λ₅, k] * crds_c[n, m, q, k]  +  bias[λ₅]
             proj_c = crds_c @ self._omegafrq.T + self._biasterm
-            # RFF features: z[n,m,q,λ₅] = sqrt(2/λ₅) * cos(proj[n,m,q,λ₅])
-            # dot product z[i] . z[j] ≈ exp(-||r_i/sigma - r_j/sigma||^2 / 2)
-            # cos output ∈ [-1, 1] — safe to cast back to the original dtype.
             zrff_c = ((2/self._lambda_5) ** 0.5 * cos(proj_c)).to(crd_slice.dtype)
             zrff_c = zrff_c * msk_slice.unsqueeze(-1).unsqueeze(-1)
             step_features = zrff_c.sum(dim=1)
