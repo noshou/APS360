@@ -234,6 +234,19 @@ def _worker(rank: int, cfg: RunConfig):
                 iq, fmags, sigmas = model(batch)
                 loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7, cfg.eps_sigma)
 
+            if rank == 0 and _bi < 10:
+                print(f"  [debug] batch {_bi}  loss={loss.item():.6g}  iq_nan={iq.isnan().any().item()}  iq_inf={iq.isinf().any().item()}", flush=True)
+
+            if rank == 0 and (loss.isnan() or loss.isinf()):
+                def _s(t): return f"nan={t.isnan().any().item()} inf={t.isinf().any().item()} min={t.float().min().item():.3g} max={t.float().max().item():.3g}"
+                print(f"  [NaN/Inf] batch {_bi}  loss={loss.item()}")
+                print(f"    iq:     {_s(iq)}")
+                print(f"    fmags:  {_s(fmags)}")
+                print(f"    sigmas: {_s(sigmas)}")
+                print(f"    iqval:  {_s(batch.iqval)}")
+                print(f"    coord:  {_s(batch.coord)}")
+                print(f"    vocab shape: {batch.vocab.shape}  n_real_atoms: {batch.padding_mask().sum().item()}", flush=True)
+
             scaler.scale(loss).backward()
 
             # With TP, each rank's parameter gradients are a partial sum over
