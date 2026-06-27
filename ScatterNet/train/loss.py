@@ -57,10 +57,10 @@ class Loss(nn.Module):
     @jaxtyped(typechecker=beartype)
     def _kratky_MSLE(
         self,
-        output_head: Float[torch.Tensor, "N Q"], 
+        output_head: Float[torch.Tensor, "N Q"],
         batch: Batch,
-        ) -> Float[torch.Tensor, "N Q"]: 
-        
+        ) -> Float[torch.Tensor, "N Q"]:
+
         """
         Kratky-weighted MSLE between predicted and ground-truth I(q).
 
@@ -76,7 +76,9 @@ class Loss(nn.Module):
         Returns:
             per-molecule per-q losses, shape (N, Q)
         """
-        residual = torch.log1p(output_head) - torch.log1p(batch.iqval)
+        # cast to fp32 before log1p: for large molecules I(q) >> fp16 max (~65504),
+        # causing both pred and target to overflow to +inf, then inf-inf = NaN.
+        residual = torch.log1p(output_head.float()) - torch.log1p(batch.iqval.float())
         return self._q_weights_ * residual ** 2
 
     @jaxtyped(typechecker=beartype)
