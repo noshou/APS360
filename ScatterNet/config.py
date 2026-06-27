@@ -86,6 +86,9 @@ class RunConfig:
     max_batches:    Cap on batches per epoch (None = no limit; useful for quick sanity checks).
     use_amp:        Enable automatic mixed precision (float16 forward, float32 gradients via GradScaler).
                     Roughly halves peak activation memory. Disable if you see numerical instability.
+    verbosity:      Logging level. "epoch" = one line per epoch only. "batch" = also print a
+                    running-average loss every 50 batches. "diagnostic" = per-batch NaN/Inf check
+                    with full tensor stats on the first 10 batches (use for debugging).
 
     Data
     ----
@@ -128,6 +131,7 @@ class RunConfig:
     num_workers:    int            = 4
     max_batches:    Optional[int]  = None
     use_amp:        bool           = True
+    verbosity:      str            = "epoch"   # "epoch" | "batch" | "diagnostic"
 
     # data
     buckets: list[tuple[int, int]] = field(default_factory=lambda: DEFAULT_BUCKETS)

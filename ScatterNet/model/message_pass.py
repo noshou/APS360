@@ -150,12 +150,16 @@ class MessagePass(nn.Module):
 
         def _step(emb_slice, crd_slice, sig_slice, msk_slice):
             # crds_c: (Nc, mc, 1, 3) / (Nc, mc, Q, 1) -> (Nc, mc, Q, 3)
-            crds_c = crd_slice.unsqueeze(-2) / sig_slice.clamp(min=eps)
+            # fp32 for division + projection: coord/sigma can reach ~60000 and
+            # @ omega sums 3 terms → ~180000, which overflows fp16 max (65504) to
+            # inf, then cos(inf) = NaN. omega buffer is fp32 so the matmul stays fp32.
+            crds_c = crd_slice.float().unsqueeze(-2) / sig_slice.float().clamp(min=eps)
             # proj_c[n, m, q, λ₅] = sum_k  omega[λ₅, k] * crds_c[n, m, q, k]  +  bias[λ₅]
             proj_c = crds_c @ self._omegafrq.T + self._biasterm
             # RFF features: z[n,m,q,λ₅] = sqrt(2/λ₅) * cos(proj[n,m,q,λ₅])
             # dot product z[i] . z[j] ≈ exp(-||r_i/sigma - r_j/sigma||^2 / 2)
-            zrff_c = (2/self._lambda_5) ** 0.5 * cos(proj_c)
+            # cos output ∈ [-1, 1] — safe to cast back to the original dtype.
+            zrff_c = ((2/self._lambda_5) ** 0.5 * cos(proj_c)).to(crd_slice.dtype)
             zrff_c = zrff_c * msk_slice.unsqueeze(-1).unsqueeze(-1)
             step_features = zrff_c.sum(dim=1)
             # chem_env[nc, q, d, l] = Σ_m  zrff[nc, mc, q, d] * emb[nc, mc, q, l]
@@ -195,9 +199,9 @@ class MessagePass(nn.Module):
         """
 
         def _step(emb_slice, ffs_slice, sig_slice, crd_slice, msk_slice):
-            crds_c = crd_slice.unsqueeze(-2) / sig_slice.clamp(min=eps)
+            crds_c = crd_slice.float().unsqueeze(-2) / sig_slice.float().clamp(min=eps)
             proj_c = crds_c @ self._omegafrq.T + self._biasterm
-            zrff_c = (2/self._lambda_5) ** 0.5 * cos(proj_c)
+            zrff_c = ((2/self._lambda_5) ** 0.5 * cos(proj_c)).to(crd_slice.dtype)
             mask_c = msk_slice.unsqueeze(-1).unsqueeze(-1)
             zrff_c = zrff_c * mask_c
 

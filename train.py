@@ -63,6 +63,7 @@ def _parse_args():
     p.add_argument("--atom_size_ceil", type=int,   default=None)
     p.add_argument("--num_workers",    type=int,   default=None)
     p.add_argument("--use_amp",        type=lambda x: x.lower() != "false", default=None)
+    p.add_argument("--verbosity",      default=None, choices=["epoch", "batch", "diagnostic"])
     return p.parse_args()
 
 
@@ -234,18 +235,18 @@ def _worker(rank: int, cfg: RunConfig):
                 iq, fmags, sigmas = model(batch)
                 loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7, cfg.eps_sigma)
 
-            if rank == 0 and _bi < 10:
-                print(f"  [debug] batch {_bi}  loss={loss.item():.6g}  iq_nan={iq.isnan().any().item()}  iq_inf={iq.isinf().any().item()}", flush=True)
-
-            if rank == 0 and (loss.isnan() or loss.isinf()):
+            if rank == 0 and cfg.verbosity == "diagnostic":
                 def _s(t): return f"nan={t.isnan().any().item()} inf={t.isinf().any().item()} min={t.float().min().item():.3g} max={t.float().max().item():.3g}"
-                print(f"  [NaN/Inf] batch {_bi}  loss={loss.item()}")
-                print(f"    iq:     {_s(iq)}")
-                print(f"    fmags:  {_s(fmags)}")
-                print(f"    sigmas: {_s(sigmas)}")
-                print(f"    iqval:  {_s(batch.iqval)}")
-                print(f"    coord:  {_s(batch.coord)}")
-                print(f"    vocab shape: {batch.vocab.shape}  n_real_atoms: {batch.padding_mask().sum().item()}", flush=True)
+                if _bi < 10:
+                    print(f"  [debug] batch {_bi}  loss={loss.item():.6g}  iq_nan={iq.isnan().any().item()}  iq_inf={iq.isinf().any().item()}", flush=True)
+                if loss.isnan() or loss.isinf():
+                    print(f"  [NaN/Inf] batch {_bi}  loss={loss.item()}")
+                    print(f"    iq:     {_s(iq)}")
+                    print(f"    fmags:  {_s(fmags)}")
+                    print(f"    sigmas: {_s(sigmas)}")
+                    print(f"    iqval:  {_s(batch.iqval)}")
+                    print(f"    coord:  {_s(batch.coord)}")
+                    print(f"    vocab shape: {batch.vocab.shape}  n_real_atoms: {batch.padding_mask().sum().item()}", flush=True)
 
             scaler.scale(loss).backward()
 
@@ -278,7 +279,7 @@ def _worker(rank: int, cfg: RunConfig):
             del iq, fmags, sigmas, loss, log_pred, log_target
             torch.cuda.empty_cache()
 
-            if rank == 0 and (_bi + 1) % 50 == 0:
+            if rank == 0 and cfg.verbosity == "batch" and (_bi + 1) % 50 == 0:
                 elapsed  = _time.time() - _t0
                 rate     = (_bi + 1) / elapsed
                 print(f"  ep {epoch}  batch {_bi+1:5d}  loss {train_loss_sum/max(train_mols,1):.4f}  {rate:.1f} batch/s", flush=True)
@@ -381,6 +382,7 @@ def main(cfg: RunConfig | None = None):
             atom_size_ceil = A.atom_size_ceil,
             num_workers    = A.num_workers,
             use_amp        = A.use_amp,
+            verbosity      = A.verbosity,
         )
 
     n_gpus = torch.cuda.device_count()
