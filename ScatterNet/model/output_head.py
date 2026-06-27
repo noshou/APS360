@@ -70,7 +70,9 @@ class OutputHead(nn.Module):
         # 1. initialize values
         N, M, Q, _ = msg_head.embeds.shape
         mask       = batch.padding_mask().unsqueeze(-1).to(msg_head.embeds.dtype)  # (N, M, 1)
-        iq_accum   = msg_head.embeds.new_zeros(N, Q)
+        # float32 accumulator: fp16 overflows to inf for large molecules (N_atoms * fmag^2 >> 65504),
+        # which causes inf*0=NaN in the log1p backward. float32 max ~3e38 avoids this entirely.
+        iq_accum   = torch.zeros(N, Q, device=msg_head.embeds.device, dtype=torch.float32)
         
         
         # 2. Accumulate over chunks

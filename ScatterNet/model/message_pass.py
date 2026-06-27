@@ -210,11 +210,13 @@ class MessagePass(nn.Module):
             locality_c = torch.bmm(zb, cb).reshape(Nc, Q, mc, self._lambda_1).permute(0, 2, 1, 3)
 
             # denominator: kernel weight sum per atom
-            # weights can be negative due to cosine features, clamp to avoid division issues
-            weighted_c = torch.einsum('nmqd, nqd -> nmq', zrff_c, cont.features).abs().clamp(min=0)
+            # weights can be negative due to cosine features; take abs so denominator is non-negative.
+            # clamp(min=eps) avoids 0/0 in both forward and backward — nan_to_num only fixes the
+            # forward value but still computes grad_output/0 = NaN during backward.
+            weighted_c = torch.einsum('nmqd, nqd -> nmq', zrff_c, cont.features).abs()
 
             # weighted average: aggregate[nc,mc,q,λ₁] = locality / weighted
-            agg_c = torch.nan_to_num(locality_c / weighted_c.unsqueeze(-1), nan=0.0, posinf=0.0, neginf=0.0)
+            agg_c = locality_c / weighted_c.unsqueeze(-1).clamp(min=eps)
 
             # gate aggregate using MishGLU; mask after gating (MishGLU ≠ 0 at x=0)
             p1_c, p2_c = self._proj_agg(agg_c).chunk(2, dim=-1)
