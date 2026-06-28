@@ -76,7 +76,7 @@ class Loss(nn.Module):
         Returns:
             per-molecule per-q losses, shape (N, Q)
         """
-        residual = torch.log1p(output_head) - torch.log1p(batch.iqval.float())
+        residual = torch.log1p(output_head) - torch.log1p(batch.iqval)
         return self._q_weights_ * residual ** 2
 
     @jaxtyped(typechecker=beartype)
@@ -124,12 +124,6 @@ class Loss(nn.Module):
         lambda_7: float,
         eps: float
     ) -> Float[torch.Tensor, ""]:
-
-        # cast to float32 before any loss computation: fp16 can overflow or produce
-        # inf which then causes NaN in backward (inf*0, 0/0 patterns).
-        output_head = output_head.float()
-        f_mag_pred  = f_mag_pred.float()
-        sigma_pred  = sigma_pred.float()
 
         msle_loss  = self._kratky_MSLE(output_head, batch)
         ff_penalty = self._ff_penalty(f_mag_pred, batch, lambda_6)

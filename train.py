@@ -62,7 +62,6 @@ def _parse_args():
     p.add_argument("--batcher_seed",   type=int,   default=None)
     p.add_argument("--atom_size_ceil", type=int,   default=None)
     p.add_argument("--num_workers",    type=int,   default=None)
-    p.add_argument("--use_amp",        type=lambda x: x.lower() != "false", default=None)
     p.add_argument("--verbosity",      default=None, choices=["epoch", "batch", "diagnostic"])
     return p.parse_args()
 
@@ -86,14 +85,13 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
     with torch.no_grad():
         for batch in loader:
             batch             = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
-            with torch.autocast(device_type="cuda", enabled=cfg.use_amp):
-                iq, fmags, sigmas = model(batch)
-                loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7, cfg.eps_sigma)
+            iq, fmags, sigmas = model(batch)
+            loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7, cfg.eps_sigma)
             n = batch.iqval.shape[0]
             total_loss += loss.item() * n
             total_mols += n
-            log_pred   = torch.log1p(iq.float())
-            log_target = torch.log1p(batch.iqval.float())
+            log_pred   = torch.log1p(iq)
+            log_target = torch.log1p(batch.iqval)
             ss_res += ((log_pred - log_target) ** 2).sum().item()
             sum_y  += log_target.sum().item()
             sum_y2 += (log_target ** 2).sum().item()
@@ -181,7 +179,6 @@ def _worker(rank: int, cfg: RunConfig):
 
     criterion = Loss(q_grid, energy).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scaler    = torch.amp.GradScaler("cuda", enabled=cfg.use_amp)  # type: ignore[attr-defined]
 
     start_epoch = 1
     history: list = []
@@ -231,9 +228,8 @@ def _worker(rank: int, cfg: RunConfig):
             batch = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.autocast(device_type="cuda", enabled=cfg.use_amp):
-                iq, fmags, sigmas = model(batch)
-                loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7, cfg.eps_sigma)
+            iq, fmags, sigmas = model(batch)
+            loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7, cfg.eps_sigma)
 
             if rank == 0 and cfg.verbosity == "diagnostic":
                 def _s(t): return f"nan={t.isnan().any().item()} inf={t.isinf().any().item()} min={t.float().min().item():.3g} max={t.float().max().item():.3g}"
@@ -248,29 +244,28 @@ def _worker(rank: int, cfg: RunConfig):
                     print(f"    coord:  {_s(batch.coord)}")
                     print(f"    vocab shape: {batch.vocab.shape}  n_real_atoms: {batch.padding_mask().sum().item()}", flush=True)
 
-            scaler.scale(loss).backward()
+            loss.backward()
 
-            # With TP, each rank's parameter gradients are a partial sum over
-            # its atom shard. All_reduce(SUM) gives the full gradient.
-            # We do not divide by world_size (DDP would average; TP needs sum).
+            # With TP, each rank's parameter gradients are a partial sum over its
+            # atom shard, so they must be summed across ranks (SUM, not average —
+            # DDP averages, TP needs the full sum).
             if is_dist:
-                scaler.unscale_(optimizer)
                 for param in model.parameters():
                     if param.grad is not None:
                         dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-            else:
-                scaler.unscale_(optimizer)
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            optimizer.step()
+
+            if rank == 0 and cfg.verbosity == "diagnostic" and (_bi < 12 or not torch.isfinite(grad_norm)):
+                print(f"  [grad] batch {_bi}  grad_norm={grad_norm.item():.4g}", flush=True)
 
             n = batch.iqval.shape[0]
             train_loss_sum += loss.item() * n
             train_mols     += n
             with torch.no_grad():
-                log_pred      = torch.log1p(iq.float())
-                log_target    = torch.log1p(batch.iqval.float())
+                log_pred      = torch.log1p(iq)
+                log_target    = torch.log1p(batch.iqval)
                 train_ss_res += ((log_pred - log_target) ** 2).sum().item()
                 train_sum_y  += log_target.sum().item()
                 train_sum_y2 += (log_target ** 2).sum().item()
@@ -325,10 +320,9 @@ def _worker(rank: int, cfg: RunConfig):
 
             if val_loss < best_val:
                 best_val = val_loss
-                fp16_state = {k: v.half() for k, v in model.state_dict().items()}
                 torch.save({
                     "epoch":    epoch,
-                    "model":    fp16_state,
+                    "model":    model.state_dict(),
                     "val_loss": val_loss,
                     "q_grid":   q_grid,
                     "energy":   energy,
@@ -381,7 +375,6 @@ def main(cfg: RunConfig | None = None):
             batcher_seed   = A.batcher_seed,
             atom_size_ceil = A.atom_size_ceil,
             num_workers    = A.num_workers,
-            use_amp        = A.use_amp,
             verbosity      = A.verbosity,
         )
 

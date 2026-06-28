@@ -84,8 +84,6 @@ class RunConfig:
                     search. -1 = auto (3x the largest molecule in the dataset).
     num_workers:    DataLoader worker processes (0 = load in main process; use 0 for CPU debugging).
     max_batches:    Cap on batches per epoch (None = no limit; useful for quick sanity checks).
-    use_amp:        Enable automatic mixed precision (float16 forward, float32 gradients via GradScaler).
-                    Roughly halves peak activation memory. Disable if you see numerical instability.
     verbosity:      Logging level. "epoch" = one line per epoch only. "batch" = also print a
                     running-average loss every 50 batches. "diagnostic" = per-batch NaN/Inf check
                     with full tensor stats on the first 10 batches (use for debugging).
@@ -130,7 +128,6 @@ class RunConfig:
     atom_size_ceil: int            = -1
     num_workers:    int            = 4
     max_batches:    Optional[int]  = None
-    use_amp:        bool           = True
     verbosity:      str            = "epoch"   # "epoch" | "batch" | "diagnostic"
 
     # data

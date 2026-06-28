@@ -49,7 +49,7 @@ class MessagePass(nn.Module):
     _omegafrq: Float[torch.Tensor, "λ₅ 3"]  # fixed RFF frequency matrix: λ₅ random 3-D directions
     _biasterm: nn.Parameter                 # RFF random phase offsets, one per Fourier feature
     _sigbilin: nn.Bilinear                  # per-round σ update from (embedding, form factor)
-    _rms_norm: nn.RMSNorm                   # per-round embedding norm; caps activation magnitude (prevents fp16 overflow)
+    _rms_norm: nn.RMSNorm                   # per-round embedding norm; caps activation magnitude
     _q_points: int                          # number of q-points (Q)
         
     class _AllReduce(torch.autograd.Function):
@@ -147,10 +147,8 @@ class MessagePass(nn.Module):
         def _step(emb_slice, crd_slice, sig_slice, msk_slice):
             
             # crds_c: (Nc, mc, 1, 3) / (Nc, mc, Q, 1) -> (Nc, mc, Q, 3)
-            # eps_msgp (sigma floor) must keep proj_c = crds_c @ omega within fp16 range (~65504).
-            # With max coord ~60 Å and omega ~ N(0,1) over 3 dims, proj_c ≈ (coord/sigma) × 3×3.5.
-            # eps=0.1 → crds_c ≤ 600 → proj_c ≤ 2100, safely within fp16.
-            # eps=1e-3 → crds_c ≤ 60000 → proj_c ≤ 180000, overflows fp16 → inf → cos=NaN.
+            # eps_msgp floors sigma before dividing, so it caps the RFF frequency
+            # (crds_c ≤ coord/eps) and avoids 1/0.
             crds_c = crd_slice.unsqueeze(-2) / sig_slice.clamp(min=eps)
             proj_c = crds_c @ self._omegafrq.T + self._biasterm
             zrff_c = (2/self._lambda_5) ** 0.5 * cos(proj_c)
@@ -214,7 +212,8 @@ class MessagePass(nn.Module):
             # forward value but still computes grad_output/0 = NaN during backward.
             weighted_c = torch.einsum('nmqd, nqd -> nmq', zrff_c, cont.features).abs()
 
-            # weighted average: aggregate[nc,mc,q,λ₁] = locality / weighted
+            # weighted average + per-round RMSNorm: keeps the residual-stream
+            # magnitude bounded so it can't compound across rounds.
             agg_c = self._rms_norm(locality_c / weighted_c.unsqueeze(-1).clamp(min=eps))
 
             # gate aggregate using MishGLU; mask after gating (MishGLU ≠ 0 at x=0)
