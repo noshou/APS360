@@ -84,6 +84,11 @@ class RunConfig:
                     search. -1 = auto (3x the largest molecule in the dataset).
     num_workers:    DataLoader worker processes (0 = load in main process; use 0 for CPU debugging).
     max_batches:    Cap on batches per epoch (None = no limit; useful for quick sanity checks).
+    ckpt_interval_sec: Seconds between mid-epoch resume-checkpoint saves. Crash safety: a session
+                    timeout then costs at most this much work (resume picks up mid-epoch).
+    ckpt_rclone_dest: rclone destination to copy checkpoints to after each save (e.g.
+                    "gdrive:APS360/ckpts/"). None = no off-box copy. Needed on Kaggle, where
+                    /kaggle/working is not reliably persisted through a session timeout.
     verbosity:      Logging level. "epoch" = one line per epoch only. "batch" = also print a
                     running-average loss every 50 batches. "diagnostic" = per-batch NaN/Inf check
                     with full tensor stats on the first 10 batches (use for debugging).
@@ -128,6 +133,8 @@ class RunConfig:
     atom_size_ceil: int            = -1
     num_workers:    int            = 4
     max_batches:    Optional[int]  = None
+    ckpt_interval_sec: float       = 600.0     # mid-epoch checkpoint cadence (crash safety)
+    ckpt_rclone_dest:  Optional[str] = None    # rclone dest for off-box checkpoint copies (None = off)
     verbosity:      str            = "epoch"   # "epoch" | "batch" | "diagnostic"
 
     # data

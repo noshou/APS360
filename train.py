@@ -2,6 +2,7 @@ import argparse
 import h5py
 import json
 import os
+import subprocess
 import torch
 import torch.distributed as dist
 from torch.multiprocessing.spawn import spawn as mp_spawn  # type: ignore[attr-defined]
@@ -18,6 +19,19 @@ from ScatterNet.train    import Loss
 def _first(x):
     """collate_fn that unwraps the single-element list from batch_size=1."""
     return x[0]
+
+
+def _rclone_push(path: str, dest: str | None):
+    """Copy a checkpoint to a durable rclone remote (e.g. Drive) so it survives a
+    Kaggle session timeout — /kaggle/working is not reliably persisted on a crash.
+    No-op if dest is None or the file is missing; never raises into the train loop."""
+    if not dest or not os.path.exists(path):
+        return
+    try:
+        subprocess.run(["rclone", "copy", path, dest], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except Exception as e:
+        print(f"  [rclone] push of {path} -> {dest} failed: {e}", flush=True)
 
 
 # CLI
@@ -185,15 +199,21 @@ def _worker(rank: int, cfg: RunConfig):
     start_epoch = 1
     history: list = []
     best_val = float("inf")
+    resume_skip = 0      # batches to skip in the first resumed epoch (exact mid-epoch resume)
 
     if cfg.resume:
         ckpt = torch.load(cfg.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch = ckpt["epoch"] + 1
-        best_val    = ckpt.get("val_loss", float("inf"))
+        best_val = ckpt.get("val_loss", float("inf"))
+        saved_bi = ckpt.get("batch_idx", -1)
+        if saved_bi is None or saved_bi < 0:        # checkpoint sat at an epoch boundary
+            start_epoch = ckpt["epoch"] + 1
+        else:                                        # mid-epoch checkpoint → redo this epoch from saved_bi+1
+            start_epoch = ckpt["epoch"]
+            resume_skip = saved_bi + 1
         if rank == 0:
-            print(f"resumed from {cfg.resume} (epoch {ckpt['epoch']}, val_loss {best_val:.4f})")
+            print(f"resumed from {cfg.resume} (epoch {ckpt['epoch']}, batch_idx {saved_bi}, val_loss {best_val:.4f})", flush=True)
 
     # training loop
 
@@ -204,6 +224,22 @@ def _worker(rank: int, cfg: RunConfig):
         q_points=q_points,     eps_embd=cfg.eps_embd,
         eps_msgp=cfg.eps_msgp,
     )
+
+    def _save_resume(ep, batch_idx):
+        """Write the resume checkpoint (weights + optimizer + position) and push it
+        off-box. batch_idx >= 0 marks a mid-epoch save; -1 marks an epoch boundary.
+        Both TP ranks hold identical weights, so rank 0's state_dict is complete."""
+        torch.save({
+            "epoch":     ep,
+            "batch_idx": batch_idx,
+            "model":     model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "val_loss":  best_val,
+            "q_grid":    q_grid,
+            "energy":    energy,
+            "hparams":   hparams,
+        }, cfg.ckpt_resume)
+        _rclone_push(cfg.ckpt_resume, cfg.ckpt_rclone_dest)
 
     for epoch in range(start_epoch, start_epoch + cfg.epochs):
 
@@ -222,8 +258,17 @@ def _worker(rank: int, cfg: RunConfig):
 
         import time as _time
         _t0 = _time.time()
+        last_ckpt = _time.time()
+
+        # On a mid-epoch resume, fast-forward over already-trained batches. The
+        # per-epoch seed above makes the shuffle deterministic, so batch _bi here
+        # is the same molecule group as in the interrupted run.
+        skip = resume_skip if epoch == start_epoch else 0
+        resume_skip = 0
 
         for _bi, batch in enumerate(train_loader):
+            if _bi < skip:
+                continue
             if cfg.max_batches is not None and _bi >= cfg.max_batches:
                 break
 
@@ -234,9 +279,9 @@ def _worker(rank: int, cfg: RunConfig):
             loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7, cfg.eps_sigma)
 
             if rank == 0 and cfg.verbosity == "diagnostic":
-                def _s(t): return f"nan={t.isnan().any().item()} inf={t.isinf().any().item()} min={t.float().min().item():.3g} max={t.float().max().item():.3g}"
+                def _s(t): return f"nan={t.isnan().any().item()} inf={t.isinf().any().item()} min={t.float().min().item()} max={t.float().max().item()}"
                 if _bi < 10:
-                    print(f"  [debug] batch {_bi}  loss={loss.item():.6g}  iq_nan={iq.isnan().any().item()}  iq_inf={iq.isinf().any().item()}", flush=True)
+                    print(f"  [debug] batch {_bi}  loss={loss.item()}  iq_nan={iq.isnan().any().item()}  iq_inf={iq.isinf().any().item()}", flush=True)
                 if loss.isnan() or loss.isinf():
                     print(f"  [NaN/Inf] batch {_bi}  loss={loss.item()}")
                     print(f"    iq:     {_s(iq)}")
@@ -260,7 +305,7 @@ def _worker(rank: int, cfg: RunConfig):
             optimizer.step()
 
             if rank == 0 and cfg.verbosity == "diagnostic" and (_bi < 12 or not torch.isfinite(grad_norm)):
-                print(f"  [grad] batch {_bi}  grad_norm={grad_norm.item():.4g}", flush=True)
+                print(f"  [grad] batch {_bi}  grad_norm={grad_norm.item()}", flush=True)
 
             n = batch.iqval.shape[0]
             train_loss_sum += loss.item() * n
@@ -278,7 +323,18 @@ def _worker(rank: int, cfg: RunConfig):
             if rank == 0 and cfg.verbosity in ("batch", "diagnostic") and (_bi + 1) % 20 == 0:
                 elapsed  = _time.time() - _t0
                 rate     = (_bi + 1) / elapsed
-                print(f"  ep {epoch}  batch {_bi+1:5d}/{len(train_loader)}  loss {train_loss_sum/max(train_mols,1):.4f}  {rate:.2f} batch/s", flush=True)
+                mem_pk   = torch.cuda.max_memory_allocated() / 1e9   # peak LIVE tensors (OOM-relevant)
+                mem_rs   = torch.cuda.memory_reserved()    / 1e9     # allocator cache (benign)
+                print(f"  ep {epoch}  batch {_bi+1:5d}/{len(train_loader)}  loss {train_loss_sum/max(train_mols,1)}  {rate} batch/s  peak_alloc={mem_pk}G reserved={mem_rs}G", flush=True)
+                torch.cuda.reset_peak_memory_stats()
+
+            # Crash safety: every ckpt_interval_sec, save a mid-epoch resume point
+            # (rank 0 only; both ranks hold identical weights) and push it off-box.
+            if rank == 0 and (_time.time() - last_ckpt) > cfg.ckpt_interval_sec:
+                _save_resume(epoch, _bi)
+                last_ckpt = _time.time()
+                if cfg.verbosity in ("batch", "diagnostic"):
+                    print(f"  [ckpt] saved mid-epoch resume @ epoch {epoch} batch {_bi}", flush=True)
 
         train_loss   = train_loss_sum / train_mols
         train_ss_tot = train_sum_y2 - train_sum_y ** 2 / train_n_elem
@@ -308,17 +364,9 @@ def _worker(rank: int, cfg: RunConfig):
             })
             with open(cfg.metrics, "w") as fh:
                 json.dump({"epochs": history}, fh, indent=2)
+            _rclone_push(cfg.metrics, cfg.ckpt_rclone_dest)
 
-            torch.save({
-                "epoch":     epoch,
-                "model":     model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "val_loss":  val_loss,
-                "q_grid":    q_grid,
-                "energy":    energy,
-                "hparams":   hparams,
-            }, cfg.ckpt_resume)
-
+            # update best BEFORE the resume save so the latter records the current best_val
             if val_loss < best_val:
                 best_val = val_loss
                 torch.save({
@@ -329,7 +377,10 @@ def _worker(rank: int, cfg: RunConfig):
                     "energy":   energy,
                     "hparams":  hparams,
                 }, cfg.ckpt_best)
+                _rclone_push(cfg.ckpt_best, cfg.ckpt_rclone_dest)
                 print(f"  saved best checkpoint (val {val_loss:.4f})")
+
+            _save_resume(epoch, -1)   # batch_idx=-1 marks the epoch as complete
 
     if is_dist:
         dist.destroy_process_group()
