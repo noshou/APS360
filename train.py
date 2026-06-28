@@ -97,7 +97,6 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
             sum_y2 += (log_target ** 2).sum().item()
             n_elem += log_target.numel()
             del iq, fmags, sigmas, loss, log_pred, log_target
-            torch.cuda.empty_cache()
     mean_loss = total_loss / total_mols
     ss_tot    = sum_y2 - sum_y ** 2 / n_elem
     r2        = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
@@ -160,6 +159,9 @@ def _worker(rank: int, cfg: RunConfig):
     train_loader = DataLoader(train_set, batch_size=1, shuffle=True,  collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
     val_loader   = DataLoader(val_set,   batch_size=1, shuffle=False, collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
     test_loader  = DataLoader(test_set,  batch_size=1, shuffle=False, collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
+
+    if rank == 0:
+        print(f"batches/epoch: train={len(train_loader)}  val={len(val_loader)}  test={len(test_loader)}", flush=True)
 
     # model
 
@@ -272,12 +274,11 @@ def _worker(rank: int, cfg: RunConfig):
                 train_n_elem += log_target.numel()
 
             del iq, fmags, sigmas, loss, log_pred, log_target
-            torch.cuda.empty_cache()
 
-            if rank == 0 and cfg.verbosity == "batch" and (_bi + 1) % 50 == 0:
+            if rank == 0 and cfg.verbosity in ("batch", "diagnostic") and (_bi + 1) % 20 == 0:
                 elapsed  = _time.time() - _t0
                 rate     = (_bi + 1) / elapsed
-                print(f"  ep {epoch}  batch {_bi+1:5d}  loss {train_loss_sum/max(train_mols,1):.4f}  {rate:.1f} batch/s", flush=True)
+                print(f"  ep {epoch}  batch {_bi+1:5d}/{len(train_loader)}  loss {train_loss_sum/max(train_mols,1):.4f}  {rate:.2f} batch/s", flush=True)
 
         train_loss   = train_loss_sum / train_mols
         train_ss_tot = train_sum_y2 - train_sum_y ** 2 / train_n_elem
