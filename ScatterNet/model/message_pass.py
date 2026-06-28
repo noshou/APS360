@@ -223,7 +223,7 @@ class MessagePass(nn.Module):
 
             emb_c  = emb_slice + gate_c
             f_in_c = ffs_slice.transpose(-1, -2).expand(-1, -1, self._q_points, -1)
-            sig_c  = sig_slice + F.softplus(self._sigbilin(emb_c, f_in_c)) + eps
+            sig_c  = F.softplus(sig_slice + F.hardtanh(self._sigbilin(emb_c, f_in_c)))
             return emb_c, sig_c
 
         new_emb_m = []
