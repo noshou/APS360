@@ -70,6 +70,7 @@ class OutputHead(nn.Module):
         # 1. initialize values
         N, M, Q, _ = msg_head.embeds.shape
         mask       = batch.padding_mask().unsqueeze(-1).to(msg_head.embeds.dtype)  # (N, M, 1)
+        
         # accumulate the Debye sum over atom-chunks; chunking avoids materialising
         # the full (N, M, Q, λ₃) bilinear tensor for large molecules
         iq_accum   = torch.zeros(N, Q, device=msg_head.embeds.device, dtype=msg_head.embeds.dtype)

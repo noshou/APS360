@@ -5,21 +5,19 @@ import os
 import subprocess
 import torch
 import torch.distributed as dist
+
 from torch.multiprocessing.spawn import spawn as mp_spawn  # type: ignore[attr-defined]
-
-from dataclasses         import replace as dc_replace
-from torch.utils.data    import DataLoader
-from Preprocess          import Encoding
-from ScatterNet          import ScatterNet
-from ScatterNet.batching import Batcher
-from ScatterNet.config   import RunConfig, load_config
-from ScatterNet.train    import Loss
-
+from dataclasses                 import replace as dc_replace
+from torch.utils.data            import DataLoader
+from Preprocess                  import Encoding
+from ScatterNet                  import ScatterNet
+from ScatterNet.batching         import Batcher
+from ScatterNet.config           import RunConfig, load_config
+from ScatterNet.loss             import Loss
 
 def _first(x):
     """collate_fn that unwraps the single-element list from batch_size=1."""
     return x[0]
-
 
 def _rclone_push(path: str, dest: str | None):
     """Copy a checkpoint to a durable rclone remote (e.g. Drive) so it survives a
@@ -28,14 +26,15 @@ def _rclone_push(path: str, dest: str | None):
     if not dest or not os.path.exists(path):
         return
     try:
-        subprocess.run(["rclone", "copy", path, dest], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        subprocess.run(
+            ["rclone", "copy", path, dest], 
+            check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
     except Exception as e:
         print(f"  [rclone] push of {path} -> {dest} failed: {e}", flush=True)
 
-
 # CLI
-
 def _parse_args():
     """Parse CLI arguments. All model/training flags default to None so that
     load_config can distinguish 'not provided' from an explicit zero or false."""
@@ -66,7 +65,6 @@ def _parse_args():
     # loss
     p.add_argument("--lambda_6",       type=float, default=None)
     p.add_argument("--lambda_7",       type=float, default=None)
-    p.add_argument("--eps_sigma",      type=float, default=None)
 
     # training
     p.add_argument("--lr",             type=float, default=None)
@@ -77,11 +75,11 @@ def _parse_args():
     p.add_argument("--atom_size_ceil", type=int,   default=None)
     p.add_argument("--num_workers",    type=int,   default=None)
     p.add_argument("--verbosity",      default=None, choices=["epoch", "batch", "diagnostic"])
+    p.add_argument("--profiler",       action="store_const", const=True, default=None)
+        
     return p.parse_args()
 
-
 # eval helper
-
 def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
     """Run one pass over loader without gradients and return (mean_loss, R2).
 
@@ -100,7 +98,7 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
         for batch in loader:
             batch             = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
             iq, fmags, sigmas = model(batch)
-            loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7, cfg.eps_sigma)
+            loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7)
             n = batch.iqval.shape[0]
             total_loss += loss.item() * n
             total_mols += n
@@ -116,9 +114,7 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
     r2        = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
     return mean_loss, r2
 
-
 # distributed worker
-
 def _worker(rank: int, cfg: RunConfig):
     """
     Per-process training worker. When launched with mp.spawn this runs on
@@ -175,7 +171,15 @@ def _worker(rank: int, cfg: RunConfig):
     test_loader  = DataLoader(test_set,  batch_size=1, shuffle=False, collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
 
     if rank == 0:
-        print(f"batches/epoch: train={len(train_loader)}  val={len(val_loader)}  test={len(test_loader)}", flush=True)
+        train_mols = sum(len(b) for b in train_set._batches)
+        val_mols   = sum(len(b) for b in val_set._batches)
+        test_mols  = sum(len(b) for b in test_set._batches)
+        print(
+            f"batches/epoch: train={len(train_loader)}  val={len(val_loader)}  test={len(test_loader)}"
+            f"  (buckets; same count by design — each bucket contributes one sub-batch per split)",
+            flush=True,
+        )
+        print(f"molecules:     train={train_mols}  val={val_mols}  test={test_mols}", flush=True)
 
     # model
 
@@ -214,6 +218,24 @@ def _worker(rank: int, cfg: RunConfig):
             resume_skip = saved_bi + 1
         if rank == 0:
             print(f"resumed from {cfg.resume} (epoch {ckpt['epoch']}, batch_idx {saved_bi}, val_loss {best_val:.4f})", flush=True)
+
+    # profiler (rank 0 only; profiles first 7 batches: wait=1 warmup=1 active=5)
+
+    _prof = None
+    if cfg.profiler and rank == 0:
+        _prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler("./profiler_trace"),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+        _prof.start()
+        print("[profiler] started — trace will be written to ./profiler_trace/", flush=True)
 
     # training loop
 
@@ -276,7 +298,7 @@ def _worker(rank: int, cfg: RunConfig):
             optimizer.zero_grad(set_to_none=True)
 
             iq, fmags, sigmas = model(batch)
-            loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7, cfg.eps_sigma)
+            loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7)
 
             if rank == 0 and cfg.verbosity == "diagnostic":
                 def _s(t): return f"nan={t.isnan().any().item()} inf={t.isinf().any().item()} min={t.float().min().item()} max={t.float().max().item()}"
@@ -303,6 +325,14 @@ def _worker(rank: int, cfg: RunConfig):
 
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
+
+            if _prof is not None:
+                _prof.step()
+                if _bi >= 4:   # wait(1)+warmup(1)+active(3) = 5 steps (0-indexed: 0..4)
+                    _prof.stop()
+                    _prof = None
+                    print("[profiler] done — see ./profiler_trace/", flush=True)
+                    break
 
             if rank == 0 and cfg.verbosity == "diagnostic" and (_bi < 12 or not torch.isfinite(grad_norm)):
                 print(f"  [grad] batch {_bi}  grad_norm={grad_norm.item()}", flush=True)
@@ -385,9 +415,7 @@ def _worker(rank: int, cfg: RunConfig):
     if is_dist:
         dist.destroy_process_group()
 
-
 # entry point
-
 def main(cfg: RunConfig | None = None):
     """
     Entry point. Pass a RunConfig directly (e.g. from a Kaggle notebook),
@@ -419,7 +447,6 @@ def main(cfg: RunConfig | None = None):
             eps_msgp       = A.eps_msgp,
             lambda_6       = A.lambda_6,
             lambda_7       = A.lambda_7,
-            eps_sigma      = A.eps_sigma,
             lr             = A.lr,
             weight_decay   = A.weight_decay,
             grad_clip      = A.grad_clip,
@@ -428,6 +455,7 @@ def main(cfg: RunConfig | None = None):
             atom_size_ceil = A.atom_size_ceil,
             num_workers    = A.num_workers,
             verbosity      = A.verbosity,
+            profiler       = A.profiler,
         )
 
     n_gpus = torch.cuda.device_count()
@@ -435,7 +463,6 @@ def main(cfg: RunConfig | None = None):
         mp_spawn(_worker, args=(cfg,), nprocs=n_gpus, join=True)
     else:
         _worker(0, cfg)
-
 
 if __name__ == "__main__":
     main()

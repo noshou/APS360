@@ -3,7 +3,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 
 import torch
-from ScatterNet.train   import Loss
+from ScatterNet.loss   import Loss
 from ScatterNet.batching import Batch
 
 Q = 6

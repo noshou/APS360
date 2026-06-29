@@ -70,8 +70,7 @@ class RunConfig:
     Loss
     ----
     lambda_6:       Weight on the form-factor penalty term.
-    lambda_7:       Weight on the sigma inverse-L1 regularisation (prevents RFF bandwidth collapse).
-    eps_sigma:      Floor inside the sigma penalty (separate from eps_msgp).
+    lambda_7:       Weight on the sigma L2 penalty (prevents RFF bandwidth blowup).
 
     Training
     --------
@@ -92,6 +91,9 @@ class RunConfig:
     verbosity:      Logging level. "epoch" = one line per epoch only. "batch" = also print a
                     running-average loss every 50 batches. "diagnostic" = per-batch NaN/Inf check
                     with full tensor stats on the first 10 batches (use for debugging).
+    profiler:       If True, wrap the first 5 batches with torch.profiler (wait=1, warmup=1,
+                    active=3). Trace is written to ./profiler_trace/ in TensorBoard format.
+                    Only rank 0 profiles; training stops after the 5th batch.
 
     Data
     ----
@@ -122,7 +124,6 @@ class RunConfig:
     # loss
     lambda_6:       float          = 0.1
     lambda_7:       float          = 0.1
-    eps_sigma:      float          = 1e-4
 
     # training
     lr:             float          = 3e-4
@@ -136,6 +137,7 @@ class RunConfig:
     ckpt_interval_sec: float       = 600.0     # mid-epoch checkpoint cadence (crash safety)
     ckpt_rclone_dest:  Optional[str] = None    # rclone dest for off-box checkpoint copies (None = off)
     verbosity:      str            = "epoch"   # "epoch" | "batch" | "diagnostic"
+    profiler:       bool           = False     # wrap first epoch's batches with torch.profiler; trace saved to ./profiler_trace/
 
     # data
     buckets: list[tuple[int, int]] = field(default_factory=lambda: DEFAULT_BUCKETS)
