@@ -91,9 +91,18 @@ class RunConfig:
     verbosity:      Logging level. "epoch" = one line per epoch only. "batch" = also print a
                     running-average loss every 50 batches. "diagnostic" = per-batch NaN/Inf check
                     with full tensor stats on the first 10 batches (use for debugging).
-    profiler:       If True, wrap the first 5 batches with torch.profiler (wait=1, warmup=1,
-                    active=3). Trace is written to ./profiler_trace/ in TensorBoard format.
-                    Only rank 0 profiles; training stops after the 5th batch.
+    profiler:       If True, run a short diagnostic instead of normal training: every rank
+                    is wrapped in torch.profiler AND a lightweight per-section, per-rank
+                    wall-clock timer (data-wait / H2D / forward / backward / grad-allreduce /
+                    clip / step). The training loop stops after the profiling window and each
+                    rank prints a section breakdown plus the heaviest batches (so rank-to-rank
+                    skew and heavy buckets are visible). TensorBoard traces are written per
+                    rank to ./profiler_trace/rank<r>/.
+    prof_warmup:    Number of warmup batches in the profiler schedule (profiled but discarded,
+                    so steady-state kernels are captured). Bump on Kaggle for a longer ramp.
+    prof_active:    Number of active batches actually recorded by the profiler / section timers.
+                    Larger = more representative stats (e.g. 50 to average over many buckets);
+                    the loop runs 1 (wait) + prof_warmup + prof_active batches total.
 
     Data
     ----
@@ -137,7 +146,9 @@ class RunConfig:
     ckpt_interval_sec: float       = 600.0     # mid-epoch checkpoint cadence (crash safety)
     ckpt_rclone_dest:  Optional[str] = None    # rclone dest for off-box checkpoint copies (None = off)
     verbosity:      str            = "epoch"   # "epoch" | "batch" | "diagnostic"
-    profiler:       bool           = False     # wrap first epoch's batches with torch.profiler; trace saved to ./profiler_trace/
+    profiler:       bool           = False     # diagnostic mode: per-rank torch.profiler + section timers; trace saved to ./profiler_trace/
+    prof_warmup:    int            = 1         # profiler schedule warmup batches (profiled, discarded)
+    prof_active:    int            = 3         # profiler schedule active batches (recorded); loop runs 1+warmup+active batches
 
     # data
     buckets: list[tuple[int, int]] = field(default_factory=lambda: DEFAULT_BUCKETS)

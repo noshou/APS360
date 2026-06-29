@@ -6,6 +6,9 @@ import subprocess
 import torch
 import torch.distributed as dist
 
+from contextlib import contextmanager
+from time       import perf_counter
+
 from torch.multiprocessing.spawn import spawn as mp_spawn  # type: ignore[attr-defined]
 from dataclasses                 import replace as dc_replace
 from torch.utils.data            import DataLoader
@@ -33,6 +36,106 @@ def _rclone_push(path: str, dest: str | None):
         )
     except Exception as e:
         print(f"  [rclone] push of {path} -> {dest} failed: {e}", flush=True)
+
+# profiler
+class _LoopProfiler:
+    """Per-rank, per-section wall-clock profiler for the training loop.
+
+    Active only when cfg.profiler is set (otherwise every method is a near-zero
+    no-op, so the normal training path pays nothing). Each section is CUDA-synced
+    at both boundaries so async GPU kernels are charged to the section that
+    launched them instead of leaking into the next one — without this, "data_wait"
+    silently absorbs the previous batch's still-running backward.
+
+    Two things this is built to surface:
+      * data-loader stalls vs GPU compute (is __getitem__ starving the GPU?), and
+      * tensor-parallel rank skew — compare the same section across ranks; a rank
+        that is fast in compute but slow in grad_allreduce is *waiting* on a
+        slower peer (the cause of the NCCL ALLREDUCE timeout).
+    A per-batch record is also kept so heavy buckets can be correlated with stalls.
+    """
+
+    def __init__(self, rank: int, device: str, enabled: bool):
+        self.rank    = rank
+        self.enabled = enabled
+        self.device  = device
+        self.cuda    = enabled and device.startswith("cuda")
+        self.totals: dict[str, float] = {}
+        self.records: list[dict]      = []
+        self._prev_end: float | None  = None
+
+    def _sync(self):
+        if self.cuda:
+            torch.cuda.synchronize()   # current device (set per-process via set_device)
+
+    @contextmanager
+    def section(self, name: str, rec: dict | None = None):
+        if not self.enabled:
+            yield
+            return
+        self._sync()
+        t0 = perf_counter()
+        try:
+            yield
+        finally:
+            self._sync()
+            dt = perf_counter() - t0
+            self.totals[name] = self.totals.get(name, 0.0) + dt
+            if rec is not None:
+                rec[name] = dt
+
+    def start_batch(self, rec: dict):
+        """Charge time blocked in the DataLoader (since the previous batch ended)
+        to 'data_wait'. Call at the very top of the loop body, before any .to()."""
+        if not self.enabled:
+            return
+        now = perf_counter()
+        dt  = 0.0 if self._prev_end is None else now - self._prev_end
+        self.totals["data_wait"] = self.totals.get("data_wait", 0.0) + dt
+        rec["data_wait"] = dt
+
+    def end_batch(self, rec: dict):
+        if not self.enabled:
+            return
+        self.records.append(rec)
+        self._prev_end = perf_counter()
+
+    # section order for the printed report (others appended as seen)
+    _ORDER = ["data_wait", "h2d", "forward", "loss", "backward",
+              "grad_allreduce", "clip", "step"]
+
+    def report(self):
+        if not self.enabled or not self.records:
+            return
+        n      = len(self.records)
+        total  = sum(self.totals.values())
+        names  = self._ORDER + [k for k in self.totals if k not in self._ORDER]
+        tag    = f"[prof r{self.rank}]"
+        lines  = [
+            f"{tag} ---- section breakdown over {n} active batch(es) "
+            f"(total {total:.3f}s, {total / n * 1e3:.1f} ms/batch) ----"
+        ]
+        for k in names:
+            if k not in self.totals:
+                continue
+            sec = self.totals[k]
+            lines.append(
+                f"{tag}   {k:<16s} {sec:8.3f}s  {sec / total * 100:5.1f}%  "
+                f"{sec / n * 1e3:8.2f} ms/batch"
+            )
+        # heaviest batches by data_wait and by compute, with bucket geometry
+        def _top(key, label):
+            rows = sorted(self.records, key=lambda r: r.get(key, 0.0), reverse=True)[:3]
+            for r in rows:
+                lines.append(
+                    f"{tag}   heavy-{label}: {r.get(key, 0.0) * 1e3:8.2f} ms  "
+                    f"bi={r['bi']:<5d} mols={r['n_mols']:<5d} "
+                    f"max_atoms={r['max_atoms']:<6d} real_atoms={r['real_atoms']}"
+                )
+        _top("data_wait", "data")
+        _top("compute",   "compute")
+        print("\n".join(lines), flush=True)
+
 
 # CLI
 def _parse_args():
@@ -76,7 +179,9 @@ def _parse_args():
     p.add_argument("--num_workers",    type=int,   default=None)
     p.add_argument("--verbosity",      default=None, choices=["epoch", "batch", "diagnostic"])
     p.add_argument("--profiler",       action="store_const", const=True, default=None)
-        
+    p.add_argument("--prof_warmup",    type=int,   default=None)
+    p.add_argument("--prof_active",    type=int,   default=None)
+
     return p.parse_args()
 
 # eval helper
@@ -219,23 +324,37 @@ def _worker(rank: int, cfg: RunConfig):
         if rank == 0:
             print(f"resumed from {cfg.resume} (epoch {ckpt['epoch']}, batch_idx {saved_bi}, val_loss {best_val:.4f})", flush=True)
 
-    # profiler (rank 0 only; profiles first 7 batches: wait=1 warmup=1 active=5)
+    # profiler — diagnostic mode. Every rank profiles (so tensor-parallel skew is
+    # visible) over a window of 1 (wait) + prof_warmup + prof_active batches; the
+    # loop then stops. torch.profiler emits a per-rank TensorBoard trace, and the
+    # lightweight _LoopProfiler attributes wall-clock to data-wait/compute/collectives.
+
+    prof_warmup = cfg.prof_warmup
+    prof_active = cfg.prof_active
+    prof_stop_bi = prof_warmup + prof_active   # last profiled batch index (wait=1 occupies bi=0)
+
+    loop_prof = _LoopProfiler(rank, device, enabled=cfg.profiler)
 
     _prof = None
-    if cfg.profiler and rank == 0:
+    if cfg.profiler:
         _prof = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler("./profiler_trace"),
+            schedule=torch.profiler.schedule(wait=1, warmup=prof_warmup, active=prof_active, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(f"./profiler_trace/rank{rank}"),
             record_shapes=True,
             profile_memory=True,
             with_stack=True,
         )
         _prof.start()
-        print("[profiler] started — trace will be written to ./profiler_trace/", flush=True)
+        if rank == 0:
+            print(
+                f"[profiler] started on all ranks — window=1+{prof_warmup}+{prof_active} batches; "
+                f"traces -> ./profiler_trace/rank<r>/",
+                flush=True,
+            )
 
     # training loop
 
@@ -294,11 +413,24 @@ def _worker(rank: int, cfg: RunConfig):
             if cfg.max_batches is not None and _bi >= cfg.max_batches:
                 break
 
-            batch = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
+            rec: dict = {"bi": _bi}
+            loop_prof.start_batch(rec)
+            if cfg.profiler:
+                # Bucket geometry, read off the still-on-CPU batch (no GPU sync).
+                # real_atoms drives the per-rank shard imbalance behind the
+                # ALLREDUCE timeout, so it is logged next to per-batch timings.
+                rec["n_mols"]     = batch.vocab.shape[0]
+                rec["max_atoms"]  = batch.vocab.shape[1]
+                rec["real_atoms"] = int(batch.padding_mask().sum().item())
+
+            with loop_prof.section("h2d", rec):
+                batch = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
             optimizer.zero_grad(set_to_none=True)
 
-            iq, fmags, sigmas = model(batch)
-            loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7)
+            with loop_prof.section("forward", rec):
+                iq, fmags, sigmas = model(batch)
+            with loop_prof.section("loss", rec):
+                loss = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7)
 
             if rank == 0 and cfg.verbosity == "diagnostic":
                 def _s(t): return f"nan={t.isnan().any().item()} inf={t.isinf().any().item()} min={t.float().min().item()} max={t.float().max().item()}"
@@ -313,26 +445,44 @@ def _worker(rank: int, cfg: RunConfig):
                     print(f"    coord:  {_s(batch.coord)}")
                     print(f"    vocab shape: {batch.vocab.shape}  n_real_atoms: {batch.padding_mask().sum().item()}", flush=True)
 
-            loss.backward()
+            with loop_prof.section("backward", rec):
+                loss.backward()
 
             # With TP, each rank's parameter gradients are a partial sum over its
             # atom shard, so they must be summed across ranks (SUM, not average —
-            # DDP averages, TP needs the full sum).
+            # DDP averages, TP needs the full sum). A rank that is fast everywhere
+            # else but slow here is *waiting* on a laggard peer — that's the skew
+            # to hunt with the per-rank section report.
             if is_dist:
-                for param in model.parameters():
-                    if param.grad is not None:
-                        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                with loop_prof.section("grad_allreduce", rec):
+                    for param in model.parameters():
+                        if param.grad is not None:
+                            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            optimizer.step()
+            with loop_prof.section("clip", rec):
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            with loop_prof.section("step", rec):
+                optimizer.step()
 
             if _prof is not None:
                 _prof.step()
-                if _bi >= 4:   # wait(1)+warmup(1)+active(3) = 5 steps (0-indexed: 0..4)
+                if _bi >= prof_stop_bi:
                     _prof.stop()
                     _prof = None
-                    print("[profiler] done — see ./profiler_trace/", flush=True)
+                    if rank == 0:
+                        print("[profiler] done — traces in ./profiler_trace/rank<r>/", flush=True)
+
+            if cfg.profiler:
+                rec["compute"] = sum(
+                    rec.get(k, 0.0)
+                    for k in ("forward", "loss", "backward", "grad_allreduce", "clip", "step")
+                )
+                del iq, fmags, sigmas, loss
+                loop_prof.end_batch(rec)
+                if _bi >= prof_stop_bi:   # all ranks stop together to avoid NCCL deadlock
+                    loop_prof.report()
                     break
+                continue                  # skip the metrics/logging tail during profiling
 
             if rank == 0 and cfg.verbosity == "diagnostic" and (_bi < 12 or not torch.isfinite(grad_norm)):
                 print(f"  [grad] batch {_bi}  grad_norm={grad_norm.item()}", flush=True)
@@ -365,6 +515,9 @@ def _worker(rank: int, cfg: RunConfig):
                 last_ckpt = _time.time()
                 if cfg.verbosity in ("batch", "diagnostic"):
                     print(f"  [ckpt] saved mid-epoch resume @ epoch {epoch} batch {_bi}", flush=True)
+
+        if cfg.profiler:
+            break   # diagnostic run: stop after the profiling window, no eval/checkpoint
 
         train_loss   = train_loss_sum / train_mols
         train_ss_tot = train_sum_y2 - train_sum_y ** 2 / train_n_elem
@@ -456,6 +609,8 @@ def main(cfg: RunConfig | None = None):
             num_workers    = A.num_workers,
             verbosity      = A.verbosity,
             profiler       = A.profiler,
+            prof_warmup    = A.prof_warmup,
+            prof_active    = A.prof_active,
         )
 
     n_gpus = torch.cuda.device_count()

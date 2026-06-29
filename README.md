@@ -642,7 +642,9 @@ Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle
 | `atom_size_ceil` | -1 | Max total atoms per batch (-1 = 3x largest molecule). |
 | `num_workers` | 4 | DataLoader worker processes. |
 | `ckpt_interval_sec` | 600 | Seconds between mid-epoch resume checkpoints. |
-| `profiler` | False | Run torch.profiler on 5 batches then stop; trace written to `./profiler_trace/`. |
+| `profiler` | False | Diagnostic run: per-rank torch.profiler + per-section wall-clock timers, then stop. Traces written per rank to `./profiler_trace/rank<r>/`. |
+| `prof_warmup` | 1 | Profiler warmup batches (profiled, discarded). |
+| `prof_active` | 3 | Profiler active batches (recorded). Loop runs `1 + prof_warmup + prof_active` batches; raise `prof_active` for more representative stats. |
 
 ---
 
@@ -697,11 +699,16 @@ Optimizer: Adam(SUM-reduced grads, clip at grad_clip) -> parameter update
 
 ## 12. Profiling and Optimization on Kaggle
 
-### Running the PyTorch Profiler
+### Running the Profiler
 
-Set `profiler: true` in your YAML config or pass `--profiler` on the CLI. The training loop will run 5 batches (wait=1, warmup=1, active=3), write a TensorBoard trace to `./profiler_trace/`, then stop.
+Set `profiler: true` in your YAML config or pass `--profiler` on the CLI. This runs a short **diagnostic** instead of normal training: the loop runs `1 + prof_warmup + prof_active` batches (defaults `1 + 1 + 3 = 5`; tune with `--prof_warmup`/`--prof_active`), then stops — no eval or checkpointing. Adjust `prof_active` higher (e.g. 20–50) to average over many buckets.
 
-On Kaggle, use the dedicated profiler cell (which sets `profiler=True` in `RunConfig`), then run the TensorBoard cell immediately after:
+Two layers of profiling run on **every rank**:
+
+1. **torch.profiler** — a full CPU+CUDA TensorBoard trace per rank at `./profiler_trace/rank<r>/`.
+2. **Section timers** — a CUDA-synced wall-clock breakdown printed at the end. Each rank prints time spent in `data_wait` / `h2d` / `forward` / `loss` / `backward` / `grad_allreduce` / `clip` / `step`, plus the heaviest batches by data-wait and by compute (with molecule count, max atoms, and real atoms). Comparing the same section **across ranks** localizes tensor-parallel skew: a rank that is fast in compute but slow in `grad_allreduce` is *waiting* on a slower peer — the usual cause of the NCCL `ALLREDUCE` watchdog timeout.
+
+On Kaggle, use the dedicated profiler cell (which sets `profiler=True`, `prof_warmup`, `prof_active` in `RunConfig`), then run the TensorBoard cell immediately after:
 
 ```python
 %load_ext tensorboard
@@ -718,7 +725,11 @@ Or load the `.pt.trace.json` file directly at `chrome://tracing`.
 
 ### Interpreting the Profiler
 
-**GPU idle gaps** between CUDA kernels: CPU is the bottleneck. Causes are usually DataLoader (HDF5 reads), Python overhead between chunks, or the per-parameter `all_reduce` loop. The HDF5 file is opened and closed per `__getitem__`; if this dominates, consider caching `Batch` objects as `.pt` files.
+**Start with the section timers** (printed to stdout) before opening the trace — they tell you which bucket of time to chase. High `data_wait` ⇒ the DataLoader is starving the GPU (see below); high `forward`/`backward` ⇒ go into the trace. A large `grad_allreduce` (or `backward`, which contains the in-model `_AllReduce`) on one rank but not the other ⇒ tensor-parallel skew, not a slow collective.
+
+**High `data_wait`**: CPU/IO is the bottleneck. Each `BatchSet.__getitem__` re-opens the HDF5 file and runs a Python encode loop per atom, so heavy buckets stall. Raise `num_workers`; if `data_wait` stays high and tracks the heavy buckets in the report, cache `Batch` objects as `.pt` files or hoist the HDF5 handle out of `__getitem__`.
+
+**GPU idle gaps** between CUDA kernels in the trace: CPU is the bottleneck. Causes are usually DataLoader (HDF5 reads), Python overhead between chunks, or the per-parameter `all_reduce` loop.
 
 **Short CUDA bars, lots of idle**: chunks are too small and kernel launch overhead dominates. Increase `atm_chunk`.
 
