@@ -348,6 +348,15 @@ def _worker(rank: int, cfg: RunConfig):
 
     loop_prof = _LoopProfiler(rank, device, enabled=cfg.profiler)
 
+    def _on_trace_ready(p):
+        # Print a kernel table straight to stdout — TensorBoard's inline view
+        # hangs through Kaggle's proxy, but stdout always works. Still write the
+        # trace file so it can be opened in Perfetto / chrome://tracing if wanted.
+        if rank == 0:
+            print(f"\n[profiler] top GPU ops (rank 0, {tb_active} active batch(es)):", flush=True)
+            print(p.key_averages().table(sort_by="cuda_time_total", row_limit=25), flush=True)
+        torch.profiler.tensorboard_trace_handler(f"./profiler_trace/rank{rank}")(p)
+
     _prof = None
     if cfg.profiler:
         _prof = torch.profiler.profile(
@@ -356,7 +365,7 @@ def _worker(rank: int, cfg: RunConfig):
                 torch.profiler.ProfilerActivity.CUDA,
             ],
             schedule=torch.profiler.schedule(wait=1, warmup=prof_warmup, active=tb_active, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(f"./profiler_trace/rank{rank}"),
+            on_trace_ready=_on_trace_ready,
             record_shapes=True,
             profile_memory=False,   # extra host RAM; not needed for a speed profile
             with_stack=False,       # huge per-event RAM at export → OOM kill; keep off
