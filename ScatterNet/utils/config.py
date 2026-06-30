@@ -66,13 +66,6 @@ class RunConfig:
                     exists at a time (freed after each N-chunk checkpoint recomputation).
     eps_embd:       Numerical floor in the Embed module (avoids division by zero).
     eps_msgp:       Numerical floor in MessagePass sigma clamping and aggregate denominator.
-    checkpoint_threshold: Gradient-checkpointing cutoff in units of N*M_shard (molecules x
-                    per-rank padded atoms). A batch is checkpointed only if N*M_shard >= this
-                    value; smaller batches run a normal forward/backward (no recompute, faster).
-                    Since every batch shares the same lambda/Q, N*M_shard is the only thing that
-                    varies, so it is an exact proxy for activation memory. 0 = always checkpoint
-                    (default; matches old behaviour). Raise it to skip recompute on batches that
-                    fit; calibrate against the profiler's peak_alloc.
 
     Loss
     ----
@@ -136,7 +129,6 @@ class RunConfig:
     msg_seed:       int            = 42
     atm_chunk:      int            = 1024
     mol_chunk:      int            = 32
-    checkpoint_threshold: int      = 0         # checkpoint a batch only if N*M_shard >= this (0 = always)
     eps_embd:       float          = 1e-8
     eps_msgp:       float          = 1e-3
 

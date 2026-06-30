@@ -129,7 +129,6 @@ Pass 2; per-atom update using the accumulated context:
         q_points:  int,
         n_chunk:   int,
         m_chunk:   int,
-        checkpoint_threshold: int = 0,
         ):
 
         super().__init__()
@@ -148,7 +147,6 @@ Pass 2; per-atom update using the accumulated context:
         self._lambda_5 = lambda_5
         self._nchunk   = n_chunk
         self._mchunk   = m_chunk
-        self._ckpt_threshold = checkpoint_threshold   # checkpoint a batch only if N*M_shard >= this
         self._proj_agg = nn.Linear(lambda_1, 2 * lambda_1)
         self.register_buffer('_omegafrq', torch.from_numpy(rng.standard_normal((lambda_5, 3))).float())
         self._biasterm = nn.Parameter(torch.from_numpy(rng.uniform(0, 2*np.pi, size=(self._lambda_5))).float())
@@ -156,7 +154,7 @@ Pass 2; per-atom update using the accumulated context:
         self._rms_norm = nn.RMSNorm(lambda_1)
         self._q_points = q_points
 
-    def _pass_1(self, cont: _PassContainer, eps: float, do_ckpt: bool) -> _PassContainer:
+    def _pass_1(self, cont: _PassContainer, eps: float) -> _PassContainer:
 
         """
         Accumulate global context (features, chem_env) for this N-chunk across all M-chunks.
@@ -196,16 +194,13 @@ Pass 2; per-atom update using the accumulated context:
         for m0 in range(0, cont.M, cont.Mchnk):
             m1 = min(m0 + cont.Mchnk, cont.M)
             args = (cont.emb_n[:, m0:m1], cont.crd_n[:, m0:m1], cont.sig_n[:, m0:m1], cont.msk_n[:, m0:m1])
-            if do_ckpt:
-                step_feat, step_chem = checkpoint(_step, *args, use_reentrant=False)  # type: ignore[misc]
-            else:
-                step_feat, step_chem = _step(*args)
+            step_feat, step_chem = checkpoint(_step, *args, use_reentrant=False)  # type: ignore[misc]
             features = features + step_feat
             chem_env = chem_env + step_chem
 
         return cont._replace(features=features, chem_env=chem_env)
 
-    def _pass_2(self, cont: _PassContainer, eps: float, do_ckpt: bool) -> _PassContainer:
+    def _pass_2(self, cont: _PassContainer, eps: float) -> _PassContainer:
 
         """
         Compute per-atom neighbourhood aggregate and update embeddings and sigmas.
@@ -265,10 +260,7 @@ Pass 2; per-atom update using the accumulated context:
         for m0 in range(0, cont.M, cont.Mchnk):
             m1 = min(m0 + cont.Mchnk, cont.M)
             args = (cont.emb_n[:, m0:m1], cont.ffs_n[:, m0:m1], cont.sig_n[:, m0:m1], cont.crd_n[:, m0:m1], cont.msk_n[:, m0:m1])
-            if do_ckpt:
-                emb_c, sig_c = checkpoint(_step, *args, use_reentrant=False)  # type: ignore[misc]
-            else:
-                emb_c, sig_c = _step(*args)
+            emb_c, sig_c = checkpoint(_step, *args, use_reentrant=False)  # type: ignore[misc]
             new_emb_m.append(emb_c)
             new_sig_m.append(sig_c)
 
@@ -310,12 +302,6 @@ Pass 2; per-atom update using the accumulated context:
         Cn      = self._nchunk
         Cm      = self._mchunk
 
-        # Gradient checkpointing trades ~2x recompute for lower memory. Every batch shares
-        # the same lambda/Q, so N*M (molecules x this rank's padded shard) is an exact proxy
-        # for activation memory — checkpoint only when it crosses the configured threshold,
-        # so small/medium batches run a normal (recompute-free) backward.
-        do_ckpt = (N * M) >= self._ckpt_threshold
-
         for _ in range(self._lambda_2):
             new_embeds_n = []
             new_sigmas_n = []
@@ -340,22 +326,19 @@ Pass 2; per-atom update using the accumulated context:
                         features = crd_s.new_zeros(Nc_s, Q, self._lambda_5),
                         chem_env = crd_s.new_zeros(Nc_s, Q, self._lambda_5, self._lambda_1),
                     )
-                    cont = self._pass_1(cont, eps, do_ckpt)
+                    cont = self._pass_1(cont, eps)
                     cont = cont._replace(
                         features = self._all_reduce(cont.features),
                         chem_env = self._all_reduce(cont.chem_env),
                     )
-                    cont = self._pass_2(cont, eps, do_ckpt)
+                    cont = self._pass_2(cont, eps)
                     return cont.emb_n, cont.sig_n
 
                 # use_reentrant=True: forward runs under no_grad so chem_env is created and freed
                 # per N-chunk. use_reentrant=False would keep all N-chunks' chem_env alive
                 # simultaneously (the _pass_2._step closures hold a reference to it).
                 args = (embeds[n0:n1], padding_mask[n0:n1], f_mags[n0:n1], sigmas[n0:n1], coord[n0:n1])
-                if do_ckpt:
-                    new_emb, new_sig = checkpoint(_n_chunk_round, *args, use_reentrant=True)  # type: ignore[misc]
-                else:
-                    new_emb, new_sig = _n_chunk_round(*args)
+                new_emb, new_sig = checkpoint(_n_chunk_round, *args, use_reentrant=True)  # type: ignore[misc]
                 new_embeds_n.append(new_emb)
                 new_sigmas_n.append(new_sig)
 
