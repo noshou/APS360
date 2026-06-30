@@ -142,20 +142,28 @@ class _LoopProfiler:
                 f"{sec / n * 1e3:8.2f} ms/batch"
             )
         if self.cuda:
+            # split the ceiling by checkpoint status: un-checkpointed peak is the OOM-risk
+            # number that calibrates checkpoint_threshold; checkpointed peak is the chunk ceiling.
+            def _maxpk(pred):
+                return max((r["peak_alloc_gb"] for r in self.records
+                            if "peak_alloc_gb" in r and pred(r)), default=0.0)
+            unck = _maxpk(lambda r: not r.get("ckpt"))
+            ckpt = _maxpk(lambda r:     r.get("ckpt"))
             lines.append(
-                f"{tag}   peak CUDA mem: alloc={self.peak_alloc_gb:.2f}G (batch {self.peak_bi})  "
-                f"reserved={self.peak_resv_gb:.2f}G  "
-                f"— headroom for larger atm_chunk/mol_chunk if well under the GPU limit"
+                f"{tag}   peak CUDA mem: un-checkpointed={unck:.2f}G  checkpointed={ckpt:.2f}G  "
+                f"(reserved high-water {self.peak_resv_gb:.2f}G; raise checkpoint_threshold while "
+                f"un-checkpointed stays under the GPU limit)"
             )
-        # heaviest batches by data_wait and by compute, with bucket geometry + peak mem
+        # heaviest batches by data_wait and by compute, with bucket geometry + peak mem + ckpt
         def _top(key, label):
             rows = sorted(self.records, key=lambda r: r.get(key, 0.0), reverse=True)[:3]
             for r in rows:
                 mem = f" peak_alloc={r['peak_alloc_gb']:.2f}G" if "peak_alloc_gb" in r else ""
+                ck  = f" ckpt={r.get('ckpt')}" if "ckpt" in r else ""
                 lines.append(
                     f"{tag}   heavy-{label}: {r.get(key, 0.0) * 1e3:8.2f} ms  "
                     f"bi={r['bi']:<5d} mols={r['n_mols']:<5d} "
-                    f"max_atoms={r['max_atoms']:<6d} real_atoms={r['real_atoms']}{mem}"
+                    f"max_atoms={r['max_atoms']:<6d} real_atoms={r['real_atoms']}{mem}{ck}"
                 )
         _top("data_wait", "data")
         _top("compute",   "compute")
@@ -301,26 +309,45 @@ def _worker(rank: int, cfg: RunConfig):
     val_loader   = DataLoader(val_set,   batch_size=1, shuffle=False, collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
     test_loader  = DataLoader(test_set,  batch_size=1, shuffle=False, collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
 
-    # In profiler mode, profile the HEAVIEST buckets (largest N*M_shard) instead of a
-    # random shuffle window — the shuffle would otherwise miss the worst-case bucket that
-    # sets the true memory ceiling. Atom counts live in each row (grp, stem, atoms), so we
-    # rank buckets from metadata without loading tensors. Worst-first ordering puts the
-    # single biggest bucket at bi=0 (the profiler's "wait" step), giving it a clean
-    # peak_alloc with no torch-trace overhead.
+    # In profiler mode, pick which buckets to profile from metadata (atom counts live in
+    # each row (grp, stem, atoms), so no tensors are loaded). Rank by N*M_shard, the proxy
+    # for activation memory. With a checkpoint_threshold set, the batches that actually
+    # govern OOM are the heaviest ones that run UN-checkpointed (proxy < threshold) — those
+    # retain full activations — so profile those for calibration. With threshold 0 (always
+    # checkpoint) there is no un-checkpointed path, so fall back to the heaviest overall to
+    # check the checkpointed ceiling. Worst-first puts the biggest at bi=0 (the profiler's
+    # "wait" step), giving it a clean peak_alloc with no torch-trace overhead.
     prof_loader = None
+    worst: list = []
     if cfg.profiler:
         ws_proxy = max(world_size, 1)
         def _bucket_proxy(i):
             rows = train_set._batches[i]
             return len(rows) * ((max(r[2] for r in rows) + ws_proxy - 1) // ws_proxy)
-        n_window = 1 + cfg.prof_warmup + cfg.prof_active
-        worst    = sorted(range(len(train_set)), key=_bucket_proxy, reverse=True)[:n_window]
+        # Profile BOTH sides of the threshold, ~equally: the heaviest UN-checkpointed
+        # buckets (proxy < threshold; these retain full activations and set the OOM risk)
+        # and the heaviest CHECKPOINTED buckets (proxy >= threshold; these set the
+        # chunk-bounded ceiling). Each group gets up to a full window, so total may grow
+        # to ~2x — accepted, to keep both sides represented. Un-checkpointed first, so the
+        # single worst un-checkpointed bucket lands at bi=0 (clean peak, no trace overhead).
+        n_each = 1 + cfg.prof_warmup + cfg.prof_active
+        ranked = sorted(range(len(train_set)), key=_bucket_proxy, reverse=True)
+        thr    = cfg.checkpoint_threshold
+        if thr > 0:
+            below = [i for i in ranked if _bucket_proxy(i) <  thr][:n_each]   # un-checkpointed
+            above = [i for i in ranked if _bucket_proxy(i) >= thr][:n_each]   # checkpointed
+            worst = below + above
+            mode  = f"{len(below)} un-checkpointed + {len(above)} checkpointed (threshold={thr})"
+        else:
+            worst = ranked[:n_each]
+            mode  = f"{len(worst)} heaviest (threshold=0, all checkpoint)"
         prof_loader = DataLoader(Subset(train_set, worst), batch_size=1, shuffle=False,
                                  collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin)
         if rank == 0:
             big = worst[0]
-            print(f"[profiler] probing {len(worst)} heaviest buckets (worst N*M_shard≈{_bucket_proxy(big)}, "
-                  f"{len(train_set._batches[big])} mols x {max(r[2] for r in train_set._batches[big])} atoms)", flush=True)
+            print(f"[profiler] probing {mode}; worst-first per group, "
+                  f"top N*M_shard≈{_bucket_proxy(big)} "
+                  f"({len(train_set._batches[big])} mols x {max(r[2] for r in train_set._batches[big])} atoms)", flush=True)
 
     if rank == 0:
         train_mols = sum(len(b) for b in train_set._batches)
@@ -389,10 +416,11 @@ def _worker(rank: int, cfg: RunConfig):
 
     prof_warmup = cfg.prof_warmup
     prof_active = cfg.prof_active
-    prof_stop_bi = prof_warmup + prof_active   # loop's last batch (wait=1 occupies bi=0)
-
-    tb_active  = min(prof_active, 3)           # keep the heavy torch trace to a few steps
-    tb_stop_bi = prof_warmup + tb_active       # torch profiler's last step index
+    # The section timers profile the whole selected loader (both groups); break on its
+    # last batch. The memory-heavy torch trace still only samples the first few steps.
+    prof_stop_bi = (len(worst) - 1) if cfg.profiler else 0   # loop's last batch
+    tb_active    = min(prof_active, 3)          # keep the heavy torch trace to a few steps
+    tb_stop_bi   = prof_warmup + tb_active      # torch profiler's last step index
 
     loop_prof = _LoopProfiler(rank, device, enabled=cfg.profiler)
 
@@ -492,6 +520,9 @@ def _worker(rank: int, cfg: RunConfig):
                 rec["n_mols"]     = batch.vocab.shape[0]
                 rec["max_atoms"]  = batch.vocab.shape[1]
                 rec["real_atoms"] = int(batch.padding_mask().sum().item())
+                _ws    = max(world_size, 1)
+                _shard = (rec["max_atoms"] + _ws - 1) // _ws
+                rec["ckpt"] = (rec["n_mols"] * _shard) >= cfg.checkpoint_threshold
 
             with loop_prof.section("h2d", rec):
                 batch = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
