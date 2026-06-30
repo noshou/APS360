@@ -52,7 +52,10 @@ class _LoopProfiler:
       * tensor-parallel rank skew — compare the same section across ranks; a rank
         that is fast in compute but slow in grad_allreduce is *waiting* on a
         slower peer (the cause of the NCCL ALLREDUCE timeout).
-    A per-batch record is also kept so heavy buckets can be correlated with stalls.
+    A per-batch record is also kept so heavy buckets can be correlated with stalls,
+    and per-batch peak CUDA memory is tracked (a free counter read — unlike
+    torch.profiler's profile_memory, which OOMs) so you can see headroom for
+    raising atm_chunk / mol_chunk.
     """
 
     def __init__(self, rank: int, device: str, enabled: bool):
@@ -63,6 +66,9 @@ class _LoopProfiler:
         self.totals: dict[str, float] = {}
         self.records: list[dict]      = []
         self._prev_end: float | None  = None
+        self.peak_alloc_gb = 0.0      # max over all batches of per-batch peak live tensors
+        self.peak_resv_gb  = 0.0      # max allocator-reserved (cache); OOM-relevant ceiling
+        self.peak_bi       = -1       # which batch hit peak_alloc_gb
 
     def _sync(self):
         if self.cuda:
@@ -93,10 +99,22 @@ class _LoopProfiler:
         dt  = 0.0 if self._prev_end is None else now - self._prev_end
         self.totals["data_wait"] = self.totals.get("data_wait", 0.0) + dt
         rec["data_wait"] = dt
+        if self.cuda:
+            # isolate this batch's peak so per-batch memory is attributable
+            torch.cuda.reset_peak_memory_stats()
 
     def end_batch(self, rec: dict):
         if not self.enabled:
             return
+        if self.cuda:
+            pk = torch.cuda.max_memory_allocated() / 1e9   # peak LIVE tensors this batch (OOM driver)
+            rv = torch.cuda.memory_reserved()      / 1e9   # allocator cache high-water
+            rec["peak_alloc_gb"] = pk
+            rec["reserved_gb"]   = rv
+            if pk > self.peak_alloc_gb:
+                self.peak_alloc_gb = pk
+                self.peak_bi       = rec["bi"]
+            self.peak_resv_gb = max(self.peak_resv_gb, rv)
         self.records.append(rec)
         self._prev_end = perf_counter()
 
@@ -123,14 +141,21 @@ class _LoopProfiler:
                 f"{tag}   {k:<16s} {sec:8.3f}s  {sec / total * 100:5.1f}%  "
                 f"{sec / n * 1e3:8.2f} ms/batch"
             )
-        # heaviest batches by data_wait and by compute, with bucket geometry
+        if self.cuda:
+            lines.append(
+                f"{tag}   peak CUDA mem: alloc={self.peak_alloc_gb:.2f}G (batch {self.peak_bi})  "
+                f"reserved={self.peak_resv_gb:.2f}G  "
+                f"— headroom for larger atm_chunk/mol_chunk if well under the GPU limit"
+            )
+        # heaviest batches by data_wait and by compute, with bucket geometry + peak mem
         def _top(key, label):
             rows = sorted(self.records, key=lambda r: r.get(key, 0.0), reverse=True)[:3]
             for r in rows:
+                mem = f" peak_alloc={r['peak_alloc_gb']:.2f}G" if "peak_alloc_gb" in r else ""
                 lines.append(
                     f"{tag}   heavy-{label}: {r.get(key, 0.0) * 1e3:8.2f} ms  "
                     f"bi={r['bi']:<5d} mols={r['n_mols']:<5d} "
-                    f"max_atoms={r['max_atoms']:<6d} real_atoms={r['real_atoms']}"
+                    f"max_atoms={r['max_atoms']:<6d} real_atoms={r['real_atoms']}{mem}"
                 )
         _top("data_wait", "data")
         _top("compute",   "compute")
