@@ -324,14 +324,27 @@ def _worker(rank: int, cfg: RunConfig):
         if rank == 0:
             print(f"resumed from {cfg.resume} (epoch {ckpt['epoch']}, batch_idx {saved_bi}, val_loss {best_val:.4f})", flush=True)
 
-    # profiler — diagnostic mode. Every rank profiles (so tensor-parallel skew is
-    # visible) over a window of 1 (wait) + prof_warmup + prof_active batches; the
-    # loop then stops. torch.profiler emits a per-rank TensorBoard trace, and the
-    # lightweight _LoopProfiler attributes wall-clock to data-wait/compute/collectives.
+    # profiler — diagnostic mode. Two decoupled layers, both on every rank:
+    #
+    #   * _LoopProfiler  — O(1)-memory wall-clock section timers. Runs the FULL
+    #     1 + prof_warmup + prof_active window so per-rank averages are representative;
+    #     this is what exposes tensor-parallel skew, and it costs ~nothing in RAM.
+    #
+    #   * torch.profiler — kernel-level trace. This buffers every op (thousands per
+    #     step here, given the checkpointed chunk loops) in HOST RAM and materialises
+    #     them all at export, so it is memory-heavy and OOM-kills the process if the
+    #     active window is long. It therefore samples only a few steady-state steps
+    #     (tb_active), and with_stack / profile_memory are OFF — with_stack stores a
+    #     full stack per event and is the main cause of the export RAM blow-up.
+    #
+    # The loop runs for the section-timer window; the torch trace stops earlier.
 
     prof_warmup = cfg.prof_warmup
     prof_active = cfg.prof_active
-    prof_stop_bi = prof_warmup + prof_active   # last profiled batch index (wait=1 occupies bi=0)
+    prof_stop_bi = prof_warmup + prof_active   # loop's last batch (wait=1 occupies bi=0)
+
+    tb_active  = min(prof_active, 3)           # keep the heavy torch trace to a few steps
+    tb_stop_bi = prof_warmup + tb_active       # torch profiler's last step index
 
     loop_prof = _LoopProfiler(rank, device, enabled=cfg.profiler)
 
@@ -342,17 +355,17 @@ def _worker(rank: int, cfg: RunConfig):
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            schedule=torch.profiler.schedule(wait=1, warmup=prof_warmup, active=prof_active, repeat=1),
+            schedule=torch.profiler.schedule(wait=1, warmup=prof_warmup, active=tb_active, repeat=1),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(f"./profiler_trace/rank{rank}"),
             record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
+            profile_memory=False,   # extra host RAM; not needed for a speed profile
+            with_stack=False,       # huge per-event RAM at export → OOM kill; keep off
         )
         _prof.start()
         if rank == 0:
             print(
-                f"[profiler] started on all ranks — window=1+{prof_warmup}+{prof_active} batches; "
-                f"traces -> ./profiler_trace/rank<r>/",
+                f"[profiler] started on all ranks — section timers over 1+{prof_warmup}+{prof_active} "
+                f"batches, torch trace over 1+{prof_warmup}+{tb_active}; traces -> ./profiler_trace/rank<r>/",
                 flush=True,
             )
 
@@ -466,11 +479,11 @@ def _worker(rank: int, cfg: RunConfig):
 
             if _prof is not None:
                 _prof.step()
-                if _bi >= prof_stop_bi:
+                if _bi >= tb_stop_bi:   # stop the memory-heavy trace early; timers keep going
                     _prof.stop()
                     _prof = None
                     if rank == 0:
-                        print("[profiler] done — traces in ./profiler_trace/rank<r>/", flush=True)
+                        print("[profiler] torch trace written — see ./profiler_trace/rank<r>/", flush=True)
 
             if cfg.profiler:
                 rec["compute"] = sum(

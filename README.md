@@ -703,10 +703,10 @@ Optimizer: Adam(SUM-reduced grads, clip at grad_clip) -> parameter update
 
 Set `profiler: true` in your YAML config or pass `--profiler` on the CLI. This runs a short **diagnostic** instead of normal training: the loop runs `1 + prof_warmup + prof_active` batches (defaults `1 + 1 + 3 = 5`; tune with `--prof_warmup`/`--prof_active`), then stops — no eval or checkpointing. Adjust `prof_active` higher (e.g. 20–50) to average over many buckets.
 
-Two layers of profiling run on **every rank**:
+Two decoupled layers of profiling run on **every rank**:
 
-1. **torch.profiler** — a full CPU+CUDA TensorBoard trace per rank at `./profiler_trace/rank<r>/`.
-2. **Section timers** — a CUDA-synced wall-clock breakdown printed at the end. Each rank prints time spent in `data_wait` / `h2d` / `forward` / `loss` / `backward` / `grad_allreduce` / `clip` / `step`, plus the heaviest batches by data-wait and by compute (with molecule count, max atoms, and real atoms). Comparing the same section **across ranks** localizes tensor-parallel skew: a rank that is fast in compute but slow in `grad_allreduce` is *waiting* on a slower peer — the usual cause of the NCCL `ALLREDUCE` watchdog timeout.
+1. **Section timers** — a CUDA-synced wall-clock breakdown printed at the end, over the **full** `prof_active` window (so averages are representative). Each rank prints time spent in `data_wait` / `h2d` / `forward` / `loss` / `backward` / `grad_allreduce` / `clip` / `step`, plus the heaviest batches by data-wait and by compute (with molecule count, max atoms, and real atoms). These cost ~no extra memory. Comparing the same section **across ranks** localizes tensor-parallel skew: a rank fast in compute but slow in `grad_allreduce` is *waiting* on a slower peer — the usual cause of the NCCL `ALLREDUCE` watchdog timeout.
+2. **torch.profiler** — a CPU+CUDA TensorBoard trace per rank at `./profiler_trace/rank<r>/` for kernel-level drill-down. This buffers every op in host RAM and materializes them at export, so it is memory-heavy: it samples only `min(prof_active, 3)` steady-state steps regardless of `prof_active`, and runs with `with_stack`/`profile_memory` **off** (a long active window or `with_stack` triggers the host OOM-killer → worker `SIGKILL`). Raising `prof_active` lengthens the cheap section-timer window, not the heavy trace.
 
 On Kaggle, use the dedicated profiler cell (which sets `profiler=True`, `prof_warmup`, `prof_active` in `RunConfig`), then run the TensorBoard cell immediately after:
 

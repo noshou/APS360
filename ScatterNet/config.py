@@ -100,9 +100,11 @@ class RunConfig:
                     rank to ./profiler_trace/rank<r>/.
     prof_warmup:    Number of warmup batches in the profiler schedule (profiled but discarded,
                     so steady-state kernels are captured). Bump on Kaggle for a longer ramp.
-    prof_active:    Number of active batches actually recorded by the profiler / section timers.
+    prof_active:    Number of active batches recorded by the lightweight section timers.
                     Larger = more representative stats (e.g. 50 to average over many buckets);
-                    the loop runs 1 (wait) + prof_warmup + prof_active batches total.
+                    the loop runs 1 (wait) + prof_warmup + prof_active batches total. The
+                    memory-heavy torch.profiler trace samples only min(prof_active, 3) of these
+                    steps (a long torch-trace window exhausts host RAM and SIGKILLs the worker).
 
     Data
     ----
