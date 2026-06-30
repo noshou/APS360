@@ -15,8 +15,8 @@ from torch.utils.data            import DataLoader
 from Preprocess                  import Encoding
 from ScatterNet                  import ScatterNet
 from ScatterNet.batching         import Batcher
-from ScatterNet.config           import RunConfig, load_config
-from ScatterNet.loss             import Loss
+from ScatterNet.utils.config           import RunConfig, load_config
+from ScatterNet.utils             import Loss
 
 def _first(x):
     """collate_fn that unwraps the single-element list from batch_size=1."""
@@ -187,6 +187,7 @@ def _parse_args():
     p.add_argument("--lambda_5",       type=int,   default=None)
     p.add_argument("--msg_seed",       type=int,   default=None)
     p.add_argument("--atm_chunk",      type=int,   default=None)
+    p.add_argument("--checkpoint_threshold", type=int, default=None)
     p.add_argument("--eps_embd",       type=float, default=None)
     p.add_argument("--eps_msgp",       type=float, default=None)
 
@@ -325,6 +326,7 @@ def _worker(rank: int, cfg: RunConfig):
         q_points  = q_points,
         eps_embd  = cfg.eps_embd,
         eps_msgp  = cfg.eps_msgp,
+        checkpoint_threshold = cfg.checkpoint_threshold,
     ).to(device)
 
     criterion = Loss(q_grid, energy).to(device)
@@ -643,6 +645,7 @@ def main(cfg: RunConfig | None = None):
             lambda_5       = A.lambda_5,
             msg_seed       = A.msg_seed,
             atm_chunk      = A.atm_chunk,
+            checkpoint_threshold = A.checkpoint_threshold,
             eps_embd       = A.eps_embd,
             eps_msgp       = A.eps_msgp,
             lambda_6       = A.lambda_6,

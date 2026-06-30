@@ -8,7 +8,7 @@ and asserts that the loss falls over training — enough to confirm the full pip
 import sys, os, json
 sys.path.insert(0, os.path.dirname(__file__))
 
-from ScatterNet.config import RunConfig
+from ScatterNet.utils.config import RunConfig
 from train             import main
 
 CKPT_BEST   = "/tmp/smoke_best.pt"
