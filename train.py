@@ -11,7 +11,7 @@ from time       import perf_counter
 
 from torch.multiprocessing.spawn import spawn as mp_spawn  # type: ignore[attr-defined]
 from dataclasses                 import replace as dc_replace
-from torch.utils.data            import DataLoader
+from torch.utils.data            import DataLoader, Subset
 from Preprocess                  import Encoding
 from ScatterNet                  import ScatterNet
 from ScatterNet.batching         import Batcher
@@ -301,6 +301,27 @@ def _worker(rank: int, cfg: RunConfig):
     val_loader   = DataLoader(val_set,   batch_size=1, shuffle=False, collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
     test_loader  = DataLoader(test_set,  batch_size=1, shuffle=False, collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
 
+    # In profiler mode, profile the HEAVIEST buckets (largest N*M_shard) instead of a
+    # random shuffle window — the shuffle would otherwise miss the worst-case bucket that
+    # sets the true memory ceiling. Atom counts live in each row (grp, stem, atoms), so we
+    # rank buckets from metadata without loading tensors. Worst-first ordering puts the
+    # single biggest bucket at bi=0 (the profiler's "wait" step), giving it a clean
+    # peak_alloc with no torch-trace overhead.
+    prof_loader = None
+    if cfg.profiler:
+        ws_proxy = max(world_size, 1)
+        def _bucket_proxy(i):
+            rows = train_set._batches[i]
+            return len(rows) * ((max(r[2] for r in rows) + ws_proxy - 1) // ws_proxy)
+        n_window = 1 + cfg.prof_warmup + cfg.prof_active
+        worst    = sorted(range(len(train_set)), key=_bucket_proxy, reverse=True)[:n_window]
+        prof_loader = DataLoader(Subset(train_set, worst), batch_size=1, shuffle=False,
+                                 collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin)
+        if rank == 0:
+            big = worst[0]
+            print(f"[profiler] probing {len(worst)} heaviest buckets (worst N*M_shard≈{_bucket_proxy(big)}, "
+                  f"{len(train_set._batches[big])} mols x {max(r[2] for r in train_set._batches[big])} atoms)", flush=True)
+
     if rank == 0:
         train_mols = sum(len(b) for b in train_set._batches)
         val_mols   = sum(len(b) for b in val_set._batches)
@@ -456,7 +477,7 @@ def _worker(rank: int, cfg: RunConfig):
         skip = resume_skip if epoch == start_epoch else 0
         resume_skip = 0
 
-        for _bi, batch in enumerate(train_loader):
+        for _bi, batch in enumerate(prof_loader if prof_loader is not None else train_loader):
             if _bi < skip:
                 continue
             if cfg.max_batches is not None and _bi >= cfg.max_batches:
