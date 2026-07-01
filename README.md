@@ -487,15 +487,17 @@ batch -> Embed(batch, ε_e)              LayerHead: (N,M,1,λ₁), (N,M,Q,1), (N
 
 ### Routing: TP vs DP
 
-With a process group active, each batch picks a strategy from `M` (padded atoms/molecule) and `dp_atom_threshold`:
+With a process group active, each batch picks a strategy from `M` (padded atoms/molecule), `N` (molecule count), `mol_chunk`, and `dp_atom_threshold`:
 
 ```
-route_dp = model.training and dp_atom_threshold > 0 and M < dp_atom_threshold
+route_dp = model.training and dp_atom_threshold > 0 and M < dp_atom_threshold and N >= 2*mol_chunk
 ```
 
 `dp_atom_threshold = 0` (default) always uses TP — matches pre-DP behaviour exactly. `evaluate()` runs with `model.eval()`, so `model.training` is `False` and eval/test always use TP regardless of the threshold (needed since `evaluate()` assumes both ranks see identical full-batch outputs).
 
 TP shards atoms of the *same* molecules across ranks and needs an all-reduce mid-forward to reconstruct each atom's full neighbourhood (see `MessagePass._AllReduce`). For a bucket with very few atoms per molecule (e.g. `max_atoms=3`), that all-reduce's fixed latency cost dwarfs the tiny amount of per-rank compute it buys — DP routes those buckets by molecule instead, with **no in-model communication at all**.
+
+**Why `N >= 2*mol_chunk` is required, not optional:** DP halves the *outer* N-chunk loop (`ceil(N/2/mol_chunk)` vs `ceil(N/mol_chunk)`), but unlike TP it does **not** halve `M` before MessagePass's own `atm_chunk` loop runs over it (TP shards `M` first; DP keeps the full `M` per molecule). So a DP-routed bucket runs roughly **2x the inner M-chunk-loop launches** TP would've had on the same bucket — that only pays for itself if halving `N` actually shrinks the outer loop. If a bucket's `N` already fits in one N-chunk (`N < 2*mol_chunk`, common for large-`M`/small-`N` buckets, since `atom_size_ceil` caps total atoms per batch), DP buys zero outer-loop reduction while still eating the un-halved-`M` cost — pure overhead, and it stays on TP. Without this guard, setting `dp_atom_threshold` too high routes exactly these buckets into DP and measurably slows training down instead of speeding it up.
 
 ### Data Parallel Forward
 
@@ -659,7 +661,7 @@ Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle
 | `msg_seed` | 42 | Seed for fixed RFF frequency matrix Ω. |
 | `atm_chunk` | 1024 | Atoms per M-chunk. Reduce to lower VRAM. |
 | `mol_chunk` | 32 | Molecules per N-chunk. Reduce to lower VRAM on large molecules. |
-| `dp_atom_threshold` | 0 | Training-only, multi-GPU only. Batches with padded atom count `M` below this route through molecule-split data parallelism (no in-model all-reduce) instead of atom-split tensor parallelism. `0` = always TP (old behaviour). See [ScatterNet §7](#7-scatternet). |
+| `dp_atom_threshold` | 0 | Training-only, multi-GPU only. Batches with padded atom count `M` below this **and** molecule count `N >= 2*mol_chunk` route through molecule-split data parallelism (no in-model all-reduce) instead of atom-split tensor parallelism. `0` = always TP (old behaviour). See [ScatterNet §7](#7-scatternet) for why the `N` guard is required, not just `M`. |
 | `eps_embd` | 1e-8 | Numerical floor in Embed (softplus, hypot). |
 | `eps_msgp` | 1e-3 | Numerical floor in MessagePass (sigma clamp, aggregate denominator). |
 | `lr` | 3e-4 | Adam learning rate. |

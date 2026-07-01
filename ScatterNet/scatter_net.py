@@ -80,10 +80,12 @@ class ScatterNet(nn.Module):
 
     When a distributed process group is active (torch.distributed initialised)
     and the model is training, each batch is routed to one of two parallelism
-    strategies based on M (padded atoms per molecule) vs `dp_atom_threshold`:
+    strategies based on M (padded atoms per molecule), N (molecule count), and
+    `dp_atom_threshold`:
 
-    Tensor-parallel (TP) — M >= dp_atom_threshold, or dp_atom_threshold <= 0,
-    or not self.training (eval always uses this path):
+    Tensor-parallel (TP) — the default; used whenever DP's conditions (below)
+    aren't met, or dp_atom_threshold <= 0, or not self.training (eval always
+    uses this path):
         1. Embed runs on the full batch on every rank (cheap, per-atom lookup).
         2. Each rank slices its atom shard from embed_head.
         3. MessagePass runs on the shard; an all-reduce inside MessagePass
@@ -94,7 +96,7 @@ class ScatterNet(nn.Module):
         5. I(q) is summed across ranks (all-reduce); f_mags and sigmas are
            gathered back to full M.
 
-    Data-parallel (DP) — training and M < dp_atom_threshold:
+    Data-parallel (DP) — training, M < dp_atom_threshold, AND N >= 2*mol_chunk:
         Molecules are divided across ranks (no atom sharding, no in-model
         communication at all — small M means TP's all-reduce cost would
         dwarf the tiny amount of per-rank compute it parallelises). Each
@@ -104,6 +106,13 @@ class ScatterNet(nn.Module):
         two ranks' scaled-local-mean gradients reconstructs the exact
         global-mean gradient — the same mechanism already used to combine
         TP's partial gradients, just fed a differently-scaled loss.
+
+        The `N >= 2*mol_chunk` guard matters: DP halves the outer N-chunk
+        loop but does NOT halve M before MessagePass's own atm_chunk-loop
+        runs (TP does, by sharding M first). So a DP-routed bucket runs
+        ~2x the inner M-chunk-loop launches TP would've had on the same
+        bucket — only worth it if halving N actually shrinks the outer
+        loop. If N already fits in one N-chunk, DP is pure overhead.
 
     Without a process group the forward is identical to the single-GPU path.
 
@@ -127,6 +136,7 @@ class ScatterNet(nn.Module):
     _eps_embd: Float
     _eps_msgp: Float
     _dp_atom_threshold: int
+    _mol_chunk:         int
 
     def __init__(
         self,
@@ -151,6 +161,7 @@ class ScatterNet(nn.Module):
         self._eps_embd = eps_embd
         self._eps_msgp = eps_msgp
         self._dp_atom_threshold = dp_atom_threshold
+        self._mol_chunk = mol_chunk
 
     @jaxtyped(typechecker=beartype)
     def forward(self, batch: Batch) -> Tuple[
@@ -186,10 +197,19 @@ class ScatterNet(nn.Module):
             return iq, f_mags, sigmas, batch, 1.0
 
         M = embed_head.embeds.shape[1]
+        N = batch.vocab.shape[0]
         route_dp = (
             self.training
             and self._dp_atom_threshold > 0
             and M < self._dp_atom_threshold
+            # DP halves the N-chunk loop but does NOT halve M (unlike TP, which
+            # shards M before MessagePass's own atm_chunk-loop runs on it), so a
+            # DP-routed bucket runs the M-chunk loop over the *full* M — roughly
+            # 2x the inner-loop launches TP would've had on the same bucket. That
+            # only pays for itself if halving N actually shrinks the outer loop;
+            # if N already fits in one N-chunk (N < 2*mol_chunk), splitting it
+            # buys nothing while still eating the un-halved-M cost, so stay on TP.
+            and N >= 2 * self._mol_chunk
         )
 
         if route_dp:

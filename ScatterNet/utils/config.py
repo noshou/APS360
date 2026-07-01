@@ -64,16 +64,24 @@ class RunConfig:
     mol_chunk:      Molecules processed per N-chunk in MessagePass. Controls peak size of
                     chem_env (mol_chunk, Q, lambda_5, lambda_1); only one N-chunk's chem_env
                     exists at a time (freed after each N-chunk checkpoint recomputation).
-    dp_atom_threshold: Training-only routing knob (only matters with >1 GPU). Molecules per
-                    batch is M (padded atom count). If M < dp_atom_threshold, the batch is
-                    routed through data-parallel splitting (molecules divided across ranks,
-                    no in-model all-reduce) instead of the default tensor-parallel atom
-                    sharding. Rationale: TP shards atoms across ranks and all-reduces to
-                    reconstruct chem_env every round; for buckets with very few atoms per
-                    molecule that all-reduce cost dwarfs the tiny amount of per-rank compute
-                    it parallelises. 0 (default) = always TP, matching pre-existing behaviour.
-                    Eval/test always use TP regardless of this threshold (evaluate() relies on
-                    both ranks seeing identical full-batch outputs).
+    dp_atom_threshold: Training-only routing knob (only matters with >1 GPU). A batch's padded
+                    atom count is M. If M < dp_atom_threshold AND the batch's molecule count
+                    N >= 2*mol_chunk, it is routed through data-parallel splitting (molecules
+                    divided across ranks, no in-model all-reduce) instead of the default
+                    tensor-parallel atom sharding. Rationale: TP shards atoms across ranks and
+                    all-reduces to reconstruct chem_env every round; for buckets with very few
+                    atoms per molecule that all-reduce cost dwarfs the tiny amount of per-rank
+                    compute it parallelises. The N >= 2*mol_chunk guard matters too: DP halves
+                    the outer N-chunk loop but does NOT halve M before MessagePass's own
+                    atm_chunk-loop runs (TP does, by sharding M first), so a DP-routed bucket
+                    runs ~2x the inner M-chunk-loop launches TP would've had on the same
+                    bucket — only worth it if halving N actually shrinks the outer loop. Without
+                    this guard, buckets with small N but M just under the threshold get routed
+                    to DP for zero benefit and a real launch-count cost, which is measurably
+                    slower than plain TP (this bit a real run with dp_atom_threshold=5000).
+                    0 (default) = always TP, matching pre-existing behaviour. Eval/test always
+                    use TP regardless of this threshold (evaluate() relies on both ranks seeing
+                    identical full-batch outputs).
     eps_embd:       Numerical floor in the Embed module (avoids division by zero).
     eps_msgp:       Numerical floor in MessagePass sigma clamping and aggregate denominator.
 
