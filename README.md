@@ -475,7 +475,7 @@ Top-level module. Wraps Embed, MessagePass, and OutputHead, and routes each batc
 
 `_eps_embd` and `_eps_msgp` are plain Python floats (not parameters or buffers); they are not moved by `.to(device)`.
 
-`forward` returns a 5-tuple: `(iq, f_mags, sigmas, local_batch, loss_scale)`. `local_batch` and `loss_scale` are only meaningful when DP-routing (below); otherwise `local_batch is batch` and `loss_scale == 1.0`. Always pass `local_batch` (not the original `batch`) to the loss, and multiply the loss by `loss_scale` before `backward()` — see [Training Loop](#9-training-loop).
+`forward` returns a 5-tuple: `(iq, f_mags, sigmas, local_batch, loss_scale)`. `local_batch` and `loss_scale` are only meaningful when DP-routing (below); otherwise `local_batch is batch` and `loss_scale == 1.0`. Always pass `local_batch` (not the original `batch`) to the loss, and multiply the loss by `loss_scale` before `backward()` - see [Training Loop](#9-training-loop).
 
 ### Single-GPU Forward
 
@@ -493,11 +493,11 @@ With a process group active, each batch picks a strategy from `M` (padded atoms/
 route_dp = model.training and dp_atom_threshold > 0 and M < dp_atom_threshold and N >= 2*mol_chunk
 ```
 
-`dp_atom_threshold = 0` (default) always uses TP — matches pre-DP behaviour exactly. `evaluate()` runs with `model.eval()`, so `model.training` is `False` and eval/test always use TP regardless of the threshold (needed since `evaluate()` assumes both ranks see identical full-batch outputs).
+`dp_atom_threshold = 0` (default) always uses TP - matches pre-DP behaviour exactly. `evaluate()` runs with `model.eval()`, so `model.training` is `False` and eval/test always use TP regardless of the threshold (needed since `evaluate()` assumes both ranks see identical full-batch outputs).
 
-TP shards atoms of the *same* molecules across ranks and needs an all-reduce mid-forward to reconstruct each atom's full neighbourhood (see `MessagePass._AllReduce`). For a bucket with very few atoms per molecule (e.g. `max_atoms=3`), that all-reduce's fixed latency cost dwarfs the tiny amount of per-rank compute it buys — DP routes those buckets by molecule instead, with **no in-model communication at all**.
+TP shards atoms of the *same* molecules across ranks and needs an all-reduce mid-forward to reconstruct each atom's full neighbourhood (see `MessagePass._AllReduce`). For a bucket with very few atoms per molecule (e.g. `max_atoms=3`), that all-reduce's fixed latency cost dwarfs the tiny amount of per-rank compute it buys - DP routes those buckets by molecule instead, with **no in-model communication at all**.
 
-**Why `N >= 2*mol_chunk` is required, not optional:** DP halves the *outer* N-chunk loop (`ceil(N/2/mol_chunk)` vs `ceil(N/mol_chunk)`), but unlike TP it does **not** halve `M` before MessagePass's own `atm_chunk` loop runs over it (TP shards `M` first; DP keeps the full `M` per molecule). So a DP-routed bucket runs roughly **2x the inner M-chunk-loop launches** TP would've had on the same bucket — that only pays for itself if halving `N` actually shrinks the outer loop. If a bucket's `N` already fits in one N-chunk (`N < 2*mol_chunk`, common for large-`M`/small-`N` buckets, since `atom_size_ceil` caps total atoms per batch), DP buys zero outer-loop reduction while still eating the un-halved-`M` cost — pure overhead, and it stays on TP. Without this guard, setting `dp_atom_threshold` too high routes exactly these buckets into DP and measurably slows training down instead of speeding it up.
+**Why `N >= 2*mol_chunk` is required, not optional:** DP halves the *outer* N-chunk loop (`ceil(N/2/mol_chunk)` vs `ceil(N/mol_chunk)`), but unlike TP it does **not** halve `M` before MessagePass's own `atm_chunk` loop runs over it (TP shards `M` first; DP keeps the full `M` per molecule). So a DP-routed bucket runs roughly **2x the inner M-chunk-loop launches** TP would've had on the same bucket - that only pays for itself if halving `N` actually shrinks the outer loop. If a bucket's `N` already fits in one N-chunk (`N < 2*mol_chunk`, common for large-`M`/small-`N` buckets, since `atom_size_ceil` caps total atoms per batch), DP buys zero outer-loop reduction while still eating the un-halved-`M` cost - pure overhead, and it stays on TP. Without this guard, setting `dp_atom_threshold` too high routes exactly these buckets into DP and measurably slows training down instead of speeding it up.
 
 ### Data Parallel Forward
 
@@ -510,7 +510,7 @@ Step 3: MessagePass + OutputHead on local_batch, single-GPU path, no collectives
 Step 4: return iq, f_mags, sigmas (shape (n1-n0, ...)), local_batch, loss_scale=(n1-n0)/N
 ```
 
-Since molecules don't interact, each rank's local outputs are already final — nothing to gather. `loss_scale` rescales the rank's local-mean loss so that, after the usual grad SUM all-reduce (below), the reconstructed gradient equals the true global-mean-loss gradient rather than double-counting it.
+Since molecules don't interact, each rank's local outputs are already final - nothing to gather. `loss_scale` rescales the rank's local-mean loss so that, after the usual grad SUM all-reduce (below), the reconstructed gradient equals the true global-mean-loss gradient rather than double-counting it.
 
 ### Tensor Parallel Forward
 
@@ -543,7 +543,7 @@ Step 5: Gather
 ### Custom Autograd Functions
 
 `_DistributedSum` (outer, for I(q)):
-- Forward: `all_reduce(SUM)` — partial I(q) from each rank summed globally.
+- Forward: `all_reduce(SUM)` - partial I(q) from each rank summed globally.
 - Backward: identity, no communication. All ranks computed the same scalar loss from the same all-reduced I(q), so the gradient is already correct.
 
 `_AllGatherDim1` (outer, for f_mags and sigmas):
@@ -626,7 +626,7 @@ Standard Adam (not AdamW; weight decay is applied inside the gradient update, no
 8. optimizer.step()
 ```
 
-Step 6 is explicit because the model uses tensor/data parallelism (see [ScatterNet §7](#7-scatternet)), not DDP. In TP mode, each rank's `param.grad` after backward is a partial sum over its atom shard, so a SUM all_reduce is required (DDP would average). In DP mode, `loss_scale = local_N / global_N` (step 4) makes the same SUM reconstruct the correct global-mean gradient from each rank's rescaled local-mean loss — one all-reduce rule serves both routing modes.
+Step 6 is explicit because the model uses tensor/data parallelism (see [ScatterNet §7](#7-scatternet)), not DDP. In TP mode, each rank's `param.grad` after backward is a partial sum over its atom shard, so a SUM all_reduce is required (DDP would average). In DP mode, `loss_scale = local_N / global_N` (step 4) makes the same SUM reconstruct the correct global-mean gradient from each rank's rescaled local-mean loss - one all-reduce rule serves both routing modes.
 
 ### Epoch Metrics
 
@@ -731,15 +731,15 @@ Optimizer: Adam(SUM-reduced grads, clip at grad_clip) -> parameter update
 
 ### Running the Profiler
 
-Set `profiler: true` in your YAML config or pass `--profiler` on the CLI. This runs a short **diagnostic** instead of normal training: the loop runs `1 + prof_warmup + prof_active` batches (defaults `1 + 1 + 3 = 5`; tune with `--prof_warmup`/`--prof_active`), then stops — no eval or checkpointing. Adjust `prof_active` higher (e.g. 20–50) to average over many buckets.
+Set `profiler: true` in your YAML config or pass `--profiler` on the CLI. This runs a short **diagnostic** instead of normal training: the loop runs `1 + prof_warmup + prof_active` batches (defaults `1 + 1 + 3 = 5`; tune with `--prof_warmup`/`--prof_active`), then stops - no eval or checkpointing. Adjust `prof_active` higher (e.g. 20–50) to average over many buckets.
 
 ### Which Buckets Get Profiled
 
-The `1 + prof_warmup + prof_active` budget is split three ways across bucket **metadata** (atom counts only — no tensors loaded), not drawn randomly from the shuffled train loader:
+The `1 + prof_warmup + prof_active` budget is split three ways across bucket **metadata** (atom counts only - no tensors loaded), not drawn randomly from the shuffled train loader:
 
-1. **Heaviest by `N*M_shard`** (`shard = ceil(max_atoms/world_size)`) — the compute-time proxy. Dominated by huge-`N`/tiny-`M` buckets, since TP's all-reduce cost scales with the *number* of N-chunks (`N/mol_chunk × λ2` rounds), not with `M` — a bucket with thousands of tiny molecules pays that fixed per-N-chunk cost thousands of times over.
-2. **Heaviest by raw `M`** — the memory-risk proxy. A large-`M`/small-`N` bucket can rank low on `N*M_shard` (small `N` keeps the product down) while still having the largest per-chunk RFF tensors (`atm_chunk`-sized chunks are actually full when `M` is large) — invisible to the first ranking alone.
-3. **A band around the median `N*M_shard`** — a "regular" batch baseline, so the two worst-case groups have something typical to compare against instead of only ever showing outliers.
+1. **Heaviest by `N*M_shard`** (`shard = ceil(max_atoms/world_size)`) - the compute-time proxy. Dominated by huge-`N`/tiny-`M` buckets, since TP's all-reduce cost scales with the *number* of N-chunks (`N/mol_chunk × λ2` rounds), not with `M` - a bucket with thousands of tiny molecules pays that fixed per-N-chunk cost thousands of times over.
+2. **Heaviest by raw `M`** - the memory-risk proxy. A large-`M`/small-`N` bucket can rank low on `N*M_shard` (small `N` keeps the product down) while still having the largest per-chunk RFF tensors (`atm_chunk`-sized chunks are actually full when `M` is large) - invisible to the first ranking alone.
+3. **A band around the median `N*M_shard`** - a "regular" batch baseline, so the two worst-case groups have something typical to compare against instead of only ever showing outliers.
 
 Each group is deduplicated against the ones before it. The single heaviest bucket by `N*M_shard` stays first (`bi=0`, the profiler's "wait" step) so it gets a clean `peak_alloc` reading with no torch-trace overhead. The startup log line reports one example bucket from each group (`mols x atoms`) so you can sanity-check what got selected.
 
@@ -747,8 +747,8 @@ Each group is deduplicated against the ones before it. The single heaviest bucke
 
 Two decoupled layers of profiling run on **every rank**:
 
-1. **Section timers** — a CUDA-synced wall-clock breakdown printed at the end, over the **full** `prof_active` window (so averages are representative). Each rank prints time spent in `data_wait` / `h2d` / `forward` / `loss` / `backward` / `grad_allreduce` / `clip` / `step`, plus the heaviest batches by data-wait and by compute (with molecule count, max atoms, and real atoms). These cost ~no extra memory. Comparing the same section **across ranks** localizes tensor-parallel skew: a rank fast in compute but slow in `grad_allreduce` is *waiting* on a slower peer — the usual cause of the NCCL `ALLREDUCE` watchdog timeout.
-2. **torch.profiler** — a CPU+CUDA TensorBoard trace per rank at `./profiler_trace/rank<r>/` for kernel-level drill-down. This buffers every op in host RAM and materializes them at export, so it is memory-heavy: it samples only `min(prof_active, 3)` steady-state steps regardless of `prof_active`, and runs with `with_stack`/`profile_memory` **off** (a long active window or `with_stack` triggers the host OOM-killer → worker `SIGKILL`). Raising `prof_active` lengthens the cheap section-timer window, not the heavy trace.
+1. **Section timers** - a CUDA-synced wall-clock breakdown printed at the end, over the **full** `prof_active` window (so averages are representative). Each rank prints time spent in `data_wait` / `h2d` / `forward` / `loss` / `backward` / `grad_allreduce` / `clip` / `step`, plus the heaviest batches by data-wait and by compute (with molecule count, max atoms, and real atoms). These cost ~no extra memory. Comparing the same section **across ranks** localizes tensor-parallel skew: a rank fast in compute but slow in `grad_allreduce` is *waiting* on a slower peer - the usual cause of the NCCL `ALLREDUCE` watchdog timeout.
+2. **torch.profiler** - a CPU+CUDA TensorBoard trace per rank at `./profiler_trace/rank<r>/` for kernel-level drill-down. This buffers every op in host RAM and materializes them at export, so it is memory-heavy: it samples only `min(prof_active, 3)` steady-state steps regardless of `prof_active`, and runs with `with_stack`/`profile_memory` **off** (a long active window or `with_stack` triggers the host OOM-killer → worker `SIGKILL`). Raising `prof_active` lengthens the cheap section-timer window, not the heavy trace.
 
 On Kaggle, use the dedicated profiler cell (which sets `profiler=True`, `prof_warmup`, `prof_active` in `RunConfig`), then run the TensorBoard cell immediately after:
 
@@ -767,7 +767,7 @@ Or load the `.pt.trace.json` file directly at `chrome://tracing`.
 
 ### Interpreting the Profiler
 
-**Start with the section timers** (printed to stdout) before opening the trace — they tell you which bucket of time to chase. High `data_wait` ⇒ the DataLoader is starving the GPU (see below); high `forward`/`backward` ⇒ go into the trace. A large `grad_allreduce` (or `backward`, which contains the in-model `_AllReduce`) on one rank but not the other ⇒ tensor-parallel skew, not a slow collective.
+**Start with the section timers** (printed to stdout) before opening the trace - they tell you which bucket of time to chase. High `data_wait` ⇒ the DataLoader is starving the GPU (see below); high `forward`/`backward` ⇒ go into the trace. A large `grad_allreduce` (or `backward`, which contains the in-model `_AllReduce`) on one rank but not the other ⇒ tensor-parallel skew, not a slow collective.
 
 **High `data_wait`**: CPU/IO is the bottleneck. Each `BatchSet.__getitem__` re-opens the HDF5 file and runs a Python encode loop per atom, so heavy buckets stall. Raise `num_workers`; if `data_wait` stays high and tracks the heavy buckets in the report, cache `Batch` objects as `.pt` files or hoist the HDF5 handle out of `__getitem__`.
 

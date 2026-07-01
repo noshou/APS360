@@ -16,7 +16,7 @@ def sphHarm(
     Layout: row 0 = Y_0^0; rows 1,2 = Y_1^0, Y_1^1; rows 3,4,5 = Y_2^0..Y_2^2; etc.
     Total (lMax+1)*(lMax+2)//2 rows.
 
-    Negative-m modes are omitted — recover them via Y_l^{-m} = (-1)^m · conj(Y_l^m).
+    Negative-m modes are omitted - recover them via Y_l^{-m} = (-1)^m · conj(Y_l^m).
 
     Args:
         lMax:  Maximum degree. Must be non-negative.
@@ -58,7 +58,7 @@ def sphBess(
         r:    Atom radial distances (Å), shape (N,). All non-negative.
 
     Returns:
-        Array of shape (lMax+1, Q, N) — entry [l, k, i] is j_l(q_k · r_i).
+        Array of shape (lMax+1, Q, N) - entry [l, k, i] is j_l(q_k · r_i).
 
     Raises:
         ValueError: If inputs are invalid.

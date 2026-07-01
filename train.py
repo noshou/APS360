@@ -24,7 +24,7 @@ def _first(x):
 
 def _rclone_push(path: str, dest: str | None):
     """Copy a checkpoint to a durable rclone remote (e.g. Drive) so it survives a
-    Kaggle session timeout — /kaggle/working is not reliably persisted on a crash.
+    Kaggle session timeout - /kaggle/working is not reliably persisted on a crash.
     No-op if dest is None or the file is missing; never raises into the train loop."""
     if not dest or not os.path.exists(path):
         return
@@ -44,16 +44,16 @@ class _LoopProfiler:
     Active only when cfg.profiler is set (otherwise every method is a near-zero
     no-op, so the normal training path pays nothing). Each section is CUDA-synced
     at both boundaries so async GPU kernels are charged to the section that
-    launched them instead of leaking into the next one — without this, "data_wait"
+    launched them instead of leaking into the next one - without this, "data_wait"
     silently absorbs the previous batch's still-running backward.
 
     Two things this is built to surface:
       * data-loader stalls vs GPU compute (is __getitem__ starving the GPU?), and
-      * tensor-parallel rank skew — compare the same section across ranks; a rank
+      * tensor-parallel rank skew - compare the same section across ranks; a rank
         that is fast in compute but slow in grad_allreduce is *waiting* on a
         slower peer (the cause of the NCCL ALLREDUCE timeout).
     A per-batch record is also kept so heavy buckets can be correlated with stalls,
-    and per-batch peak CUDA memory is tracked (a free counter read — unlike
+    and per-batch peak CUDA memory is tracked (a free counter read - unlike
     torch.profiler's profile_memory, which OOMs) so you can see headroom for
     raising atm_chunk / mol_chunk.
     """
@@ -275,7 +275,7 @@ def _worker(rank: int, cfg: RunConfig):
     rank i with GPU cuda:i. When called directly (single GPU) rank is 0.
 
     Parallelism routing is handled inside ScatterNet.forward, per batch: by
-    default atoms are sharded across ranks for tensor parallelism (TP) —
+    default atoms are sharded across ranks for tensor parallelism (TP) -
     MessagePass all_reduces between its two passes, and outputs are gathered
     before returning. If cfg.dp_atom_threshold > 0 and a training batch's
     padded atom count M falls below it, the batch is instead split by
@@ -284,7 +284,7 @@ def _worker(rank: int, cfg: RunConfig):
     (all_reduce SUM), which DDP would otherwise handle; TP needs the full SUM
     (partial gradients per atom shard), and DP relies on ScatterNet.forward's
     loss_scale to make the same SUM reconstruct the correct global-mean
-    gradient too — see the comment at the grad_allreduce call site below.
+    gradient too - see the comment at the grad_allreduce call site below.
     """
 
     world_size = torch.cuda.device_count()
@@ -337,11 +337,11 @@ def _worker(rank: int, cfg: RunConfig):
     # though it has the biggest per-chunk activations), and (2) what a "typical" batch even
     # looks like (a pure worst-case sample only ever shows outliers). So the profiling budget
     # is split three ways:
-    #   1. heaviest by N*M_shard  — compute-time worst case (usually huge-N/tiny-M; this is
+    #   1. heaviest by N*M_shard  - compute-time worst case (usually huge-N/tiny-M; this is
     #      where TP's all-reduce cost piles up, see dp_atom_threshold).
-    #   2. heaviest by raw M      — memory-risk worst case (large per-chunk RFF tensors),
+    #   2. heaviest by raw M      - memory-risk worst case (large per-chunk RFF tensors),
     #      invisible to the N*M_shard ranking whenever N is small.
-    #   3. a band around the median N*M_shard — representative "regular" batches, so the
+    #   3. a band around the median N*M_shard - representative "regular" batches, so the
     #      two worst-case groups have a baseline to compare against.
     # Worst-of-group-1 stays first (bi=0, the profiler's "wait" step) so it gets a clean
     # peak_alloc reading with no torch-trace overhead, matching the original single-ranking
@@ -396,7 +396,7 @@ def _worker(rank: int, cfg: RunConfig):
         test_mols  = sum(len(b) for b in test_set._batches)
         print(
             f"batches/epoch: train={len(train_loader)}  val={len(val_loader)}  test={len(test_loader)}"
-            f"  (buckets; same count by design — each bucket contributes one sub-batch per split)",
+            f"  (buckets; same count by design - each bucket contributes one sub-batch per split)",
             flush=True,
         )
         print(f"molecules:     train={train_mols}  val={val_mols}  test={test_mols}", flush=True)
@@ -440,17 +440,17 @@ def _worker(rank: int, cfg: RunConfig):
         if rank == 0:
             print(f"resumed from {cfg.resume} (epoch {ckpt['epoch']}, batch_idx {saved_bi}, val_loss {best_val:.4f})", flush=True)
 
-    # profiler — diagnostic mode. Two decoupled layers, both on every rank:
+    # profiler - diagnostic mode. Two decoupled layers, both on every rank:
     #
-    #   * _LoopProfiler  — O(1)-memory wall-clock section timers. Runs the FULL
+    #   * _LoopProfiler  - O(1)-memory wall-clock section timers. Runs the FULL
     #     1 + prof_warmup + prof_active window so per-rank averages are representative;
     #     this is what exposes tensor-parallel skew, and it costs ~nothing in RAM.
     #
-    #   * torch.profiler — kernel-level trace. This buffers every op (thousands per
+    #   * torch.profiler - kernel-level trace. This buffers every op (thousands per
     #     step here, given the checkpointed chunk loops) in HOST RAM and materialises
     #     them all at export, so it is memory-heavy and OOM-kills the process if the
     #     active window is long. It therefore samples only a few steady-state steps
-    #     (tb_active), and with_stack / profile_memory are OFF — with_stack stores a
+    #     (tb_active), and with_stack / profile_memory are OFF - with_stack stores a
     #     full stack per event and is the main cause of the export RAM blow-up.
     #
     # The loop runs for the section-timer window; the torch trace stops earlier.
@@ -466,7 +466,7 @@ def _worker(rank: int, cfg: RunConfig):
     loop_prof = _LoopProfiler(rank, device, enabled=cfg.profiler)
 
     def _on_trace_ready(p):
-        # Print a kernel table straight to stdout — TensorBoard's inline view
+        # Print a kernel table straight to stdout - TensorBoard's inline view
         # hangs through Kaggle's proxy, but stdout always works. Still write the
         # trace file so it can be opened in Perfetto / chrome://tracing if wanted.
         if rank == 0:
@@ -490,7 +490,7 @@ def _worker(rank: int, cfg: RunConfig):
         _prof.start()
         if rank == 0:
             print(
-                f"[profiler] started on all ranks — section timers over 1+{prof_warmup}+{prof_active} "
+                f"[profiler] started on all ranks - section timers over 1+{prof_warmup}+{prof_active} "
                 f"batches, torch trace over 1+{prof_warmup}+{tb_active}; traces -> ./profiler_trace/rank<r>/",
                 flush=True,
             )
@@ -594,14 +594,14 @@ def _worker(rank: int, cfg: RunConfig):
                 loss.backward()
 
             # With TP, each rank's parameter gradients are a partial sum over its
-            # atom shard, so they must be summed across ranks (SUM, not average —
+            # atom shard, so they must be summed across ranks (SUM, not average -
             # DDP averages, TP needs the full sum). With DP (small-M batches routed
             # by dp_atom_threshold), ScatterNet.forward's loss_scale = local_N/global_N
             # rescales each rank's local-mean loss before backward, so the same SUM
             # here reconstructs the correct global-mean gradient instead of double-
-            # counting it — one all-reduce rule serves both routing modes. A rank
+            # counting it - one all-reduce rule serves both routing modes. A rank
             # that is fast everywhere else but slow here is *waiting* on a laggard
-            # peer — that's the skew to hunt with the per-rank section report.
+            # peer - that's the skew to hunt with the per-rank section report.
             if is_dist:
                 with loop_prof.section("grad_allreduce", rec):
                     for param in model.parameters():
@@ -619,7 +619,7 @@ def _worker(rank: int, cfg: RunConfig):
                     _prof.stop()
                     _prof = None
                     if rank == 0:
-                        print("[profiler] torch trace written — see ./profiler_trace/rank<r>/", flush=True)
+                        print("[profiler] torch trace written - see ./profiler_trace/rank<r>/", flush=True)
 
             if cfg.profiler:
                 rec["compute"] = sum(

@@ -54,7 +54,7 @@ for bar, v in zip(bars2, msle):
     ax2.text(v + 0.1, bar.get_y() + bar.get_height() / 2,
              f"{v:.3f}", va="center", ha="left", fontsize=8)
 
-fig.suptitle("Baseline Comparison — Test Set", fontsize=13, fontweight="bold")
+fig.suptitle("Baseline Comparison - Test Set", fontsize=13, fontweight="bold")
 plt.tight_layout()
 plt.savefig(OUT_PATH, dpi=150, bbox_inches="tight")
 print(f"Saved → {OUT_PATH}")

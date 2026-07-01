@@ -204,7 +204,7 @@ function initTab(i) {
     const s = structures[i];
     const t = themes[currentTheme];
 
-    // molecule viewer — XYZ is small, inline
+    // molecule viewer - XYZ is small, inline
     viewers[i] = $3Dmol.createViewer(document.getElementById('mol-' + i), {
         backgroundColor: t.molBg
     });

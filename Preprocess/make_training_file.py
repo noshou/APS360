@@ -19,7 +19,7 @@ if not os.path.exists(SRC):
     sys.exit(f"Source file not found: {SRC}")
 
 if os.path.exists(DST):
-    sys.exit(f"Destination already exists: {DST}  — delete it first if you want to rebuild.")
+    sys.exit(f"Destination already exists: {DST}  - delete it first if you want to rebuild.")
 
 print(f"Source : {SRC}  ({os.path.getsize(SRC)/1e9:.1f} GB)")
 print(f"Dest   : {DST}")

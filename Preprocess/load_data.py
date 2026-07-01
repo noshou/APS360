@@ -10,7 +10,7 @@ from tqdm import tqdm
 from Scattering.formfact import FormFactors
 from Scattering.molecule import Molecule
 
-# Per-worker globals set once by _worker_init — avoids pickling ff/lMax per task.
+# Per-worker globals set once by _worker_init - avoids pickling ff/lMax per task.
 _ff:   FormFactors | None = None
 _lMax: int | None         = None
 
@@ -76,20 +76,20 @@ def buildDB(
     are serialized on the main process (h5py is not concurrency-safe for writes).
 
     B_lm coefficients are computed internally by the Stuhrmann decomposition but
-    discarded — the NN predicts I(q) directly, using B_lm as a physics-structured
+    discarded - the NN predicts I(q) directly, using B_lm as a physics-structured
     intermediate learned during training, not as a supervised target.
 
     HDF5 layout:
         /attrs:                      lMax (int), energy (float)
-        /q_grid:                     float64 (Q,)   — momentum transfer grid in Å⁻¹
-        /sources_tsv:                uint8   (N,)   — raw bytes of sources_tsv, if provided
-        /makeup_tsv:                 uint8   (M,)   — raw bytes of makeup_tsv, if provided
-        /<group>/<stem>.attrs[name]: str            — molecule name from XYZ header
-        /<group>/<stem>/I_q:         float32 (Q,)   — orientationally-averaged scattering intensity
-        /<group>/<stem>/coords:      float64 (n, 3) — centroid-subtracted Cartesian coordinates in Å
-        /<group>/<stem>/angles:      float64 (n, 2) — spherical angles: col 0 = theta (0→π), col 1 = phi (0→2π)
-        /<group>/<stem>/r:           float64 (n,)   — radial distances from centroid in Å
-        /<group>/<stem>/elms:        str     (n,)   — element symbol per atom (variable-length UTF-8)
+        /q_grid:                     float64 (Q,)   - momentum transfer grid in Å⁻¹
+        /sources_tsv:                uint8   (N,)   - raw bytes of sources_tsv, if provided
+        /makeup_tsv:                 uint8   (M,)   - raw bytes of makeup_tsv, if provided
+        /<group>/<stem>.attrs[name]: str            - molecule name from XYZ header
+        /<group>/<stem>/I_q:         float32 (Q,)   - orientationally-averaged scattering intensity
+        /<group>/<stem>/coords:      float64 (n, 3) - centroid-subtracted Cartesian coordinates in Å
+        /<group>/<stem>/angles:      float64 (n, 2) - spherical angles: col 0 = theta (0→π), col 1 = phi (0→2π)
+        /<group>/<stem>/r:           float64 (n,)   - radial distances from centroid in Å
+        /<group>/<stem>/elms:        str     (n,)   - element symbol per atom (variable-length UTF-8)
 
     All floating-point datasets are compressed with ZFP lossless compression; the
     uint8 TSV blobs use Bitshuffle+Zstd (ZFP is float-only). `elms` is stored

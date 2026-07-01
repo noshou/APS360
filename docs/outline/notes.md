@@ -207,7 +207,7 @@
  -   by trial and error, normalization constant of N*((sqrt(24*N)/epsilon) + 1) works fairly well for the proportional estimator
  -   total number of atoms sampled is still N² since distance calculations are not truncated; would love to dig into this further given more time
 -   rough plan for tackling estimation errors based on three general SAXS profile regions:
- -   **Guinier region**: small q values, highest intensity with sharp drop; highest discrepancy between estimator and actual value (expected — form factors are largest here so errors are amplified significantly)
+ -   **Guinier region**: small q values, highest intensity with sharp drop; highest discrepancy between estimator and actual value (expected - form factors are largest here so errors are amplified significantly)
  -   **Fourier/Debye region**: intermediate q values, after first inflection point with sharp decline toward Porod region; medium to moderate deviations
  -   **Porod region**: large q values, rapid exponential decay toward zero; small to very small deviations
  -   deviations are relative and dependent on molecule size (more atoms → higher amplification of errors)

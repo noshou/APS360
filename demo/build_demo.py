@@ -67,7 +67,7 @@ for npz_file in sorted(PREC_DIR.glob("*.npz")):
     qVals = data["qvals"]
     xyz   = xyz_file.read_text(encoding="utf-8")
 
-    # I(q) figure — transparent bg, themed via CSS/JS at runtime
+    # I(q) figure - transparent bg, themed via CSS/JS at runtime
     fig_iq = go.Figure()
     fig_iq.add_trace(go.Scatter(
         x=qVals.tolist(), y=I_q.tolist(), mode="lines",
@@ -93,7 +93,7 @@ for npz_file in sorted(PREC_DIR.glob("*.npz")):
         height=250,
     )
 
-    # B_lm frames — normalize to unit amplitude; track true max range across all frames
+    # B_lm frames - normalize to unit amplitude; track true max range across all frames
     colorbar_cfg = dict(thickness=14, len=0.6, title=dict(text="z", font=dict(size=11)))
     frames = []
     max_r  = 0.0
@@ -383,7 +383,7 @@ function initTab(i) {{
     const s = structures[i];
     const t = themes[currentTheme];
 
-    // molecule viewer — XYZ is small, inline
+    // molecule viewer - XYZ is small, inline
     viewers[i] = $3Dmol.createViewer(document.getElementById('mol-' + i), {{
         backgroundColor: t.molBg
     }});

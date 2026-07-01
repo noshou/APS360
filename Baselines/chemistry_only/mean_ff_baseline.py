@@ -12,7 +12,7 @@ class MeanFFBaseline(Baseline):
     Chemistry-only baseline: predict I(q) as incoherent scattering Σ_i f_i(q)².
 
     Uses xraydb form factors; no geometry or training data required.
-    This is the lower bound of coherent scattering — all cross terms zeroed out.
+    This is the lower bound of coherent scattering - all cross terms zeroed out.
     Beating this baseline proves the model learns more than per-element form factors.
     """
 

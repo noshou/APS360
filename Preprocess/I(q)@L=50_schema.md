@@ -4,7 +4,7 @@
 
 The HDF5 files are hosted on HuggingFace at **[noshou/iq_train_set](https://huggingface.co/datasets/noshou/iq_train_set)**.
 
-Download with the HuggingFace CLI (recommended — resumes interrupted downloads):
+Download with the HuggingFace CLI (recommended - resumes interrupted downloads):
 
 ```bash
 pip install huggingface_hub
@@ -30,8 +30,8 @@ Place the downloaded file at `Preprocess/I(q)@L=50.h5` (the path all pipeline sc
 
 Two files are maintained:
 
-- **`I(q)@L=50.h5`** — full database including COD (41.6 GB)
-- **`I(q)@L=50_train.h5`** — training subset with COD excluded (23.4 GB); this is the file used for model training
+- **`I(q)@L=50.h5`** - full database including COD (41.6 GB)
+- **`I(q)@L=50_train.h5`** - training subset with COD excluded (23.4 GB); this is the file used for model training
 
 Produced by `buildDB()` in `load_data.py`. The file is opened in append mode (`'a'`), so existing entries are skipped on resume.
 

@@ -35,7 +35,7 @@ def test_penalty_decreases_as_sigma_grows():
 
 def test_padding_atoms_excluded():
     """Padded atoms (vocab=0) must not contribute to the penalty."""
-    # mol A: 1 real atom;  mol B: 2 real atoms — same sigma
+    # mol A: 1 real atom;  mol B: 2 real atoms - same sigma
     batch = make_batch(
         vocab = [[1], [1, 2]],
         iqval = [[0.1]*Q, [0.1]*Q],
@@ -49,7 +49,7 @@ def test_padding_atoms_excluded():
     pen = loss._sg_penalty(sigmas, lambda_7=1.0, batch=batch, eps=1e-8)
     # both molecules should give the same per-atom average (lambda_7 / sigma = 1.0)
     assert torch.allclose(pen[0], pen[1], atol=1e-5), \
-        f"mol A penalty {pen[0]} ≠ mol B penalty {pen[1]} — padding leaked in"
+        f"mol A penalty {pen[0]} ≠ mol B penalty {pen[1]} - padding leaked in"
     print(f"  mol_A={pen[0].mean().item():.4f}  mol_B={pen[1].mean().item():.4f}  ✓")
 
 def test_lambda7_scales_linearly():

@@ -55,7 +55,7 @@ class StuhrmannMixin:
 
         # Process atoms in chunks to bound peak memory.
         # Peak per chunk: Y~(lMax+1)²×chunk×16B + j~(lMax+1)×Q×chunk×8B.
-        # At chunk=5000, lMax=50, Q=51 this is ~312 MB — safe for WSL.
+        # At chunk=5000, lMax=50, Q=51 this is ~312 MB - safe for WSL.
         CHUNK = 5_000
         N = len(self.elms)
         for start in range(0, N, CHUNK):
@@ -63,7 +63,7 @@ class StuhrmannMixin:
             Y    = sphHarm(lMax, self.theta[sl], self.phi[sl])   # ((lMax+1)(lMax+2)//2, chunk)
             j    = sphBess(ff.qvals, lMax, self.r[sl])           # (lMax+1, Q, chunk)
             f    = np.stack([ff.ff[ion] for ion in self.elms[sl]])  # (chunk, Q)
-            Y_conj = Y.conj()                                    # (K, chunk) — once per chunk
+            Y_conj = Y.conj()                                    # (K, chunk) - once per chunk
             for l in range(lMax + 1):
                 W  = f.T * j[l]                                  # (Q, chunk)
                 k0 = l * (l + 1) // 2

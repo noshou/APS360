@@ -20,7 +20,7 @@ mean_iq = MeanIQBaseline().fit(train_loader)
 rg      = RgBaseline(qgrid, energy)          # no fit needed
 
 for batch in test_loader:
-    pred = mean_iq(batch)   # (N, Q) — same shape as ScatterNet output
+    pred = mean_iq(batch)   # (N, Q) - same shape as ScatterNet output
 ```
 
 ---

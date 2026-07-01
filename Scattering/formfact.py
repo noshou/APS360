@@ -47,7 +47,7 @@ class FormFactors:
     #   f(q, E) = f0(s) + f'(E) + i·f''(E)
     # where s = q/(4π), f0 is the Cromer-Mann/Waasmaier Thomson term (→Z at s=0),
     # and f'/f'' are the Chantler anomalous corrections (f1_chantler/f2_chantler).
-    # xraydb.f1_chantler returns f'(E) only — NOT Z+f' — so no subtraction of f0(0).
+    # xraydb.f1_chantler returns f'(E) only - NOT Z+f' - so no subtraction of f0(0).
 
     def __post_init__(self) -> None:
         self.qvals.flags.writeable = False
@@ -148,13 +148,13 @@ class FormFactors:
 
         Each ion is classified into one of three tiers:
 
-        * **Dummy** — ``f0`` raises for the bare element (e.g. ``X1+``, ``M``).
+        * **Dummy** - ``f0`` raises for the bare element (e.g. ``X1+``, ``M``).
         These sites carry no electron density and are skipped entirely.
-        * **f0-only** — ``f0`` works but no Chantler tabulation exists for the
+        * **f0-only** - ``f0`` works but no Chantler tabulation exists for the
         element or the energy is outside the tabulated range (e.g. ``Pu``,
         ``Am``).  Only the Thomson scattering term ``f0(s)`` is returned as
         complex128 (no anomalous corrections).
-        * **Full** — both ``f0`` and the Chantler f1/f2 corrections are
+        * **Full** - both ``f0`` and the Chantler f1/f2 corrections are
         available.  The complete form factor
         ``f(q,E) = f0(s) + f1(E) − f0(0) + i·f2(E)`` is computed.
 
@@ -206,14 +206,14 @@ class FormFactors:
         for ion in dict.fromkeys(ions):
             elem = _bare(ion)
 
-            # Tier 1 — dummy site: f0 raises for the bare element
+            # Tier 1 - dummy site: f0 raises for the bare element
             try:
                 f0(elem, np.array([0.0]))
             except Exception:
                 log_lines.append(f"DUMMY   {ion}")
                 continue
 
-            # Tier 2 — f0-only: Chantler tabulation missing or energy out of range
+            # Tier 2 - f0-only: Chantler tabulation missing or energy out of range
             try:
                 cls._validate_energy(ion, energy)
             except ValueError:
@@ -221,7 +221,7 @@ class FormFactors:
                 ff_dict[ion] = cls._calc_formfact(ion, qvals, energy, skip_anomalous=True)
                 continue
 
-            # Tier 3 — full form factor
+            # Tier 3 - full form factor
             ff_dict[ion] = cls._calc_formfact(ion, qvals, energy, skip_anomalous=False)
 
         if log_path is not None and log_lines:

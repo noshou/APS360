@@ -92,7 +92,7 @@ def test_ff_penalty_scales_with_lambda6():
 def test_ff_padding_excluded():
     """Padded atoms must not contribute to the FF penalty."""
     loss = make_loss()
-    # mol A: 1 atom;  mol B: 2 atoms — but same single real atom (idx 1)
+    # mol A: 1 atom;  mol B: 2 atoms - but same single real atom (idx 1)
     batch = make_batch(
         vocab=[[1], [1, 2]],
         iqval=[[0.1]*Q, [0.1]*Q],
@@ -101,7 +101,7 @@ def test_ff_padding_excluded():
     # set f_mag_pred equal to the real table values for ALL slots (including padding)
     f_real = loss._fmag_table[batch.vocab]  # (2, 2, Q)
     out = loss._ff_penalty(f_real, batch, lambda_6=1.0)
-    # both rows should be zero — padding atom contributes nothing
+    # both rows should be zero - padding atom contributes nothing
     assert torch.allclose(out, torch.zeros(2, Q), atol=1e-5), \
         f"padding leaked: {out}"
     print(f"  max_err={out.abs().max().item():.2e}  ✓")

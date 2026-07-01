@@ -246,7 +246,7 @@ Pass 2; per-atom update using the accumulated context:
             # residual update
             new_emb = emb_slice + gate       
 
-            # sigma update: tanhshrink(x) = x - tanh(x) is near-zero for small x ("sticky" —
+            # sigma update: tanhshrink(x) = x - tanh(x) is near-zero for small x ("sticky" -
             # sigma barely moves when the bilinear output is small) and grows linearly for large x.
             # softplus keeps σ strictly positive.
             f_in    = ffs_slice.transpose(-1, -2).expand(-1, -1, self._q_points, -1)
@@ -274,24 +274,41 @@ Pass 2; per-atom update using the accumulated context:
         new_sig = torch.cat(new_sig_m, dim=1)  # (Nchnk, M, Q, 1)
         return cont._replace(emb_n=new_emb, sig_n=new_sig)
 
-    def _all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        
-        """Apply _AllReduce if a process group is active; otherwise pass through."""
-        
-        if not dist.is_available() or not dist.is_initialized():
+    def _all_reduce(self, x: torch.Tensor, use_all_reduce: bool) -> torch.Tensor:
+
+        """Apply _AllReduce if a process group is active AND the caller wants one;
+        otherwise pass through. `use_all_reduce=False` is for ScatterNet's DP path:
+        each rank there already holds a complete, disjoint set of molecules, so
+        there is nothing to reconcile across ranks (unlike TP, which shards atoms
+        of the SAME molecules and must all-reduce to see the full neighbourhood).
+        Calling all_reduce here unconditionally in DP mode would be a correctness
+        bug, not just a slowdown: DP's two ranks can have different local molecule
+        counts (an off-by-one from `ceil(N/ws)`), so they can end up issuing a
+        different NUMBER of N-chunk rounds, and thus a different number of
+        all_reduce calls overall, one rank hangs forever waiting for a collective
+        the other rank never issues (NCCL watchdog timeout)."""
+
+        if not use_all_reduce or not dist.is_available() or not dist.is_initialized():
             return x
         return self._AllReduce.apply(x)  # type: ignore[return-value]
 
     @jaxtyped(typechecker=beartype)
-    def forward(self, batch: Batch, embed_head: LayerHead, eps: float) -> LayerHead:
+    def forward(self, batch: Batch, embed_head: LayerHead, eps: float, use_all_reduce: bool = True) -> LayerHead:
 
         """
         Run λ₂ rounds of RFF message passing.
 
         Args:
-            batch:      molecule geometry; uses coord (N, M, 3) Cartesian positions (Å)
-            embed_head: output of Embed; embeds (N, M, 1, λ₁), f_mags and sigmas (N, M, Q, 1)
-            eps:        numerical floor for sigma clamping and aggregate denominator
+            batch:          molecule geometry; uses coord (N, M, 3) Cartesian positions (Å)
+            embed_head:     output of Embed; embeds (N, M, 1, λ₁), f_mags and sigmas (N, M, Q, 1)
+            eps:            numerical floor for sigma clamping and aggregate denominator
+            use_all_reduce: whether to all-reduce features/chem_env across ranks between
+                            the two passes. True (default) for TP and single-GPU, where
+                            the shard being processed is a slice of the SAME molecules on
+                            every rank. Must be False for ScatterNet's DP path, where each
+                            rank processes a disjoint set of molecules and there is nothing
+                            to reconcile — see `_all_reduce`'s docstring for why this isn't
+                            optional (it's a correctness/deadlock issue, not just a no-op).
         Returns:
             LayerHead with embeds updated to (N, M, Q, λ₁) and sigmas updated; f_mags unchanged
         """
@@ -334,8 +351,8 @@ Pass 2; per-atom update using the accumulated context:
                     )
                     cont = self._pass_1(cont, eps)
                     cont = cont._replace(
-                        features = self._all_reduce(cont.features),
-                        chem_env = self._all_reduce(cont.chem_env),
+                        features = self._all_reduce(cont.features, use_all_reduce),
+                        chem_env = self._all_reduce(cont.chem_env, use_all_reduce),
                     )
                     cont = self._pass_2(cont, eps)
                     return cont.emb_n, cont.sig_n

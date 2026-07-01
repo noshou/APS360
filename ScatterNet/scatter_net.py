@@ -16,7 +16,7 @@ class _DistributedSum(torch.autograd.Function):
 
     Used for partial I(q) sums from each rank's atom shard. Since both ranks
     compute the same loss after the all-reduce, ∂L/∂partial_iq is already the
-    global gradient on every rank — no backward communication is needed.
+    global gradient on every rank - no backward communication is needed.
     """
 
     @staticmethod
@@ -83,7 +83,7 @@ class ScatterNet(nn.Module):
     strategies based on M (padded atoms per molecule), N (molecule count), and
     `dp_atom_threshold`:
 
-    Tensor-parallel (TP) — the default; used whenever DP's conditions (below)
+    Tensor-parallel (TP) - the default; used whenever DP's conditions (below)
     aren't met, or dp_atom_threshold <= 0, or not self.training (eval always
     uses this path):
         1. Embed runs on the full batch on every rank (cheap, per-atom lookup).
@@ -96,22 +96,22 @@ class ScatterNet(nn.Module):
         5. I(q) is summed across ranks (all-reduce); f_mags and sigmas are
            gathered back to full M.
 
-    Data-parallel (DP) — training, M < dp_atom_threshold, AND N >= 2*mol_chunk:
+    Data-parallel (DP) - training, M < dp_atom_threshold, AND N >= 2*mol_chunk:
         Molecules are divided across ranks (no atom sharding, no in-model
-        communication at all — small M means TP's all-reduce cost would
+        communication at all - small M means TP's all-reduce cost would
         dwarf the tiny amount of per-rank compute it parallelises). Each
         rank runs the ordinary single-GPU forward on its own molecule slice
         and returns a `loss_scale = local_N / global_N` so that, once the
         training loop's existing grad all-reduce (SUM) runs, summing the
         two ranks' scaled-local-mean gradients reconstructs the exact
-        global-mean gradient — the same mechanism already used to combine
+        global-mean gradient - the same mechanism already used to combine
         TP's partial gradients, just fed a differently-scaled loss.
 
         The `N >= 2*mol_chunk` guard matters: DP halves the outer N-chunk
         loop but does NOT halve M before MessagePass's own atm_chunk-loop
         runs (TP does, by sharding M first). So a DP-routed bucket runs
         ~2x the inner M-chunk-loop launches TP would've had on the same
-        bucket — only worth it if halving N actually shrinks the outer
+        bucket - only worth it if halving N actually shrinks the outer
         loop. If N already fits in one N-chunk, DP is pure overhead.
 
     Without a process group the forward is identical to the single-GPU path.
@@ -182,7 +182,7 @@ class ScatterNet(nn.Module):
             local_batch: the slice of `batch` these outputs correspond to.
                          Equal to `batch` unchanged unless DP-routed this
                          batch (in which case N above is the local molecule
-                         count, not the global one) — pass this to the loss,
+                         count, not the global one) - pass this to the loss,
                          not the original `batch`.
             loss_scale:  local_N / global_N when DP-routed; 1.0 otherwise.
                          Multiply the loss by this before backward().
@@ -204,7 +204,7 @@ class ScatterNet(nn.Module):
             and M < self._dp_atom_threshold
             # DP halves the N-chunk loop but does NOT halve M (unlike TP, which
             # shards M before MessagePass's own atm_chunk-loop runs on it), so a
-            # DP-routed bucket runs the M-chunk loop over the *full* M — roughly
+            # DP-routed bucket runs the M-chunk loop over the *full* M - roughly
             # 2x the inner-loop launches TP would've had on the same bucket. That
             # only pays for itself if halving N actually shrinks the outer loop;
             # if N already fits in one N-chunk (N < 2*mol_chunk), splitting it
@@ -231,7 +231,14 @@ class ScatterNet(nn.Module):
                 f_mags = embed_head.f_mags[n0:n1],
                 sigmas = embed_head.sigmas[n0:n1],
             )
-            msg_head           = self._msg(local_batch, local_head, self._eps_msgp)
+            # use_all_reduce=False: each rank holds a disjoint set of molecules here,
+            # not a shard of the SAME molecules like TP, so there is nothing to
+            # reconcile across ranks. This is required for correctness, not just an
+            # optimization - see MessagePass._all_reduce's docstring for the deadlock
+            # this avoids (DP's two ranks can have different local N, hence a
+            # different number of N-chunk rounds and all_reduce calls, if this were
+            # left on).
+            msg_head           = self._msg(local_batch, local_head, self._eps_msgp, use_all_reduce=False)
             iq, f_mags, sigmas = self._out(local_batch, msg_head)
             return iq, f_mags, sigmas, local_batch, (n1 - n0) / N
 

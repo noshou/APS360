@@ -2,7 +2,7 @@
 Training loop smoke test.
 
 Runs 5 epochs on a tiny slice of real data (1-6 atom molecules, 50 batches/epoch)
-and asserts that the loss falls over training — enough to confirm the full pipeline
+and asserts that the loss falls over training - enough to confirm the full pipeline
 (data loading → forward → loss → backward → checkpoint) is wired up correctly.
 """
 import sys, os, json

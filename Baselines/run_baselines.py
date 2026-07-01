@@ -2,9 +2,9 @@
 Baseline runner with per-batch and global RAM profiling.
 
 Saves to Baselines/:
-  baseline_results.json        — msle / r2 for every baseline × split
-  memory_profile.png           — per-batch RAM + global timeline
-  plots/<name>.png             — per-baseline scatter + example curves
+  baseline_results.json        - msle / r2 for every baseline × split
+  memory_profile.png           - per-batch RAM + global timeline
+  plots/<name>.png             - per-baseline scatter + example curves
 """
 
 import json
@@ -117,7 +117,7 @@ train_loader = _loader(train_set)
 val_loader   = _loader(val_set)
 test_loader  = _loader(test_set)
 
-print(f"Batches — train: {len(train_set)}  val: {len(val_set)}  test: {len(test_set)}")
+print(f"Batches - train: {len(train_set)}  val: {len(val_set)}  test: {len(test_set)}")
 
 # ── evaluation ────────────────────────────────────────────────────────────────
 
@@ -350,7 +350,7 @@ if _batch_records:
         seen.add(bl)
     ax2.set_xlabel("Batch index (train pass only)")
     ax2.set_ylabel("RAM after batch (GB)")
-    ax2.set_title("Per-batch RAM — each dot = one training batch, coloured by baseline")
+    ax2.set_title("Per-batch RAM - each dot = one training batch, coloured by baseline")
     ax2.legend(loc="upper left", fontsize=7, markerscale=3)
     ax2.grid(True, alpha=0.3)
 
@@ -371,7 +371,7 @@ if _batch_records:
     ax3.grid(True, alpha=0.3)
     ax3.axhline(0, color="gray", linewidth=0.8)
 
-plt.suptitle("Baseline Run — Memory Profile", fontsize=14, fontweight="bold", y=1.01)
+plt.suptitle("Baseline Run - Memory Profile", fontsize=14, fontweight="bold", y=1.01)
 plt.savefig(MEMORY_PLOT, dpi=150, bbox_inches="tight")
 plt.close(fig)
 print(f"Memory plot saved → {MEMORY_PLOT}")

@@ -1,5 +1,5 @@
 ================================================================================
-BINNING ANALYSIS — I(q)@L=50.h5
+BINNING ANALYSIS - I(q)@L=50.h5
 Generated: 2026-06-26
 ================================================================================
 
@@ -32,7 +32,7 @@ BINNING STRATEGY
 Objective: equal molecule count per bin (not equal atom count).
 Rationale: loss is per I(q) curve (one per molecule), so molecule count
            determines training signal contribution, not atom count.
-Padding:   handled by Batcher's atom_size_ceil — molecules in each bin
+Padding:   handled by Batcher's atom_size_ceil - molecules in each bin
            are sorted by atom count and split into fixed-memory sub-batches.
            Wide bins incur no extra padding cost; atom_size_ceil does the work.
 
@@ -103,7 +103,7 @@ Padding:   handled by Batcher's atom_size_ceil — molecules in each bin
 
 Molecule count range: 9,013 – 28,962  (mean 15,568)
 Pad ratio range:      0.10 – 1.00  (mean 0.94)
-All bins ≥ 0.60 pad:  True (last bin excluded — 78k outlier)
+All bins ≥ 0.60 pad:  True (last bin excluded - 78k outlier)
 
 NOTE ON atom_size_ceil:
   atom_size_ceil is set to 78,819 (matching what's in kaggle.ipynb).
@@ -111,9 +111,9 @@ NOTE ON atom_size_ceil:
 ================================================================================
 FILES
 ================================================================================
-  atom_count_histogram.png — full distribution, all groups, 58 bin lines
-  bin_padding.png          — max/p95/mean + pad ratio per bin
-  bin_molecules.png        — molecule count per bin
-  dataset_cdf.png          — per-dataset CDF with bin boundaries
-  large_mol_zoom.png       — 561–78k range detail
-  ../../Baselines/eval_baselines.py — BUCKETS updated
+  atom_count_histogram.png - full distribution, all groups, 58 bin lines
+  bin_padding.png          - max/p95/mean + pad ratio per bin
+  bin_molecules.png        - molecule count per bin
+  dataset_cdf.png          - per-dataset CDF with bin boundaries
+  large_mol_zoom.png       - 561–78k range detail
+  ../../Baselines/eval_baselines.py - BUCKETS updated

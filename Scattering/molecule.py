@@ -221,7 +221,7 @@ class Molecule(StuhrmannMixin):
         all ZFP lossless; elms (str, (n,)) uncompressed; name as a group attribute.
         I(q) is not stored here.
         """
-        import h5py       # lazy — keeps Scattering independent of storage deps
+        import h5py       # lazy - keeps Scattering independent of storage deps
         import hdf5plugin # type: ignore[import]
         _zfp = hdf5plugin.Zfp(reversible=True)  # type: ignore[attr-defined]
         group.attrs['name'] = self._name                                        # type: ignore[union-attr]
