@@ -147,15 +147,18 @@ class _LoopProfiler:
                 f"{tag}   peak CUDA mem: {peak:.2f}G  "
                 f"(reserved high-water {self.peak_resv_gb:.2f}G)"
             )
-        # heaviest batches by data_wait and by compute, with bucket geometry + peak mem
+        # heaviest batches by data_wait and by compute, with bucket geometry + peak mem.
+        # label is padded to a fixed width so the "ms" field lines up regardless of
+        # whether label is "data" or "compute" (different lengths otherwise shift
+        # every field after it).
         def _top(key, label):
             rows = sorted(self.records, key=lambda r: r.get(key, 0.0), reverse=True)[:3]
             for r in rows:
-                mem = f" peak_alloc={r['peak_alloc_gb']:.2f}G" if "peak_alloc_gb" in r else ""
+                mem = f"peak_alloc={r['peak_alloc_gb']:6.2f}G" if "peak_alloc_gb" in r else ""
                 lines.append(
-                    f"{tag}   heavy-{label}: {r.get(key, 0.0) * 1e3:8.2f} ms  "
-                    f"bi={r['bi']:<5d} mols={r['n_mols']:<5d} "
-                    f"max_atoms={r['max_atoms']:<6d} real_atoms={r['real_atoms']}{mem}"
+                    f"{tag}   heavy-{label:<8s}{r.get(key, 0.0) * 1e3:8.2f} ms  "
+                    f"bi={r['bi']:<5d} mols={r['n_mols']:<6d} "
+                    f"max_atoms={r['max_atoms']:<6d} real_atoms={r['real_atoms']:<6d} {mem}"
                 )
         _top("data_wait", "data")
         _top("compute",   "compute")
@@ -383,12 +386,13 @@ def _worker(rank: int, cfg: RunConfig):
                 rows = train_set._batches[i]
                 return f"{len(rows)} mols x {max(r[2] for r in rows)} atoms"
             print(f"[profiler] probing {mode}", flush=True)
-            if heavy_nm:
-                print(f"  worst N*M_shard≈{_bucket_nm_proxy(heavy_nm[0])} ({_describe(heavy_nm[0])})", flush=True)
-            if heavy_m:
-                print(f"  worst M          ({_describe(heavy_m[0])})", flush=True)
-            if regular:
-                print(f"  median sample    ({_describe(regular[0])})", flush=True)
+            for label, group, proxy_fn in (
+                ("worst N*M_shard", heavy_nm, _bucket_nm_proxy),
+                ("worst M",         heavy_m,  _bucket_max_m),
+                ("median sample",   regular,  _bucket_nm_proxy),
+            ):
+                if group:
+                    print(f"  {label:<16s} proxy={proxy_fn(group[0]):<8d} {_describe(group[0])}", flush=True)
 
     if rank == 0:
         train_mols = sum(len(b) for b in train_set._batches)
