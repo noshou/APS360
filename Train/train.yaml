@@ -1,0 +1,43 @@
+# Default config for the local CLI path (python train.py --config runs/default.yaml).
+# The Kaggle notebook (kaggle_train.ipynb) builds RunConfig in Python and does NOT
+# read this file; that notebook is the source of truth. Keep the knobs below in sync
+# with it. Missing keys fall back to RunConfig dataclass defaults; CLI flags override.
+
+# paths - local defaults; override on the CLI for other environments
+hdf5:        Preprocess/I(q)@L=50.h5
+db:          Preprocess/scatternet
+ckpt_best:   scatternet_best.pt
+ckpt_resume: scatternet_resume.pt
+metrics:     scatternet_metrics.json
+
+# model architecture
+lambda_1: 128
+lambda_2: 5
+lambda_3: 128
+lambda_4: 4
+lambda_5: 128
+msg_seed: 42
+
+# chunking (peak-memory vs launch-count tradeoff; see README Appendix)
+atm_chunk: 100
+mol_chunk: 56
+
+# parallelism routing (multi-GPU only; see README ScatterNet section 7)
+dp_atom_threshold: 101   # calibrated for 2x T4: 1.8x faster, peak 13.55G. 0 = always TP.
+
+# numerical floors
+eps_embd: 1.0e-8
+eps_msgp: 1.0e-3
+
+# loss
+lambda_6: 0.1
+lambda_7: 0.1
+
+# optimiser / training loop
+lr:            3.0e-4
+weight_decay:  1.0e-5
+grad_clip:     1.0
+epochs:        50
+batcher_seed:  0
+atom_size_ceil: -1   # -1 = auto (3x largest molecule)
+num_workers: 4

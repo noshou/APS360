@@ -213,6 +213,7 @@ def _parse_args():
     p.add_argument("--lambda_5",       type=int,   default=None)
     p.add_argument("--msg_seed",       type=int,   default=None)
     p.add_argument("--atm_chunk",      type=int,   default=None)
+    p.add_argument("--mol_chunk",      type=int,   default=None)
     p.add_argument("--dp_atom_threshold", type=int, default=None)
     p.add_argument("--eps_embd",       type=float, default=None)
     p.add_argument("--eps_msgp",       type=float, default=None)
@@ -473,9 +474,19 @@ def _worker(rank: int, cfg: RunConfig):
         # Print a kernel table straight to stdout - TensorBoard's inline view
         # hangs through Kaggle's proxy, but stdout always works. Still write the
         # trace file so it can be opened in Perfetto / chrome://tracing if wanted.
+        # This table is torch.profiler's own formatter (EventList.table), not ours -
+        # we don't control its per-cell alignment, only these call arguments. Its
+        # default max_name_column_width=55 plus 10 numeric columns makes each row
+        # ~180+ chars wide; a notebook cell that soft-wraps long lines will make an
+        # otherwise-correct fixed-width table look misaligned, since a wrapped
+        # continuation line isn't column-aligned with the row below it. Shrinking
+        # the name column keeps the whole table narrower so it's less likely to wrap.
         if rank == 0:
             print(f"\n[profiler] top GPU ops (rank 0, {tb_active} active batch(es)):", flush=True)
-            print(p.key_averages().table(sort_by="cuda_time_total", row_limit=25), flush=True)
+            print(
+                p.key_averages().table(sort_by="cuda_time_total", row_limit=25, max_name_column_width=30),
+                flush=True,
+            )
         torch.profiler.tensorboard_trace_handler(f"./profiler_trace/rank{rank}")(p)
 
     _prof = None
@@ -749,6 +760,7 @@ def main(cfg: RunConfig | None = None):
             lambda_5       = A.lambda_5,
             msg_seed       = A.msg_seed,
             atm_chunk      = A.atm_chunk,
+            mol_chunk      = A.mol_chunk,
             dp_atom_threshold = A.dp_atom_threshold,
             eps_embd       = A.eps_embd,
             eps_msgp       = A.eps_msgp,

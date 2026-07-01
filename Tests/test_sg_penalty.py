@@ -27,8 +27,8 @@ def test_penalty_decreases_as_sigma_grows():
     sigmas_small = torch.full((2, 1, Q), 0.01)
     sigmas_large = torch.full((2, 1, Q), 1.00)
 
-    pen_small = loss._sg_penalty(sigmas_small, lambda_7=1.0, batch=batch, eps=1e-8).mean().item()
-    pen_large = loss._sg_penalty(sigmas_large, lambda_7=1.0, batch=batch, eps=1e-8).mean().item()
+    pen_small = loss._sg_penalty(sigmas_small, lambda_7=1.0, batch=batch).mean().item()
+    pen_large = loss._sg_penalty(sigmas_large, lambda_7=1.0, batch=batch).mean().item()
 
     assert pen_small > pen_large, f"expected pen_small ({pen_small:.4f}) > pen_large ({pen_large:.4f})"
     print(f"  penalty(σ=0.01)={pen_small:.4f}  penalty(σ=1.0)={pen_large:.4f}  ✓")
@@ -46,7 +46,7 @@ def test_padding_atoms_excluded():
     # after Batch.from_lists, M=2; mol A has one padding atom (vocab=0, mask=0)
     sigmas = torch.full((2, 2, Q), 1.0)
 
-    pen = loss._sg_penalty(sigmas, lambda_7=1.0, batch=batch, eps=1e-8)
+    pen = loss._sg_penalty(sigmas, lambda_7=1.0, batch=batch)
     # both molecules should give the same per-atom average (lambda_7 / sigma = 1.0)
     assert torch.allclose(pen[0], pen[1], atol=1e-5), \
         f"mol A penalty {pen[0]} ≠ mol B penalty {pen[1]} - padding leaked in"
@@ -62,8 +62,8 @@ def test_lambda7_scales_linearly():
     loss = Loss(torch.linspace(0.1, 1.0, Q), 12500.0)
     sigmas = torch.full((1, 2, Q), 0.5)
 
-    pen1 = loss._sg_penalty(sigmas, lambda_7=1.0, batch=batch, eps=1e-8).mean().item()
-    pen2 = loss._sg_penalty(sigmas, lambda_7=2.0, batch=batch, eps=1e-8).mean().item()
+    pen1 = loss._sg_penalty(sigmas, lambda_7=1.0, batch=batch).mean().item()
+    pen2 = loss._sg_penalty(sigmas, lambda_7=2.0, batch=batch).mean().item()
 
     assert abs(pen2 / pen1 - 2.0) < 1e-5, f"expected 2x scaling, got {pen2/pen1:.6f}"
     print(f"  λ7=1→{pen1:.4f}  λ7=2→{pen2:.4f}  ratio={pen2/pen1:.4f}  ✓")
