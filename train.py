@@ -159,6 +159,29 @@ class _LoopProfiler:
                 )
         _top("data_wait", "data")
         _top("compute",   "compute")
+
+        # Per-group breakdown: the combined numbers above blend three structurally
+        # different bucket populations (compute-worst, memory-worst, median), so they
+        # aren't comparable across profiler runs whose group sizes differ, and they're
+        # not very informative even within one run. Report each group separately so
+        # e.g. "did dp_atom_threshold help the heavy_nm group" is a like-for-like question.
+        _GROUP_LABEL = {"heavy_nm": "heaviest N*M_shard", "heavy_m": "heaviest M", "regular": "median"}
+        if any("group" in r for r in self.records):
+            lines.append(f"{tag} ---- per-group breakdown ----")
+            for g in ("heavy_nm", "heavy_m", "regular"):
+                grp = [r for r in self.records if r.get("group") == g]
+                if not grp:
+                    continue
+                gn      = len(grp)
+                g_ms    = lambda k: sum(r.get(k, 0.0) for r in grp) / gn * 1e3
+                g_peak  = max((r.get("peak_alloc_gb", 0.0) for r in grp), default=0.0)
+                lines.append(
+                    f"{tag}   {_GROUP_LABEL[g]:<20s} n={gn:<3d} "
+                    f"compute={g_ms('compute'):8.2f}ms/batch  "
+                    f"forward={g_ms('forward'):7.2f}ms  backward={g_ms('backward'):7.2f}ms  "
+                    f"grad_allreduce={g_ms('grad_allreduce'):7.2f}ms  peak_alloc={g_peak:.2f}G"
+                )
+
         print("\n".join(lines), flush=True)
 
 
@@ -325,6 +348,7 @@ def _worker(rank: int, cfg: RunConfig):
     # behaviour for the compute-worst-case bucket.
     prof_loader = None
     worst: list = []
+    prof_group_bounds = (0, 0)   # (end of heavy_nm, end of heavy_m) indices into `worst`
     if cfg.profiler:
         ws_proxy = max(world_size, 1)
         def _bucket_nm_proxy(i):
@@ -350,6 +374,7 @@ def _worker(rank: int, cfg: RunConfig):
         regular    = [i for i in by_nm[band_start:] if i not in seen][:n_regular]
 
         worst = heavy_nm + heavy_m + regular
+        prof_group_bounds = (len(heavy_nm), len(heavy_nm) + len(heavy_m))
         mode  = f"{len(heavy_nm)} heaviest N*M_shard + {len(heavy_m)} heaviest M + {len(regular)} median"
         prof_loader = DataLoader(Subset(train_set, worst), batch_size=1, shuffle=False,
                                  collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin)
@@ -536,6 +561,12 @@ def _worker(rank: int, cfg: RunConfig):
                 rec["n_mols"]     = batch.vocab.shape[0]
                 rec["max_atoms"]  = batch.vocab.shape[1]
                 rec["real_atoms"] = int(batch.padding_mask().sum().item())
+                if _bi < prof_group_bounds[0]:
+                    rec["group"] = "heavy_nm"
+                elif _bi < prof_group_bounds[1]:
+                    rec["group"] = "heavy_m"
+                else:
+                    rec["group"] = "regular"
 
             with loop_prof.section("h2d", rec):
                 batch = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
