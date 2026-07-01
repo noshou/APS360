@@ -25,7 +25,7 @@ class MessagePass(nn.Module):
         ```
 
     RFF approximation of the RBF kernel exp(-‖r̃_i − r̃_j‖² / 2):
-        ```
+        ``` 
         φ_m(q) = √(2/λ₅) · cos(Ω · r̃_m(q) + b)    ∈ R^λ₅
         ```
     where Ω ∈ R^{λ₅×3} is a fixed random frequency matrix and b ∈ R^λ₅ random phases.
@@ -259,7 +259,13 @@ Pass 2; per-atom update using the accumulated context:
 
         for m0 in range(0, cont.M, cont.Mchnk):
             m1 = min(m0 + cont.Mchnk, cont.M)
-            args = (cont.emb_n[:, m0:m1], cont.ffs_n[:, m0:m1], cont.sig_n[:, m0:m1], cont.crd_n[:, m0:m1], cont.msk_n[:, m0:m1])
+            args = (
+                cont.emb_n[:, m0:m1], 
+                cont.ffs_n[:, m0:m1], 
+                cont.sig_n[:, m0:m1], 
+                cont.crd_n[:, m0:m1], 
+                cont.msk_n[:, m0:m1]
+            )
             emb_c, sig_c = checkpoint(_step, *args, use_reentrant=False)  # type: ignore[misc]
             new_emb_m.append(emb_c)
             new_sig_m.append(sig_c)

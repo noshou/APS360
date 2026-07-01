@@ -1,6 +1,6 @@
 # ScatterNet: Design Reference
 
-GNN that predicts X-ray powder scattering curves I(q) from atomic coordinates and species, using Random Fourier Features for O(M·λ₅) all-pairs kernel aggregation and tensor parallelism across GPUs.
+GNN that predicts X-ray powder scattering curves I(q) from atomic coordinates and species, using Random Fourier Features for O(M·λ₅) all-pairs kernel aggregation, and tensor/data parallelism across GPUs (routed per batch, see §7).
 
 ---
 
@@ -463,7 +463,7 @@ In the full Debye equation `I(q) = sum_j sum_k f_j f_k sinc(q r_jk)`, diagonal t
 
 ## 7. `ScatterNet`
 
-Top-level module. Wraps Embed, MessagePass, and OutputHead, and handles atom-dimension tensor parallelism across GPUs.
+Top-level module. Wraps Embed, MessagePass, and OutputHead, and routes each batch to one of two parallelism strategies across GPUs: atom-dimension tensor parallelism (TP), or, for small-atom-count batches during training, molecule-dimension data parallelism (DP).
 
 ### Module Registry
 
@@ -475,6 +475,8 @@ Top-level module. Wraps Embed, MessagePass, and OutputHead, and handles atom-dim
 
 `_eps_embd` and `_eps_msgp` are plain Python floats (not parameters or buffers); they are not moved by `.to(device)`.
 
+`forward` returns a 5-tuple: `(iq, f_mags, sigmas, local_batch, loss_scale)`. `local_batch` and `loss_scale` are only meaningful when DP-routing (below); otherwise `local_batch is batch` and `loss_scale == 1.0`. Always pass `local_batch` (not the original `batch`) to the loss, and multiply the loss by `loss_scale` before `backward()` — see [Training Loop](#9-training-loop).
+
 ### Single-GPU Forward
 
 ```
@@ -482,6 +484,31 @@ batch -> Embed(batch, ε_e)              LayerHead: (N,M,1,λ₁), (N,M,Q,1), (N
       -> MessagePass(batch, head, ε_m)  LayerHead: (N,M,Q,λ₁), (N,M,Q,1), (N,M,Q,1)
       -> OutputHead(batch, head)        (N,Q), (N,M,Q), (N,M,Q)
 ```
+
+### Routing: TP vs DP
+
+With a process group active, each batch picks a strategy from `M` (padded atoms/molecule) and `dp_atom_threshold`:
+
+```
+route_dp = model.training and dp_atom_threshold > 0 and M < dp_atom_threshold
+```
+
+`dp_atom_threshold = 0` (default) always uses TP — matches pre-DP behaviour exactly. `evaluate()` runs with `model.eval()`, so `model.training` is `False` and eval/test always use TP regardless of the threshold (needed since `evaluate()` assumes both ranks see identical full-batch outputs).
+
+TP shards atoms of the *same* molecules across ranks and needs an all-reduce mid-forward to reconstruct each atom's full neighbourhood (see `MessagePass._AllReduce`). For a bucket with very few atoms per molecule (e.g. `max_atoms=3`), that all-reduce's fixed latency cost dwarfs the tiny amount of per-rank compute it buys — DP routes those buckets by molecule instead, with **no in-model communication at all**.
+
+### Data Parallel Forward
+
+Molecule dimension N is split across `ws` ranks (`shard = ceil(N/ws)`, `n0 = rank*shard`), each rank keeping the *full* `M` atoms of its molecules:
+
+```
+Step 1: Embed on full batch (identical on all ranks)
+Step 2: Slice N dimension -> local_batch (n1-n0 molecules, full M), local_head
+Step 3: MessagePass + OutputHead on local_batch, single-GPU path, no collectives
+Step 4: return iq, f_mags, sigmas (shape (n1-n0, ...)), local_batch, loss_scale=(n1-n0)/N
+```
+
+Since molecules don't interact, each rank's local outputs are already final — nothing to gather. `loss_scale` rescales the rank's local-mean loss so that, after the usual grad SUM all-reduce (below), the reconstructed gradient equals the true global-mean-loss gradient rather than double-counting it.
 
 ### Tensor Parallel Forward
 
@@ -589,15 +616,15 @@ Standard Adam (not AdamW; weight decay is applied inside the gradient update, no
 ```
 1. Move batch to device
 2. optimizer.zero_grad(set_to_none=True)
-3. iq, fmags, sigmas = model(batch)
-4. loss = criterion.loss(iq, fmags, sigmas, batch, λ₆, λ₇)
+3. iq, fmags, sigmas, local_batch, loss_scale = model(batch)
+4. loss = criterion.loss(iq, fmags, sigmas, local_batch, λ₆, λ₇) * loss_scale
 5. loss.backward()
 6. [distributed] dist.all_reduce(SUM) on every param.grad
 7. clip_grad_norm_(model.parameters(), grad_clip)
 8. optimizer.step()
 ```
 
-Step 6 is explicit because the model uses tensor parallelism (atom sharding), not DDP. Each rank's `param.grad` after backward is a partial sum over its atom shard, so a SUM all_reduce is required. DDP would average (divide by world_size); TP needs the full SUM.
+Step 6 is explicit because the model uses tensor/data parallelism (see [ScatterNet §7](#7-scatternet)), not DDP. In TP mode, each rank's `param.grad` after backward is a partial sum over its atom shard, so a SUM all_reduce is required (DDP would average). In DP mode, `loss_scale = local_N / global_N` (step 4) makes the same SUM reconstruct the correct global-mean gradient from each rank's rescaled local-mean loss — one all-reduce rule serves both routing modes.
 
 ### Epoch Metrics
 
@@ -632,6 +659,7 @@ Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle
 | `msg_seed` | 42 | Seed for fixed RFF frequency matrix Ω. |
 | `atm_chunk` | 1024 | Atoms per M-chunk. Reduce to lower VRAM. |
 | `mol_chunk` | 32 | Molecules per N-chunk. Reduce to lower VRAM on large molecules. |
+| `dp_atom_threshold` | 0 | Training-only, multi-GPU only. Batches with padded atom count `M` below this route through molecule-split data parallelism (no in-model all-reduce) instead of atom-split tensor parallelism. `0` = always TP (old behaviour). See [ScatterNet §7](#7-scatternet). |
 | `eps_embd` | 1e-8 | Numerical floor in Embed (softplus, hypot). |
 | `eps_msgp` | 1e-3 | Numerical floor in MessagePass (sigma clamp, aggregate denominator). |
 | `lr` | 3e-4 | Adam learning rate. |

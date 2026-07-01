@@ -64,6 +64,16 @@ class RunConfig:
     mol_chunk:      Molecules processed per N-chunk in MessagePass. Controls peak size of
                     chem_env (mol_chunk, Q, lambda_5, lambda_1); only one N-chunk's chem_env
                     exists at a time (freed after each N-chunk checkpoint recomputation).
+    dp_atom_threshold: Training-only routing knob (only matters with >1 GPU). Molecules per
+                    batch is M (padded atom count). If M < dp_atom_threshold, the batch is
+                    routed through data-parallel splitting (molecules divided across ranks,
+                    no in-model all-reduce) instead of the default tensor-parallel atom
+                    sharding. Rationale: TP shards atoms across ranks and all-reduces to
+                    reconstruct chem_env every round; for buckets with very few atoms per
+                    molecule that all-reduce cost dwarfs the tiny amount of per-rank compute
+                    it parallelises. 0 (default) = always TP, matching pre-existing behaviour.
+                    Eval/test always use TP regardless of this threshold (evaluate() relies on
+                    both ranks seeing identical full-batch outputs).
     eps_embd:       Numerical floor in the Embed module (avoids division by zero).
     eps_msgp:       Numerical floor in MessagePass sigma clamping and aggregate denominator.
 
@@ -129,6 +139,7 @@ class RunConfig:
     msg_seed:       int            = 42
     atm_chunk:      int            = 1024
     mol_chunk:      int            = 32
+    dp_atom_threshold: int         = 0         # 0 = always TP (old behaviour); see docstring above
     eps_embd:       float          = 1e-8
     eps_msgp:       float          = 1e-3
 

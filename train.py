@@ -187,6 +187,7 @@ def _parse_args():
     p.add_argument("--lambda_5",       type=int,   default=None)
     p.add_argument("--msg_seed",       type=int,   default=None)
     p.add_argument("--atm_chunk",      type=int,   default=None)
+    p.add_argument("--dp_atom_threshold", type=int, default=None)
     p.add_argument("--eps_embd",       type=float, default=None)
     p.add_argument("--eps_msgp",       type=float, default=None)
 
@@ -227,7 +228,7 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
     with torch.no_grad():
         for batch in loader:
             batch             = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
-            iq, fmags, sigmas = model(batch)
+            iq, fmags, sigmas, _, _ = model(batch)  # eval always TP-routes (model.eval()); local_batch==batch, loss_scale==1.0
             loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7)
             n = batch.iqval.shape[0]
             total_loss += loss.item() * n
@@ -250,11 +251,17 @@ def _worker(rank: int, cfg: RunConfig):
     Per-process training worker. When launched with mp.spawn this runs on
     rank i with GPU cuda:i. When called directly (single GPU) rank is 0.
 
-    Tensor parallelism (TP) is handled inside ScatterNet.forward — atoms are
-    sharded across ranks, MessagePass all_reduces between its two passes, and
-    outputs are gathered before returning. This worker is responsible for
-    syncing parameter gradients after each backward (all_reduce SUM), which
-    DDP would otherwise handle, but TP needs SUM not average.
+    Parallelism routing is handled inside ScatterNet.forward, per batch: by
+    default atoms are sharded across ranks for tensor parallelism (TP) —
+    MessagePass all_reduces between its two passes, and outputs are gathered
+    before returning. If cfg.dp_atom_threshold > 0 and a training batch's
+    padded atom count M falls below it, the batch is instead split by
+    molecule across ranks (DP) with no in-model communication at all. This
+    worker is responsible for syncing parameter gradients after each backward
+    (all_reduce SUM), which DDP would otherwise handle; TP needs the full SUM
+    (partial gradients per atom shard), and DP relies on ScatterNet.forward's
+    loss_scale to make the same SUM reconstruct the correct global-mean
+    gradient too — see the comment at the grad_allreduce call site below.
     """
 
     world_size = torch.cuda.device_count()
@@ -349,6 +356,7 @@ def _worker(rank: int, cfg: RunConfig):
         q_points  = q_points,
         eps_embd  = cfg.eps_embd,
         eps_msgp  = cfg.eps_msgp,
+        dp_atom_threshold = cfg.dp_atom_threshold,
     ).to(device)
 
     criterion = Loss(q_grid, energy).to(device)
@@ -500,9 +508,9 @@ def _worker(rank: int, cfg: RunConfig):
             optimizer.zero_grad(set_to_none=True)
 
             with loop_prof.section("forward", rec):
-                iq, fmags, sigmas = model(batch)
+                iq, fmags, sigmas, local_batch, loss_scale = model(batch)
             with loop_prof.section("loss", rec):
-                loss = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7)
+                loss = criterion.loss(iq, fmags, sigmas, local_batch, cfg.lambda_6, cfg.lambda_7) * loss_scale
 
             if rank == 0 and cfg.verbosity == "diagnostic":
                 def _s(t): return f"nan={t.isnan().any().item()} inf={t.isinf().any().item()} min={t.float().min().item()} max={t.float().max().item()}"
@@ -513,18 +521,22 @@ def _worker(rank: int, cfg: RunConfig):
                     print(f"    iq:     {_s(iq)}")
                     print(f"    fmags:  {_s(fmags)}")
                     print(f"    sigmas: {_s(sigmas)}")
-                    print(f"    iqval:  {_s(batch.iqval)}")
-                    print(f"    coord:  {_s(batch.coord)}")
-                    print(f"    vocab shape: {batch.vocab.shape}  n_real_atoms: {batch.padding_mask().sum().item()}", flush=True)
+                    print(f"    iqval:  {_s(local_batch.iqval)}")
+                    print(f"    coord:  {_s(local_batch.coord)}")
+                    print(f"    vocab shape: {local_batch.vocab.shape}  n_real_atoms: {local_batch.padding_mask().sum().item()}", flush=True)
 
             with loop_prof.section("backward", rec):
                 loss.backward()
 
             # With TP, each rank's parameter gradients are a partial sum over its
             # atom shard, so they must be summed across ranks (SUM, not average —
-            # DDP averages, TP needs the full sum). A rank that is fast everywhere
-            # else but slow here is *waiting* on a laggard peer — that's the skew
-            # to hunt with the per-rank section report.
+            # DDP averages, TP needs the full sum). With DP (small-M batches routed
+            # by dp_atom_threshold), ScatterNet.forward's loss_scale = local_N/global_N
+            # rescales each rank's local-mean loss before backward, so the same SUM
+            # here reconstructs the correct global-mean gradient instead of double-
+            # counting it — one all-reduce rule serves both routing modes. A rank
+            # that is fast everywhere else but slow here is *waiting* on a laggard
+            # peer — that's the skew to hunt with the per-rank section report.
             if is_dist:
                 with loop_prof.section("grad_allreduce", rec):
                     for param in model.parameters():
@@ -668,6 +680,7 @@ def main(cfg: RunConfig | None = None):
             lambda_5       = A.lambda_5,
             msg_seed       = A.msg_seed,
             atm_chunk      = A.atm_chunk,
+            dp_atom_threshold = A.dp_atom_threshold,
             eps_embd       = A.eps_embd,
             eps_msgp       = A.eps_msgp,
             lambda_6       = A.lambda_6,

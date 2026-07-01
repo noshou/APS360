@@ -212,5 +212,6 @@ class Batcher:
         self._test  = BatchSet(hdf5_db, enc, [b for b in test_batches  if b])
     
     def get_sets(self) -> Tuple[BatchSet, BatchSet, BatchSet]:
-        return self._train, self._val, self._test
+        return self._train, self._val, self._test 
+    
         
