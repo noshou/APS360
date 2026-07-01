@@ -733,6 +733,16 @@ Optimizer: Adam(SUM-reduced grads, clip at grad_clip) -> parameter update
 
 Set `profiler: true` in your YAML config or pass `--profiler` on the CLI. This runs a short **diagnostic** instead of normal training: the loop runs `1 + prof_warmup + prof_active` batches (defaults `1 + 1 + 3 = 5`; tune with `--prof_warmup`/`--prof_active`), then stops — no eval or checkpointing. Adjust `prof_active` higher (e.g. 20–50) to average over many buckets.
 
+### Which Buckets Get Profiled
+
+The `1 + prof_warmup + prof_active` budget is split three ways across bucket **metadata** (atom counts only — no tensors loaded), not drawn randomly from the shuffled train loader:
+
+1. **Heaviest by `N*M_shard`** (`shard = ceil(max_atoms/world_size)`) — the compute-time proxy. Dominated by huge-`N`/tiny-`M` buckets, since TP's all-reduce cost scales with the *number* of N-chunks (`N/mol_chunk × λ2` rounds), not with `M` — a bucket with thousands of tiny molecules pays that fixed per-N-chunk cost thousands of times over.
+2. **Heaviest by raw `M`** — the memory-risk proxy. A large-`M`/small-`N` bucket can rank low on `N*M_shard` (small `N` keeps the product down) while still having the largest per-chunk RFF tensors (`atm_chunk`-sized chunks are actually full when `M` is large) — invisible to the first ranking alone.
+3. **A band around the median `N*M_shard`** — a "regular" batch baseline, so the two worst-case groups have something typical to compare against instead of only ever showing outliers.
+
+Each group is deduplicated against the ones before it. The single heaviest bucket by `N*M_shard` stays first (`bi=0`, the profiler's "wait" step) so it gets a clean `peak_alloc` reading with no torch-trace overhead. The startup log line reports one example bucket from each group (`mols x atoms`) so you can sanity-check what got selected.
+
 Two decoupled layers of profiling run on **every rank**:
 
 1. **Section timers** — a CUDA-synced wall-clock breakdown printed at the end, over the **full** `prof_active` window (so averages are representative). Each rank prints time spent in `data_wait` / `h2d` / `forward` / `loss` / `backward` / `grad_allreduce` / `clip` / `step`, plus the heaviest batches by data-wait and by compute (with molecule count, max atoms, and real atoms). These cost ~no extra memory. Comparing the same section **across ranks** localizes tensor-parallel skew: a rank fast in compute but slow in `grad_allreduce` is *waiting* on a slower peer — the usual cause of the NCCL `ALLREDUCE` watchdog timeout.

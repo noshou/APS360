@@ -308,28 +308,62 @@ def _worker(rank: int, cfg: RunConfig):
     test_loader  = DataLoader(test_set,  batch_size=1, shuffle=False, collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
 
     # In profiler mode, pick which buckets to profile from metadata (atom counts live in
-    # each row (grp, stem, atoms), so no tensors are loaded). Rank by N*M_shard, the proxy
-    # for activation memory, and profile the heaviest buckets. Worst-first puts the biggest
-    # at bi=0 (the profiler's "wait" step), giving it a clean peak_alloc with no torch-trace
-    # overhead.
+    # each row (grp, stem, atoms), so no tensors are loaded). A single N*M_shard ranking
+    # misses two things: (1) memory-risk buckets with large M but small N (N*M_shard is a
+    # compute-time proxy dominated by N, so a huge-M/small-N bucket can rank low on it even
+    # though it has the biggest per-chunk activations), and (2) what a "typical" batch even
+    # looks like (a pure worst-case sample only ever shows outliers). So the profiling budget
+    # is split three ways:
+    #   1. heaviest by N*M_shard  — compute-time worst case (usually huge-N/tiny-M; this is
+    #      where TP's all-reduce cost piles up, see dp_atom_threshold).
+    #   2. heaviest by raw M      — memory-risk worst case (large per-chunk RFF tensors),
+    #      invisible to the N*M_shard ranking whenever N is small.
+    #   3. a band around the median N*M_shard — representative "regular" batches, so the
+    #      two worst-case groups have a baseline to compare against.
+    # Worst-of-group-1 stays first (bi=0, the profiler's "wait" step) so it gets a clean
+    # peak_alloc reading with no torch-trace overhead, matching the original single-ranking
+    # behaviour for the compute-worst-case bucket.
     prof_loader = None
     worst: list = []
     if cfg.profiler:
         ws_proxy = max(world_size, 1)
-        def _bucket_proxy(i):
+        def _bucket_nm_proxy(i):
             rows = train_set._batches[i]
             return len(rows) * ((max(r[2] for r in rows) + ws_proxy - 1) // ws_proxy)
-        n_each = 1 + cfg.prof_warmup + cfg.prof_active
-        ranked = sorted(range(len(train_set)), key=_bucket_proxy, reverse=True)
-        worst  = ranked[:n_each]
-        mode   = f"{len(worst)} heaviest"
+        def _bucket_max_m(i):
+            return max(r[2] for r in train_set._batches[i])
+
+        n_each  = 1 + cfg.prof_warmup + cfg.prof_active
+        n_group = max(1, n_each // 3)
+
+        by_nm = sorted(range(len(train_set)), key=_bucket_nm_proxy, reverse=True)
+        by_m  = sorted(range(len(train_set)), key=_bucket_max_m,   reverse=True)
+
+        heavy_nm = by_nm[:n_group]
+        seen     = set(heavy_nm)
+        heavy_m  = [i for i in by_m if i not in seen][:n_group]
+        seen    |= set(heavy_m)
+
+        n_regular  = max(0, n_each - len(heavy_nm) - len(heavy_m))
+        mid        = len(by_nm) // 2
+        band_start = max(0, mid - n_regular)
+        regular    = [i for i in by_nm[band_start:] if i not in seen][:n_regular]
+
+        worst = heavy_nm + heavy_m + regular
+        mode  = f"{len(heavy_nm)} heaviest N*M_shard + {len(heavy_m)} heaviest M + {len(regular)} median"
         prof_loader = DataLoader(Subset(train_set, worst), batch_size=1, shuffle=False,
                                  collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin)
         if rank == 0:
-            big = worst[0]
-            print(f"[profiler] probing {mode}; worst-first per group, "
-                  f"top N*M_shard≈{_bucket_proxy(big)} "
-                  f"({len(train_set._batches[big])} mols x {max(r[2] for r in train_set._batches[big])} atoms)", flush=True)
+            def _describe(i):
+                rows = train_set._batches[i]
+                return f"{len(rows)} mols x {max(r[2] for r in rows)} atoms"
+            print(f"[profiler] probing {mode}", flush=True)
+            if heavy_nm:
+                print(f"  worst N*M_shard≈{_bucket_nm_proxy(heavy_nm[0])} ({_describe(heavy_nm[0])})", flush=True)
+            if heavy_m:
+                print(f"  worst M          ({_describe(heavy_m[0])})", flush=True)
+            if regular:
+                print(f"  median sample    ({_describe(regular[0])})", flush=True)
 
     if rank == 0:
         train_mols = sum(len(b) for b in train_set._batches)
