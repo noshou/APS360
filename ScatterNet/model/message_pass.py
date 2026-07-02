@@ -432,7 +432,7 @@ class MessagePass(nn.Module):
                 # per N-chunk. use_reentrant=False would keep all N-chunks' chem_env alive
                 # simultaneously (the _pass_2._step closures hold a reference to it).
                 args = (embeds[n0:n1], padding_mask[n0:n1], f_mags[n0:n1], sigmas[n0:n1], coord[n0:n1])
-                new_emb, new_sig = checkpoint(_n_chunk_round, *args, use_reentrant=True)  # type: ignore[misc]
+                new_emb, new_sig = checkpoint(_n_chunk_round, *args, use_reentrant=False)  # type: ignore[misc]
                 new_embeds_n.append(new_emb)
                 new_sigmas_n.append(new_sig)
 
