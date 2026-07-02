@@ -295,6 +295,9 @@ def _worker(rank: int, cfg: RunConfig):
     world_size = torch.cuda.device_count()
     is_dist    = world_size > 1
 
+    if cfg.compile:
+        os.environ.setdefault("TORCHDYNAMO_VERBOSE", "1")  # full Dynamo/Inductor traceback on compile failures
+
     if is_dist:
         os.environ.setdefault("MASTER_ADDR", "localhost")
         os.environ.setdefault("MASTER_PORT", "12355")

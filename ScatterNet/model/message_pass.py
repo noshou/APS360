@@ -81,6 +81,7 @@ class MessagePass(nn.Module):
     _sigbilin: nn.Bilinear                  # updates σ from (updated embedding, form factor)
     _rms_norm: nn.RMSNorm                   # normalises aggregated context before gating
     _q_points: int                          # number of q-points (Q)
+    _rffscale: float                        # rff_scale = (2/lambda_5) ** 0.5 to prevent triton bug
     _step1_fn: Callable
     _step2_fn: Callable
     class _AllReduce(torch.autograd.Function):
@@ -155,6 +156,12 @@ class MessagePass(nn.Module):
         self._sigbilin = nn.Bilinear(lambda_1, q_points, 1)
         self._rms_norm = nn.RMSNorm(lambda_1)
         self._q_points = q_points
+        # precomputed here (not inside _step1/_step2) so torch.compile never sees Python
+        # arithmetic on lambda_5: under dynamic=True it treats lambda_5 as a SymInt (it's
+        # also used in reshapes below), and `(2/lambda_5) ** 0.5` would then trace as a
+        # SymFloat that specializes to float64, which Triton's pow() can't mix with the
+        # float32 RFF tensor (Triton has no (float32, float64) overload).
+        self._rffscale = (2 / lambda_5) ** 0.5
         self._step1_fn = torch.compile(self._step1, fullgraph=True, dynamic=True) if compile else self._step1
         self._step2_fn = torch.compile(self._step2, fullgraph=True, dynamic=True) if compile else self._step2
 
@@ -167,6 +174,7 @@ class MessagePass(nn.Module):
         sigslice: torch.Tensor, 
         mskslice: torch.Tensor,
         epsilon_: float,
+        rff_scale: float,
         lambda_1: int,
         lambda_5: int
     ):
@@ -177,7 +185,7 @@ class MessagePass(nn.Module):
 
         # φ_m = √(2/λ₅) · cos(Ω · r̃_m + b): RFF feature vector per atom per q-point
         proj = scaled_coords @ omegafrq.T + biasterm       # (Nc, mc, Q, λ₅)
-        zrff = (2/lambda_5) ** 0.5 * cos(proj)             # (Nc, mc, Q, λ₅)
+        zrff = rff_scale * cos(proj)                       # (Nc, mc, Q, λ₅)
         zrff = zrff * mskslice.unsqueeze(-1).unsqueeze(-1) # zero padding atoms
 
         # Σ_m φ_m: partial sum of RFF features over atoms in this M-chunk
@@ -222,10 +230,11 @@ class MessagePass(nn.Module):
                 sig_slice,
                 msk_slice,
                 eps,
+                self._rffscale,
                 self._lambda_1,
                 self._lambda_5
             )
-            
+
             step_feat, step_chem = checkpoint(self._step1_fn, *args, use_reentrant=False)  # type: ignore[misc]
             features = features + step_feat
             chem_env = chem_env + step_chem
@@ -247,6 +256,7 @@ class MessagePass(nn.Module):
         features: torch.Tensor,
         chem_env: torch.Tensor,
         epsilon_: float,
+        rff_scale: float,
         q_points: int,
         lambda_1: int,
         lambda_5: int
@@ -255,7 +265,7 @@ class MessagePass(nn.Module):
         # recompute φ_m for this M-chunk (same as _pass_1, but now chem_env is complete)
         scaled_coords = crdslice.unsqueeze(-2) / sigslice.clamp(min=epsilon_) # (Nc, mc, Q, 3)
         proj = scaled_coords @ omegafrq.T + biasterm # (Nc, mc, Q, λ₅)
-        zrff = (2/lambda_5) ** 0.5 * cos(proj) # (Nc, mc, Q, λ₅)
+        zrff = rff_scale * cos(proj) # (Nc, mc, Q, λ₅)
         mask = mskslice.unsqueeze(-1).unsqueeze(-1) # (Nc, mc, 1, 1)
         zrff = zrff * mask
 
@@ -332,6 +342,7 @@ class MessagePass(nn.Module):
                 cont_feat,
                 cont_chnv,
                 eps,
+                self._rffscale,
                 self._q_points,
                 self._lambda_1,
                 self._lambda_5
