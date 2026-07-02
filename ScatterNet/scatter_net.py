@@ -128,6 +128,7 @@ class ScatterNet(nn.Module):
         q_points:  number of q-grid points (Q)
         eps_embd:  numerical floor for Embed
         eps_msgp:  numerical floor for MessagePass
+        compile:   torch.compile Embed/MessagePass/OutputHead's checkpointed step functions
     """
 
     _emb:      Embed
@@ -152,12 +153,13 @@ class ScatterNet(nn.Module):
         eps_embd:  float,
         eps_msgp:  float,
         dp_atom_threshold: int = 0,
+        compile:   bool = False,
     ) -> None:
 
         super().__init__()
-        self._emb      = Embed(lambda_1, q_points)
-        self._msg      = MessagePass(lambda_1, lambda_2, lambda_5, msg_seed, q_points, n_chunk=mol_chunk, m_chunk=atm_chunk)
-        self._out      = OutputHead(lambda_1, lambda_3, lambda_4, atm_chunk)
+        self._emb      = Embed(lambda_1, q_points, compile=compile)
+        self._msg      = MessagePass(lambda_1, lambda_2, lambda_5, msg_seed, q_points, n_chunk=mol_chunk, m_chunk=atm_chunk, compile=compile)
+        self._out      = OutputHead(lambda_1, lambda_3, lambda_4, atm_chunk, compile=compile)
         self._eps_embd = eps_embd
         self._eps_msgp = eps_msgp
         self._dp_atom_threshold = dp_atom_threshold

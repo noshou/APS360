@@ -1,5 +1,5 @@
 from jaxtyping import Bool, Float, Int, jaxtyped
-from beartype import beartype
+from beartype import beartype, List
 from dataclasses import dataclass
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -31,9 +31,9 @@ class Batch:
     @classmethod
     def from_lists(
         cls,
-        vocabs: list[Int[torch.Tensor,   "M"]],
-        iqvals: list[Float[torch.Tensor, "Q"]],
-        coords: list[Float[torch.Tensor, "M 3"]]
+        vocabs: List[Int[torch.Tensor,   "M"]],
+        iqvals: List[Float[torch.Tensor, "Q"]],
+        coords: List[Float[torch.Tensor, "M 3"]]
     ) -> "Batch":
         
         """

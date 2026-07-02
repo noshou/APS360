@@ -657,6 +657,7 @@ Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle
 | `atm_chunk`         | 1024    | Atoms per M-chunk. Reduce to lower VRAM.                                                                                                   |
 | `mol_chunk`         | 32      | Molecules per N-chunk. Reduce to lower VRAM on large molecules.                                                                            |
 | `dp_atom_threshold` | 101     | Batches with padded atom count`M` below this **and** molecule count `N >= 2*mol_chunk` route through DP instead of TP                      |
+| `compile`           | False   | torch.compile Embed/MessagePass/OutputHead's checkpointed step functions (fullgraph=True, dynamic=True).                                   |
 | `eps_embd`          | 1e-8    | Numerical floor in Embed (softplus, hypot).                                                                                                |
 | `eps_msgp`          | 1e-3    | Numerical floor in MessagePass (sigma clamp, aggregate denominator).                                                                       |
 | `lr`                | 3e-4    | Adam learning rate.                                                                                                                        |

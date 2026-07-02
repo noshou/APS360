@@ -1,6 +1,7 @@
-import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.distributed   as dist
+import numpy               as np
 
 from torch                   import cos, nn
 from torch.utils.checkpoint  import checkpoint
@@ -8,8 +9,7 @@ from ..batching              import Batch
 from jaxtyping               import jaxtyped, Float, Bool
 from beartype                import beartype
 from .layer_head             import LayerHead
-from typing                  import NamedTuple
-import torch.distributed as dist
+from typing                  import NamedTuple, Callable
 
 class MessagePass(nn.Module):
 
@@ -39,7 +39,7 @@ class MessagePass(nn.Module):
     features[q, d]      = Σ_m  φ_m(q, d)                        shape (Q, λ₅)
     chem_env[q, d, l]   = Σ_m  φ_m(q, d) · e_m(q, l)            shape (Q, λ₅, λ₁)
     ``` 
-Pass 2; per-atom update using the accumulated context:
+    Pass 2; per-atom update using the accumulated context:
         
         ```
         locality_m[q, l]    = Σ_d  φ_m(q, d) · chem_env[q, d, l]   shape (Q, λ₁)
@@ -81,7 +81,8 @@ Pass 2; per-atom update using the accumulated context:
     _sigbilin: nn.Bilinear                  # updates σ from (updated embedding, form factor)
     _rms_norm: nn.RMSNorm                   # normalises aggregated context before gating
     _q_points: int                          # number of q-points (Q)
-
+    _step1_fn: Callable
+    _step2_fn: Callable
     class _AllReduce(torch.autograd.Function):
 
         """
@@ -122,13 +123,14 @@ Pass 2; per-atom update using the accumulated context:
 
     def __init__(
         self,
-        lambda_1:  int,
-        lambda_2:  int,
-        lambda_5:  int,
-        seed:      int,
-        q_points:  int,
-        n_chunk:   int,
-        m_chunk:   int,
+        lambda_1: int,
+        lambda_2: int,
+        lambda_5: int,
+        seed:     int,
+        q_points: int,
+        n_chunk:  int,
+        m_chunk:  int,
+        compile:  bool = False
         ):
 
         super().__init__()
@@ -153,6 +155,43 @@ Pass 2; per-atom update using the accumulated context:
         self._sigbilin = nn.Bilinear(lambda_1, q_points, 1)
         self._rms_norm = nn.RMSNorm(lambda_1)
         self._q_points = q_points
+        self._step1_fn = torch.compile(self._step1, fullgraph=True, dynamic=True) if compile else self._step1
+        self._step2_fn = torch.compile(self._step2, fullgraph=True, dynamic=True) if compile else self._step2
+
+    @staticmethod
+    def _step1(
+        biasterm: nn.Parameter,
+        omegafrq: torch.Tensor,
+        embslice: torch.Tensor, 
+        crdslice: torch.Tensor, 
+        sigslice: torch.Tensor, 
+        mskslice: torch.Tensor,
+        epsilon_: float,
+        lambda_1: int,
+        lambda_5: int
+    ):
+
+        # r̃_m = r_m / σ_m: scale coords by bandwidth so kernel range is q-dependent.
+        # clamp(min=eps) caps the max RFF frequency and avoids 1/0.
+        scaled_coords = crdslice.unsqueeze(-2) / sigslice.clamp(min=epsilon_) # (Nc, mc, Q, 3)
+
+        # φ_m = √(2/λ₅) · cos(Ω · r̃_m + b): RFF feature vector per atom per q-point
+        proj = scaled_coords @ omegafrq.T + biasterm       # (Nc, mc, Q, λ₅)
+        zrff = (2/lambda_5) ** 0.5 * cos(proj)             # (Nc, mc, Q, λ₅)
+        zrff = zrff * mskslice.unsqueeze(-1).unsqueeze(-1) # zero padding atoms
+
+        # Σ_m φ_m: partial sum of RFF features over atoms in this M-chunk
+        step_features = zrff.sum(dim=1) # (Nc, Q, λ₅)
+
+        # Σ_m φ_m ⊗ e_m: partial outer-product sum (kernel-weighted embedding accumulator).
+        # bmm on (Nc*Q, λ₅, mc) @ (Nc*Q, mc, λ₁) avoids the (Nc, mc, Q, λ₅, λ₁) intermediate
+        # that einsum('nmqd,nmql->nqdl') would create before contracting over m.
+        Nc, mc, Q = zrff.shape[0], zrff.shape[1], zrff.shape[2]
+        zb = zrff.permute(0, 2, 3, 1).reshape(Nc * Q, lambda_5, mc)      # (Nc*Q, λ₅, mc)
+        eb = embslice.permute(0, 2, 1, 3).reshape(Nc * Q, mc, lambda_1) # (Nc*Q, mc, λ₁)
+        step_chem_env = torch.bmm(zb, eb).reshape(Nc, Q, lambda_5, lambda_1)
+
+        return step_features, step_chem_env
 
     def _pass_1(self, cont: _PassContainer, eps: float) -> _PassContainer:
 
@@ -164,41 +203,97 @@ Pass 2; per-atom update using the accumulated context:
             chem_env  = Σ_m φ_m ⊗ e_m (kernel-weighted embedding sum)
         """
 
-        def _step(emb_slice, crd_slice, sig_slice, msk_slice):
-
-            # r̃_m = r_m / σ_m: scale coords by bandwidth so kernel range is q-dependent.
-            # clamp(min=eps) caps the max RFF frequency and avoids 1/0.
-            scaled_coords = crd_slice.unsqueeze(-2) / sig_slice.clamp(min=eps) # (Nc, mc, Q, 3)
-
-            # φ_m = √(2/λ₅) · cos(Ω · r̃_m + b): RFF feature vector per atom per q-point
-            proj = scaled_coords @ self._omegafrq.T + self._biasterm # (Nc, mc, Q, λ₅)
-            zrff = (2/self._lambda_5) ** 0.5 * cos(proj)             # (Nc, mc, Q, λ₅)
-            zrff = zrff * msk_slice.unsqueeze(-1).unsqueeze(-1)      # zero padding atoms
-
-            # Σ_m φ_m: partial sum of RFF features over atoms in this M-chunk
-            step_features = zrff.sum(dim=1) # (Nc, Q, λ₅)
-
-            # Σ_m φ_m ⊗ e_m: partial outer-product sum (kernel-weighted embedding accumulator).
-            # bmm on (Nc*Q, λ₅, mc) @ (Nc*Q, mc, λ₁) avoids the (Nc, mc, Q, λ₅, λ₁) intermediate
-            # that einsum('nmqd,nmql->nqdl') would create before contracting over m.
-            Nc, mc, Q = zrff.shape[0], zrff.shape[1], zrff.shape[2]
-            zb = zrff.permute(0, 2, 3, 1).reshape(Nc * Q, self._lambda_5, mc)      # (Nc*Q, λ₅, mc)
-            eb = emb_slice.permute(0, 2, 1, 3).reshape(Nc * Q, mc, self._lambda_1) # (Nc*Q, mc, λ₁)
-            step_chem_env = torch.bmm(zb, eb).reshape(Nc, Q, self._lambda_5, self._lambda_1)
-
-            return step_features, step_chem_env
-
         features: Float[torch.Tensor, "Nchnk Q λ₅"]    = cont.features
         chem_env: Float[torch.Tensor, "Nchnk Q λ₅ λ₁"] = cont.chem_env
 
         for m0 in range(0, cont.M, cont.Mchnk):
             m1 = min(m0 + cont.Mchnk, cont.M)
-            args = (cont.emb_n[:, m0:m1], cont.crd_n[:, m0:m1], cont.sig_n[:, m0:m1], cont.msk_n[:, m0:m1])
-            step_feat, step_chem = checkpoint(_step, *args, use_reentrant=False)  # type: ignore[misc]
+            
+            emb_slice = cont.emb_n[:, m0:m1]
+            crd_slice = cont.crd_n[:, m0:m1]
+            sig_slice = cont.sig_n[:, m0:m1]
+            msk_slice = cont.msk_n[:, m0:m1]
+            
+            args = (
+                self._biasterm,
+                self._omegafrq,
+                emb_slice,
+                crd_slice,
+                sig_slice,
+                msk_slice,
+                eps,
+                self._lambda_1,
+                self._lambda_5
+            )
+            
+            step_feat, step_chem = checkpoint(self._step1_fn, *args, use_reentrant=False)  # type: ignore[misc]
             features = features + step_feat
             chem_env = chem_env + step_chem
 
         return cont._replace(features=features, chem_env=chem_env)
+
+    @staticmethod
+    def _step2(
+        biasterm: nn.Parameter,
+        rms_norm: nn.RMSNorm,
+        proj_agg: nn.Linear,
+        sigbilin: nn.Bilinear,
+        omegafrq: torch.Tensor,
+        embslice: torch.Tensor, 
+        crdslice: torch.Tensor, 
+        sigslice: torch.Tensor, 
+        mskslice: torch.Tensor,
+        ffsslice: torch.Tensor,
+        features: torch.Tensor,
+        chem_env: torch.Tensor,
+        epsilon_: float,
+        q_points: int,
+        lambda_1: int,
+        lambda_5: int
+        ):
+
+        # recompute φ_m for this M-chunk (same as _pass_1, but now chem_env is complete)
+        scaled_coords = crdslice.unsqueeze(-2) / sigslice.clamp(min=epsilon_) # (Nc, mc, Q, 3)
+        proj = scaled_coords @ omegafrq.T + biasterm # (Nc, mc, Q, λ₅)
+        zrff = (2/lambda_5) ** 0.5 * cos(proj) # (Nc, mc, Q, λ₅)
+        mask = mskslice.unsqueeze(-1).unsqueeze(-1) # (Nc, mc, 1, 1)
+        zrff = zrff * mask
+
+        # locality_m = φ_m · chem_env ≈ Σ_{m'} k(r̃_m, r̃_{m'}) · e_{m'}
+        # neighbourhood embedding for each atom: weighted sum of all other atoms' embeddings.
+        # Same bmm trick as _pass_1: avoids (Nc, mc, Q, λ₅, λ₁) intermediate.
+        Nc, mc, Q = zrff.shape[0], zrff.shape[1], zrff.shape[2]
+        zb        = zrff.permute(0, 2, 1, 3).reshape(Nc * Q, mc, lambda_5)  # (Nc*Q, mc, λ₅); query features
+        cb        = chem_env.reshape(Nc * Q, lambda_5, lambda_1) # (Nc*Q, λ₅, λ₁); accumulated context
+
+        # locality: (Nc, mc, Q, λ₁); approximate kernel-weighted neighbour embedding sum
+        locality = torch.bmm(zb, cb).reshape(Nc, Q, mc, lambda_1).permute(0, 2, 1, 3)
+
+        # weights_m = |φ_m · features| ≈ Σ_{m'} k(r̃_m, r̃_{m'})
+        # denominator for the normalised average: total kernel weight seen by atom m.
+        # abs() because cosine RFF features can be negative, making the dot product negative.
+        # clamp(min=eps): avoids 0/0 in both forward and backward (nan_to_num only fixes
+        # the forward value but still produces grad/0 = NaN during backward).
+        weights = torch.einsum('nmqd, nqd -> nmq', zrff, features).abs() # (Nc, mc, Q)
+
+        # normalised aggregate: kernel-weighted average of neighbour embeddings
+        agg = rms_norm(locality / weights.unsqueeze(-1).clamp(min=epsilon_)) # (Nc, mc, Q, λ₁)
+
+        # MishGLU gate: one linear projects to 2λ₁, split into value p1 and gate p2.
+        # gate = p1 · Mish(p2) selectively passes neighbourhood signal into the residual stream.
+        p1, p2 = proj_agg(agg).chunk(2, dim=-1) # each (Nc, mc, Q, λ₁)
+        gate   = p1 * F.mish(p2) * mask               # (Nc, mc, Q, λ₁)
+
+        # residual update
+        new_emb = embslice + gate       
+
+        # sigma update: tanhshrink(x) = x - tanh(x) is near-zero for small x ("sticky" -
+        # sigma barely moves when the bilinear output is small) and grows linearly for large x.
+        # softplus keeps σ strictly positive.
+        f_in    = ffsslice.transpose(-1, -2).expand(-1, -1, q_points, -1)
+        new_sig = F.softplus(sigslice + F.tanhshrink(sigbilin(new_emb, f_in)))
+
+        return new_emb, new_sig
 
     def _pass_2(self, cont: _PassContainer, eps: float) -> _PassContainer:
 
@@ -209,64 +304,40 @@ Pass 2; per-atom update using the accumulated context:
         all others despite M-chunking (all-pairs coverage is preserved).
         """
 
-        def _step(emb_slice, ffs_slice, sig_slice, crd_slice, msk_slice):
-
-            # recompute φ_m for this M-chunk (same as _pass_1, but now chem_env is complete)
-            scaled_coords = crd_slice.unsqueeze(-2) / sig_slice.clamp(min=eps) # (Nc, mc, Q, 3)
-            proj = scaled_coords @ self._omegafrq.T + self._biasterm           # (Nc, mc, Q, λ₅)
-            zrff = (2/self._lambda_5) ** 0.5 * cos(proj)                       # (Nc, mc, Q, λ₅)
-            mask = msk_slice.unsqueeze(-1).unsqueeze(-1)                       # (Nc, mc, 1, 1)
-            zrff = zrff * mask
-
-            # locality_m = φ_m · chem_env ≈ Σ_{m'} k(r̃_m, r̃_{m'}) · e_{m'}
-            # neighbourhood embedding for each atom: weighted sum of all other atoms' embeddings.
-            # Same bmm trick as _pass_1: avoids (Nc, mc, Q, λ₅, λ₁) intermediate.
-            Nc, mc, Q = zrff.shape[0], zrff.shape[1], zrff.shape[2]
-            zb        = zrff.permute(0, 2, 1, 3).reshape(Nc * Q, mc, self._lambda_5)  # (Nc*Q, mc, λ₅); query features
-            cb        = cont.chem_env.reshape(Nc * Q, self._lambda_5, self._lambda_1) # (Nc*Q, λ₅, λ₁); accumulated context
-
-            # locality: (Nc, mc, Q, λ₁); approximate kernel-weighted neighbour embedding sum
-            locality = torch.bmm(zb, cb).reshape(Nc, Q, mc, self._lambda_1).permute(0, 2, 1, 3)
-
-            # weights_m = |φ_m · features| ≈ Σ_{m'} k(r̃_m, r̃_{m'})
-            # denominator for the normalised average: total kernel weight seen by atom m.
-            # abs() because cosine RFF features can be negative, making the dot product negative.
-            # clamp(min=eps): avoids 0/0 in both forward and backward (nan_to_num only fixes
-            # the forward value but still produces grad/0 = NaN during backward).
-            weights = torch.einsum('nmqd, nqd -> nmq', zrff, cont.features).abs() # (Nc, mc, Q)
-
-            # normalised aggregate: kernel-weighted average of neighbour embeddings
-            agg = self._rms_norm(locality / weights.unsqueeze(-1).clamp(min=eps)) # (Nc, mc, Q, λ₁)
-
-            # MishGLU gate: one linear projects to 2λ₁, split into value p1 and gate p2.
-            # gate = p1 · Mish(p2) selectively passes neighbourhood signal into the residual stream.
-            p1, p2 = self._proj_agg(agg).chunk(2, dim=-1) # each (Nc, mc, Q, λ₁)
-            gate   = p1 * F.mish(p2) * mask               # (Nc, mc, Q, λ₁)
-
-            # residual update
-            new_emb = emb_slice + gate       
-
-            # sigma update: tanhshrink(x) = x - tanh(x) is near-zero for small x ("sticky" -
-            # sigma barely moves when the bilinear output is small) and grows linearly for large x.
-            # softplus keeps σ strictly positive.
-            f_in    = ffs_slice.transpose(-1, -2).expand(-1, -1, self._q_points, -1)
-            new_sig = F.softplus(sig_slice + F.tanhshrink(self._sigbilin(new_emb, f_in)))
-
-            return new_emb, new_sig
-
         new_emb_m = []
         new_sig_m = []
 
         for m0 in range(0, cont.M, cont.Mchnk):
             m1 = min(m0 + cont.Mchnk, cont.M)
+            
+            emb_slice = cont.emb_n[:, m0:m1]
+            ffs_slice = cont.ffs_n[:, m0:m1]
+            sig_slice = cont.sig_n[:, m0:m1]
+            crd_slice = cont.crd_n[:, m0:m1]
+            msk_slice = cont.msk_n[:, m0:m1]
+            cont_feat = cont.features
+            cont_chnv = cont.chem_env 
+            
             args = (
-                cont.emb_n[:, m0:m1], 
-                cont.ffs_n[:, m0:m1], 
-                cont.sig_n[:, m0:m1], 
-                cont.crd_n[:, m0:m1], 
-                cont.msk_n[:, m0:m1]
+                self._biasterm,
+                self._rms_norm,
+                self._proj_agg,
+                self._sigbilin,
+                self._omegafrq,
+                emb_slice,
+                crd_slice,
+                sig_slice,
+                msk_slice,
+                ffs_slice,
+                cont_feat,
+                cont_chnv,
+                eps,
+                self._q_points,
+                self._lambda_1,
+                self._lambda_5
             )
-            emb_c, sig_c = checkpoint(_step, *args, use_reentrant=False)  # type: ignore[misc]
+
+            emb_c, sig_c = checkpoint(self._step2_fn, *args, use_reentrant=False)  # type: ignore[misc]
             new_emb_m.append(emb_c)
             new_sig_m.append(sig_c)
 

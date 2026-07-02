@@ -82,6 +82,8 @@ class RunConfig:
                     0 (default) = always TP, matching pre-existing behaviour. Eval/test always
                     use TP regardless of this threshold (evaluate() relies on both ranks seeing
                     identical full-batch outputs).
+    compile:        If True, torch.compile the checkpointed step functions in Embed, MessagePass,
+                    and OutputHead (fullgraph=True, dynamic=True). False (default) runs them eager.
     eps_embd:       Numerical floor in the Embed module (avoids division by zero).
     eps_msgp:       Numerical floor in MessagePass sigma clamping and aggregate denominator.
 
@@ -148,6 +150,7 @@ class RunConfig:
     atm_chunk:      int            = 1024
     mol_chunk:      int            = 32
     dp_atom_threshold: int         = 0         # 0 = always TP (old behaviour); see docstring above
+    compile:        bool           = False     # torch.compile Embed/MessagePass/OutputHead's checkpointed step functions
     eps_embd:       float          = 1e-8
     eps_msgp:       float          = 1e-3
 
