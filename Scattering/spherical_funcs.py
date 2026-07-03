@@ -18,17 +18,24 @@ def sphHarm(
 
     Negative-m modes are omitted - recover them via Y_l^{-m} = (-1)^m · conj(Y_l^m).
 
-    Args:
-        lMax:  Maximum degree. Must be non-negative.
-        theta: Polar colatitudinal angles (0→π), shape (N,).
-        phi:   Azimuthal angles (0→2π), shape (N,).
+    Parameters
+    ----------
+    lMax : int
+        Maximum degree. Must be non-negative.
+    theta : ndarray of float64, shape (N,)
+        Polar colatitudinal angles (0→π).
+    phi : ndarray of float64, shape (N,)
+        Azimuthal angles (0→2π).
 
-    Returns:
-        Y: shape ((lMax+1)*(lMax+2)//2, N). Y[k, i] = Y_l^m(theta[i], phi[i])
-        where k = l*(l+1)//2 + m.
+    Returns
+    -------
+    ndarray of complex128, shape ((lMax+1)*(lMax+2)//2, N)
+        Y[k, i] = Y_l^m(theta[i], phi[i]) where k = l*(l+1)//2 + m.
 
-    Raises:
-        ValueError: If inputs are invalid.
+    Raises
+    ------
+    ValueError
+        If lMax is negative, or if theta and phi do not share shape or are empty.
     """
     if lMax < 0:
         raise ValueError("sphHarm: lMax must be non-negative")
@@ -52,16 +59,24 @@ def sphBess(
 
     For reference, j_0(x) = sin(x)/x (the Debye kernel).
 
-    Args:
-        q:    Scattering vector magnitudes (Å⁻¹), shape (Q,). All non-negative.
-        lMax: Maximum order. Must be non-negative.
-        r:    Atom radial distances (Å), shape (N,). All non-negative.
+    Parameters
+    ----------
+    q : ndarray of float64, shape (Q,)
+        Scattering vector magnitudes (Å⁻¹). All non-negative.
+    lMax : int
+        Maximum order. Must be non-negative.
+    r : ndarray of float64, shape (N,)
+        Atom radial distances (Å). All non-negative.
 
-    Returns:
-        Array of shape (lMax+1, Q, N) - entry [l, k, i] is j_l(q_k · r_i).
+    Returns
+    -------
+    ndarray of float64, shape (lMax+1, Q, N)
+        Entry [l, k, i] is j_l(q_k · r_i).
 
-    Raises:
-        ValueError: If inputs are invalid.
+    Raises
+    ------
+    ValueError
+        If q or r is empty, lMax is negative, or q or r contains negative values.
     """
     if r.size == 0:
         raise ValueError("sphBess: r cannot be empty")

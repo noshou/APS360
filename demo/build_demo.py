@@ -14,10 +14,25 @@ from scipy.special import sph_harm_y
 from global_vals import *
 
 def sh_proj(full_coeffs, Y_grid, THETA, PHI):
-    """Reconstruct angular scattering surface r = 1 + Re(Σ B_lm Y_lm) in Cartesian coordinates.
+    """Reconstruct the angular scattering surface r = 1 + Re(Σ B_lm Y_lm) in Cartesian coordinates.
 
-    full_coeffs: (K,) complex128, full (l,m) layout, k = l²+l+m.
-    Y_grid:      (K, H, W) complex128, precomputed spherical harmonics on the meshgrid.
+    Parameters
+    ----------
+    full_coeffs : ndarray of complex128, shape (K,)
+        Spherical-harmonic coefficients in the full (l, m) layout, where
+        k = l**2 + l + m.
+    Y_grid : ndarray of complex128, shape (K, H, W)
+        Precomputed spherical harmonics evaluated on the (THETA, PHI) meshgrid.
+    THETA : ndarray of float, shape (H, W)
+        Polar angle meshgrid.
+    PHI : ndarray of float, shape (H, W)
+        Azimuthal angle meshgrid.
+
+    Returns
+    -------
+    tuple of ndarray
+        `(x, y, z)` Cartesian coordinate arrays, each shape (H, W), of the
+        reconstructed surface.
     """
     f = np.tensordot(full_coeffs, Y_grid, axes=([0], [0]))  # (H, W)
     r = 1.0 + np.real(f)
@@ -45,7 +60,21 @@ for l in range(lMax + 1):
             _full_sign[k_full] = (-1) ** abs_m
 
 def expand_coeffs(B_lm_q):
-    """Expand reduced m≥0 coeffs to full (l,m) layout, returning (K,) complex array."""
+    """Expand reduced m >= 0 coefficients to the full (l, m) layout.
+
+    Parameters
+    ----------
+    B_lm_q : ndarray of complex128, shape (K_reduced,)
+        Spherical-harmonic coefficients for a single q-value, stored only
+        for m >= 0 using the reduced index `l*(l+1)//2 + abs(m)`.
+
+    Returns
+    -------
+    ndarray of complex128, shape (K,)
+        Coefficients expanded to the full (l, m) layout (k = l**2 + l + m),
+        with negative-m entries filled in via the conjugate symmetry
+        `B_l,-m = (-1)**m * conj(B_l,m)`.
+    """
     full = B_lm_q[_full_to_reduced].copy()
     neg_mask = _full_sign < 0
     full[neg_mask] = _full_sign[neg_mask] * np.conj(full[neg_mask])

@@ -15,11 +15,39 @@ _ff:   FormFactors | None = None
 _lMax: int | None         = None
 
 def _worker_init(ff: FormFactors, lMax: int) -> None:
+    """Initialize per-worker globals so `ff` and `lMax` are not repickled per task.
+
+    Parameters
+    ----------
+    ff : FormFactors
+        Precomputed form factors, shared by all tasks in this worker process.
+    lMax : int
+        Maximum spherical harmonic degree used by `_process_mol`.
+
+    Returns
+    -------
+    None
+    """
     global _ff, _lMax
     _ff   = ff
     _lMax = lMax
 
 def _process_mol(xyz_path: str) -> tuple[str, np.ndarray, Molecule] | None:
+    """Load one XYZ file and compute its Stuhrmann-decomposed scattering intensity.
+
+    Parameters
+    ----------
+    xyz_path : str
+        Path to the molecule's .xyz file.
+
+    Returns
+    -------
+    tuple of (str, numpy.ndarray, Molecule) or None
+        ``(stem, I_q, mol)`` where `stem` is the filename without extension
+        and directory, `I_q` is the orientationally-averaged scattering
+        intensity, and `mol` is the parsed `Molecule`. Returns None if
+        parsing or the Stuhrmann computation raises any exception.
+    """
     assert _ff is not None and _lMax is not None
     try:
         mol = Molecule.fromXYZ(xyz_path)
@@ -39,19 +67,28 @@ def loadFormFact(
     log_path: str | None = None,
     ) -> FormFactors:
 
-    """
-    Builds a FormFactors object from a makeup TSV of ion symbols.
+    """Build a FormFactors object from a makeup TSV of ion symbols.
 
-    Args:
-        makeup_tsv: Path to a tab-separated file with a column of ion symbols (e.g. 'C', 'Fe2+').
-        energy:     X-ray energy in eV. Default 12.5 keV.
-        qMax:       Maximum momentum transfer in Å⁻¹.
-        qMin:       Minimum momentum transfer in Å⁻¹.
-        step:       q-grid step size in Å⁻¹.
-        col_name:   Name of the column in makeup_tsv containing ion symbols.
-        log_path:   Optional path for logging skipped ions; passed through to FormFactors.fromIons.
+    Parameters
+    ----------
+    makeup_tsv : str
+        Path to a tab-separated file with a column of ion symbols (e.g. 'C', 'Fe2+').
+    energy : int or float, optional
+        X-ray energy in eV. Default 12.5 keV.
+    qMax : int or float, optional
+        Maximum momentum transfer in Å⁻¹.
+    qMin : int or float, optional
+        Minimum momentum transfer in Å⁻¹.
+    step : float, optional
+        q-grid step size in Å⁻¹.
+    col_name : str, optional
+        Name of the column in `makeup_tsv` containing ion symbols.
+    log_path : str or None, optional
+        Optional path for logging skipped ions; passed through to `FormFactors.fromIons`.
 
-    Returns:
+    Returns
+    -------
+    FormFactors
         FormFactors with precomputed complex form factors over the q grid.
     """
 
@@ -69,8 +106,7 @@ def buildDB(
     workers: int | None     = None,
     ) -> None:
 
-    """
-    Compute Stuhrmann decompositions for all XYZ files and write to an HDF5 database.
+    """Compute Stuhrmann decompositions for all XYZ files and write to an HDF5 database.
 
     Molecule computation is parallelized across `workers` processes; HDF5 writes
     are serialized on the main process (h5py is not concurrency-safe for writes).
@@ -95,14 +131,26 @@ def buildDB(
     uint8 TSV blobs use Bitshuffle+Zstd (ZFP is float-only). `elms` is stored
     uncompressed as a variable-length string dataset.
 
-    Args:
-        groups:      Dict mapping group name to directory of .xyz files.
-        ff:          Precomputed FormFactors; must contain all ions present in the XYZ files.
-        lMax:        Maximum spherical harmonic degree. Runtime scales as O((lMax+1)²) per molecule.
-        out_path:    Output path for the HDF5 file.
-        sources_tsv: Optional path to a provenance TSV to embed verbatim in the database.
-        makeup_tsv:  Optional path to the ion makeup TSV to embed verbatim in the database.
-        workers:     Number of worker processes. Defaults to os.cpu_count().
+    Parameters
+    ----------
+    groups : dict of str to str
+        Dict mapping group name to directory of .xyz files.
+    ff : FormFactors
+        Precomputed FormFactors; must contain all ions present in the XYZ files.
+    lMax : int
+        Maximum spherical harmonic degree. Runtime scales as O((lMax+1)^2) per molecule.
+    out_path : str
+        Output path for the HDF5 file.
+    sources_tsv : str or None, optional
+        Optional path to a provenance TSV to embed verbatim in the database.
+    makeup_tsv : str or None, optional
+        Optional path to the ion makeup TSV to embed verbatim in the database.
+    workers : int or None, optional
+        Number of worker processes. Defaults to os.cpu_count().
+
+    Returns
+    -------
+    None
     """
 
     # ZFP lossless for floating-point data; bitshuffle+Zstd for metadata (uint8 not ZFP-compatible).
@@ -170,7 +218,7 @@ def buildDB(
                     try:
                         mol_grp = hf_group[key]
                         for ds in ('I_q', 'coords', 'angles', 'r', 'elms'):
-                            mol_grp[ds][()]
+                            mol_grp[ds][()] #type: ignore
                         already_done.add(key)
                     except Exception:
                         del hf_group[key]
@@ -212,12 +260,12 @@ def buildDB(
                             tmp.create_dataset('I_q', data=I_q, chunks=True, **data_compress)
                             mol.toHDF5(tmp)
                             # Read back chunk data to verify it landed before committing.
-                            _n = tmp['coords'].shape[0]
-                            assert (tmp['I_q'][()].shape    == (_Q,)
-                                and tmp['coords'][()].shape == (_n, 3)
-                                and tmp['angles'][()].shape == (_n, 2)
-                                and tmp['r'][()].shape      == (_n,)
-                                and len(tmp['elms'][()])    == _n)
+                            _n = tmp['coords'].shape[0]                # type: ignore 
+                            assert (tmp['I_q'][()].shape    == (_Q,)   # type: ignore
+                                and tmp['coords'][()].shape == (_n, 3) # type: ignore
+                                and tmp['angles'][()].shape == (_n, 2) # type: ignore  
+                                and tmp['r'][()].shape      == (_n,)   # type: ignore
+                                and len(tmp['elms'][()])    == _n)     # type: ignore 
                             hf.move(f'{group_name}/{tmp_name}', f'{group_name}/{stem}')
                         except Exception:
                             if tmp_name in hf_group:

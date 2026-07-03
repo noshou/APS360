@@ -9,9 +9,8 @@ from .vocab import VOCAB
 import os
 
 class Encoding:
-    
-    """
-    Singleton that builds and queries the molecule encoding database.
+
+    """Singleton that builds and queries the molecule encoding database.
 
     On first construction, reads every molecule from an HDF5 file, maps each
     atom's element string to an integer VOCAB index, and persists the results
@@ -22,12 +21,12 @@ class Encoding:
     ``get_in_range(min, max)`` to retrieve all molecules whose atom count falls
     in a size bucket, then let ``Batcher`` accumulate rows until the total
     atom count would exceed ``atom_size_ceil`` and split there.
-    
-    Usage:
-    ``` from Preprocess import encode
-        encode("my_dataset", "I(q)@L=50.h5")
-        # writes my_dataset-ENCODING.sqlite3
-    ```
+
+    Examples
+    --------
+    >>> from Preprocess import encode
+    >>> encode("my_dataset", "I(q)@L=50.h5")
+    # writes my_dataset-ENCODING.sqlite3
     """
 
     _CHARGE_RE = re.compile(r'[0-9]*[+\-]+$')
@@ -51,6 +50,20 @@ class Encoding:
     _instance = None
 
     def __new__(cls, *args, **kwargs):
+        """Return the shared singleton instance, creating it on first call.
+
+        Parameters
+        ----------
+        *args : tuple
+            Positional arguments forwarded to `__init__` (unused here).
+        **kwargs : dict
+            Keyword arguments forwarded to `__init__` (unused here).
+
+        Returns
+        -------
+        Encoding
+            The single shared `Encoding` instance.
+        """
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
@@ -59,9 +72,12 @@ class Encoding:
     def __init__(self, db_name: str, hdf5_path: str):
         """Build or reuse the encoding database.
 
-        Args:
-            db_name:    base name for the output file; produces ``<db_name>-ENCODING.sqlite3``.
-            hdf5_path:  path to the source HDF5 file produced by the preprocessing pipeline.
+        Parameters
+        ----------
+        db_name : str
+            Base name for the output file; produces ``<db_name>-ENCODING.sqlite3``.
+        hdf5_path : str
+            Path to the source HDF5 file produced by the preprocessing pipeline.
         """
 
         _DBPATH = f"{db_name}-ENCODING.sqlite3"
@@ -124,6 +140,19 @@ class Encoding:
 
     @beartype
     def _bare(self, _ion: str) -> str:
+        """Strip charge suffixes and normalize special-case ion aliases.
+
+        Parameters
+        ----------
+        _ion : str
+            Raw ion symbol, possibly with a trailing charge (e.g. 'Fe2+').
+
+        Returns
+        -------
+        str
+            Lowercase bare element symbol, with 'cval'/'siva' remapped to
+            'c'/'si' and any charge suffix removed.
+        """
         ion = _ion.strip()
         if ion.lower() == 'cval':
             return 'c'
@@ -134,14 +163,57 @@ class Encoding:
 
     @beartype
     def _adapt_array(self, lst: list) -> str:
+        """Serialize a list to a JSON string for SQLite storage.
+
+        Parameters
+        ----------
+        lst : list
+            List to serialize.
+
+        Returns
+        -------
+        str
+            JSON-encoded representation of `lst`.
+        """
         return json.dumps(lst)
 
     @beartype
     def _convert_array(self, text: bytes) -> list:
+        """Deserialize a JSON-encoded SQLite column back into a list.
+
+        Parameters
+        ----------
+        text : bytes
+            UTF-8 encoded JSON bytes read from the database.
+
+        Returns
+        -------
+        list
+            The decoded list.
+        """
         return json.loads(text.decode("utf-8"))
-    
+
     @beartype
     def _encode_ions(self, ions: List[str]) -> List[int]:
+        """Map a list of ion symbols to their 1-based VOCAB indices.
+
+        Parameters
+        ----------
+        ions : list of str
+            Ion symbols for each atom in a molecule, in atom order.
+
+        Returns
+        -------
+        list of int
+            VOCAB index for each ion, in the same order as `ions`.
+
+        Raises
+        ------
+        LookupError
+            If an ion symbol (and its bare form) is not found in VOCAB.
+        ValueError
+            If `ions` is empty.
+        """
         enc: List[int] = []
         for ion in ions:
             key = ion.lower().strip()
@@ -161,12 +233,17 @@ class Encoding:
         Results are ordered by atom count ascending so a caller can greedily
         accumulate rows and split when a running total exceeds a ceiling.
 
-        Args:
-            min_atoms:  lower bound (inclusive).
-            max_atoms:  upper bound (inclusive).
+        Parameters
+        ----------
+        min_atoms : int
+            Lower bound (inclusive).
+        max_atoms : int
+            Upper bound (inclusive).
 
-        Returns:
-            List of ``(grp, stem, atoms, VOCAB_idx)`` tuples.  ``grp`` and
+        Returns
+        -------
+        list of tuple of (str, str, int, list of int)
+            ``(grp, stem, atoms, VOCAB_idx)`` tuples.  ``grp`` and
             ``stem`` are the HDF5 keys needed to load tensor data via
             ``f[grp][stem]``.  ``VOCAB_idx`` is the list of integer VOCAB
             indices for each atom in the molecule.
@@ -190,7 +267,20 @@ class Encoding:
 
     @beartype
     def get_meta_in_range(self, min_atoms: int, max_atoms: int) -> List[Tuple[str, str, int]]:
-        """Like get_in_range but omits VOCAB_idx, for lazy loading pipelines."""
+        """Like get_in_range but omits VOCAB_idx, for lazy loading pipelines.
+
+        Parameters
+        ----------
+        min_atoms : int
+            Lower bound (inclusive).
+        max_atoms : int
+            Upper bound (inclusive).
+
+        Returns
+        -------
+        list of tuple of (str, str, int)
+            ``(grp, stem, atoms)`` tuples ordered by atom count ascending.
+        """
         _QUERY = """
             SELECT grp, stem, atoms
             FROM items
@@ -207,7 +297,13 @@ class Encoding:
         return results
 
     def max_atom_count(self) -> int:
-        """Return the largest atom count across all molecules in the database."""
+        """Return the largest atom count across all molecules in the database.
+
+        Returns
+        -------
+        int
+            Maximum value of the ``atoms`` column, cached after first computation.
+        """
         if hasattr(self, "_max") and self._max is not None:
             return self._max
         conn = sqlite3.connect(self._path)
@@ -219,7 +315,13 @@ class Encoding:
         return self._max
     
     def count(self) -> int:
-        """Return the total number of molecules in dataset"""
+        """Return the total number of molecules in the dataset.
+
+        Returns
+        -------
+        int
+            Row count of the ``items`` table.
+        """
         conn = sqlite3.connect(self._path)
         try:
             return conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]

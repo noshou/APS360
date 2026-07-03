@@ -9,6 +9,18 @@ from dataclasses import dataclass, field
 # Used for xraydb functions that don't accept ionic notation (f1/f2, chantler_energies)
 _CHARGE_RE = re.compile(r'[0-9]*[+\-]+$')
 def _bare(ion: str) -> str:
+    """Strip trailing charge notation from an ion symbol.
+
+    Parameters
+    ----------
+    ion : str
+        Ion symbol, possibly with charge notation (e.g. ``'Mn2+'``, ``'Na+'``).
+
+    Returns
+    -------
+    str
+        Bare element symbol with charge notation removed (e.g. ``'Mn'``, ``'Na'``).
+    """
     return _CHARGE_RE.sub('', ion)
 
 @dataclass(frozen=True)
@@ -50,6 +62,12 @@ class FormFactors:
     # xraydb.f1_chantler returns f'(E) only - NOT Z+f' - so no subtraction of f0(0).
 
     def __post_init__(self) -> None:
+        """Make the qvals and ff arrays read-only and build the ion index map.
+
+        Returns
+        -------
+        None
+        """
         self.qvals.flags.writeable = False
         for arr in self.ff.values():
             arr.flags.writeable = False

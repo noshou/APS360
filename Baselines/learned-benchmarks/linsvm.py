@@ -1,0 +1,234 @@
+import torch
+import numpy as np
+
+from collections.abc              import Iterable
+from jaxtyping                    import Float, jaxtyped
+from beartype                     import beartype
+from sklearn.preprocessing        import StandardScaler
+from sklearn.kernel_approximation import Nystroem
+from sklearn.svm                  import LinearSVR
+from ScatterNet.batching          import Batch
+from Preprocess                   import VOCAB
+from Baselines.baseline           import Baseline
+
+
+def _median_heuristic_gamma(
+    X:            np.ndarray,
+    sample_size:  int = 1000,
+    random_state: int = 0,
+) -> float:
+    """Estimate an RBF gamma from the data via the median pairwise-distance heuristic.
+
+    The RBF kernel is ``exp(-gamma * ||x - x'||**2)``: gamma controls how
+    quickly similarity decays with distance. A large gamma makes each point
+    influence only a tiny neighborhood (the kernel degenerates toward a
+    nearest-neighbor lookup and overfits); a small gamma makes distant
+    points still look similar (the kernel degenerates toward a constant
+    function and underfits). A fixed gamma picked in advance (e.g. 0.1)
+    only happens to be reasonable for one particular feature scale. This
+    instead derives gamma from the training data itself: it samples pairs
+    of feature rows, takes the median squared Euclidean distance between
+    them, and inverts it, so the kernel's "reach" self-adjusts to whatever
+    scale the features actually have after standardization.
+
+    Parameters
+    ----------
+    X : numpy.ndarray
+        Feature matrix, shape ``(n_samples, n_features)``, already scaled.
+    sample_size : int, optional
+        Number of rows to subsample for the pairwise-distance estimate, by
+        default 1000.
+    random_state : int, optional
+        Seed for the row subsample, by default 0.
+
+    Returns
+    -------
+    float
+        Estimated gamma. Falls back to 1.0 if every sampled pairwise
+        distance is zero (degenerate/constant features).
+    """
+    rng    = np.random.default_rng(random_state)
+    n      = X.shape[0]
+    idx    = rng.choice(n, size=min(sample_size, n), replace=False)
+    sample = X[idx]
+
+    sq_dists       = np.sum((sample[:, None, :] - sample[None, :, :]) ** 2, axis=-1)
+    triu           = sq_dists[np.triu_indices_from(sq_dists, k=1)]
+    median_sq_dist = np.median(triu)
+
+    return float(1.0 / median_sq_dist) if median_sq_dist > 0 else 1.0
+
+
+class Linsvm(Baseline):
+    """
+    Learned baseline: per-q LinearSVR over Nystroem-approximated RBF features.
+
+    Pools each molecule down to a fixed feature vector (per-element
+    composition fractions, atom count, and radius of gyration), standardizes
+    it, then maps it through a Nystroem approximation of the RBF kernel so a
+    fast linear model can still capture nonlinear structure without ever
+    building the O(n^2) kernel matrix a plain kernel SVR would need on a
+    900,000-molecule training set. A separate LinearSVR head is trained per
+    q-point on top of the shared Nystroem features. Runs entirely on CPU.
+    The RBF gamma used by Nystroem is estimated from the training data
+    (median pairwise-distance heuristic) rather than fixed in advance, so a
+    poor guess at gamma doesn't silently cripple the whole baseline - see
+    ``_median_heuristic_gamma`` for what gamma actually controls.
+    """
+
+    def __init__(
+        self,
+        n_components: int          = 500,
+        gamma:        float | None = None,
+        random_state: int          = 4209,
+    ) -> None:
+        """Store hyperparameters; the pipeline itself is built in ``fit``.
+
+        Parameters
+        ----------
+        n_components : int, optional
+            Number of Nystroem landmark features, by default 500.
+        gamma : float or None, optional
+            RBF kernel gamma. If None (default), it is estimated from the
+            training features via the median pairwise-distance heuristic
+            instead of being fixed in advance.
+        random_state : int, optional
+            Seed for Nystroem's landmark sampling, the gamma heuristic's
+            subsample, and the LinearSVR heads, by default 4209.
+
+        Returns
+        -------
+        None
+        """
+        self._n_components = n_components
+        self._gamma         = gamma
+        self._random_state  = random_state
+
+        self._scaler:   StandardScaler | None = None
+        self._nystroem: Nystroem       | None = None
+        self._heads:    list[LinearSVR]       = []
+
+    def _molecule_features(self, batch: Batch) -> np.ndarray:
+        """Compute a fixed-size feature vector per molecule in a batch.
+
+        Parameters
+        ----------
+        batch : Batch
+            Batch of molecules.
+
+        Returns
+        -------
+        numpy.ndarray
+            Feature matrix of shape ``(N, len(VOCAB) + 3)``: per-element
+            composition fractions, atom count, and radius of gyration.
+        """
+        N, M = batch.vocab.shape
+        V    = len(VOCAB) + 1
+
+        mask     = batch.padding_mask().float()
+        counts   = torch.zeros(N, V).scatter_add_(
+            1, batch.vocab.long(), torch.ones(N, M)
+        )
+        counts[:, 0] = 0.0
+        n_atoms      = counts.sum(dim=1, keepdim=True).clamp(min=1)
+        fractions    = counts / n_atoms
+
+        r2  = (batch.coord ** 2).sum(dim=-1)
+        rg2 = (r2 * mask).sum(dim=1, keepdim=True) / n_atoms
+        rg  = rg2.clamp(min=0).sqrt()
+
+        feats = torch.cat([fractions, n_atoms, rg], dim=1)
+        return feats.cpu().numpy()
+
+    def fit(self, loader: Iterable[Batch]) -> "Linsvm":
+        """Fit the scaler, Nystroem transform, and one LinearSVR per q-point.
+
+        Parameters
+        ----------
+        loader : Iterable[Batch]
+            Iterable of training batches.
+
+        Returns
+        -------
+        Linsvm
+            This instance, with a fitted pipeline.
+
+        Raises
+        ------
+        RuntimeError
+            If the loader yields no batches (empty training set).
+        """
+        X_parts: list[np.ndarray] = []
+        Y_parts: list[np.ndarray] = []
+
+        for batch in loader:
+            X_parts.append(self._molecule_features(batch))
+            Y_parts.append(torch.log1p(batch.iqval).cpu().numpy())
+
+        if not X_parts:
+            raise RuntimeError("fit() received an empty loader")
+
+        X = np.concatenate(X_parts, axis=0)
+        Y = np.concatenate(Y_parts, axis=0)  # (n_samples, Q)
+
+        self._scaler = StandardScaler().fit(X)
+        X_scaled     = self._scaler.transform(X)
+
+        gamma = (
+            self._gamma if self._gamma is not None
+            else _median_heuristic_gamma(X_scaled, random_state=self._random_state)
+        )
+
+        self._nystroem = Nystroem(
+            kernel       = "rbf",
+            gamma        = gamma,
+            n_components = self._n_components,
+            random_state = self._random_state,
+        ).fit(X_scaled)
+        X_transformed = self._nystroem.transform(X_scaled)
+
+        self._heads = []
+        for q in range(Y.shape[1]):
+            head = LinearSVR(
+                dual         = False,
+                loss         = "squared_epsilon_insensitive",
+                random_state = self._random_state,
+            )
+            head.fit(X_transformed, Y[:, q])
+            self._heads.append(head)
+
+        return self
+
+    @jaxtyped(typechecker=beartype)
+    def __call__(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:
+        """Predict I(q) for a batch of molecules.
+
+        Parameters
+        ----------
+        batch : Batch
+            Batch of molecules to predict scattering curves for.
+
+        Returns
+        -------
+        torch.Tensor
+            Predicted I(q) curves of shape ``(N, Q)``, on the same device
+            as the input batch.
+
+        Raises
+        ------
+        RuntimeError
+            If called before ``fit`` has been run.
+        """
+        if self._scaler is None or self._nystroem is None or not self._heads:
+            raise RuntimeError("Linsvm must be fit before calling")
+
+        device = batch.vocab.device
+        X             = self._molecule_features(batch)
+        X_scaled      = self._scaler.transform(X)
+        X_transformed = self._nystroem.transform(X_scaled)
+
+        log_preds = np.stack(
+            [head.predict(X_transformed) for head in self._heads], axis=1
+        )  # (N, Q), in log1p space
+        pred = torch.from_numpy(np.expm1(log_preds)).float().to(device)
+        return pred

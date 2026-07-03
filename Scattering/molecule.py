@@ -40,16 +40,24 @@ class Molecule(StuhrmannMixin):
         """
         Initialize a Molecule from Cartesian coordinates.
 
-        Args:
-            x:    x-coordinates of atoms in Å (1D array).
-            y:    y-coordinates of atoms in Å (1D array).
-            z:    z-coordinates of atoms in Å (1D array).
-            elms: Element symbols for each atom, e.g. ['C', 'N', 'O'].
-            name: Human-readable name of the molecule.
+        Parameters
+        ----------
+        x : ndarray of float64
+            x-coordinates of atoms in Å (1D array).
+        y : ndarray of float64
+            y-coordinates of atoms in Å (1D array).
+        z : ndarray of float64
+            z-coordinates of atoms in Å (1D array).
+        elms : list of str
+            Element symbols for each atom, e.g. ``['C', 'N', 'O']``.
+        name : str
+            Human-readable name of the molecule.
 
-        Raises:
-            ValueError: If x, y, z and elms are not all the same length, if
-                        the arrays are empty, or if any atom lies at the origin (r = 0).
+        Raises
+        ------
+        ValueError
+            If x, y, z and elms are not all the same length, or if the arrays
+            are empty.
         """
 
         n = len(elms)
@@ -79,9 +87,35 @@ class Molecule(StuhrmannMixin):
 
 
     def __setattr__(self, name: str, value: object) -> None:
+        """Reject any attempt to set an attribute, enforcing immutability.
+
+        Parameters
+        ----------
+        name : str
+            Name of the attribute being set.
+        value : object
+            Value that would have been assigned.
+
+        Raises
+        ------
+        AttributeError
+            Always raised; Molecule instances cannot be mutated.
+        """
         raise AttributeError("Molecule is immutable")
 
     def __delattr__(self, name: str) -> None:
+        """Reject any attempt to delete an attribute, enforcing immutability.
+
+        Parameters
+        ----------
+        name : str
+            Name of the attribute that would have been deleted.
+
+        Raises
+        ------
+        AttributeError
+            Always raised; Molecule instances cannot be mutated.
+        """
         raise AttributeError("Molecule is immutable")
 
     @classmethod
@@ -94,19 +128,28 @@ class Molecule(StuhrmannMixin):
             Line 2: molecule name (string)
             Lines 3+: one atom per line; exactly 4 columns: element x y z
 
-        Usage:
+        Usage::
+
             M = Molecule.fromXYZ("your_xyz_file.xyz")
 
-        Args:
-            xyz_fp: Path to the .xyz file.
+        Parameters
+        ----------
+        xyz_fp : str
+            Path to the .xyz file.
 
-        Returns:
-            A new Molecule instance.
+        Returns
+        -------
+        Molecule
+            A new Molecule instance, centred at its geometric centroid.
 
-        Raises:
-            FileNotFoundError: If xyz_fp does not exist.
-            ValueError: If the file is malformed (bad atom count, wrong number
-                        of columns, non-numeric coordinates, or atom count mismatch).
+        Raises
+        ------
+        FileNotFoundError
+            If xyz_fp does not exist.
+        ValueError
+            If the file is malformed (bad atom count, wrong number of
+            columns, non-numeric or non-finite coordinates, or atom count
+            mismatch).
         """
         try:
             with open(xyz_fp) as f:
@@ -161,57 +204,123 @@ class Molecule(StuhrmannMixin):
 
     @property
     def coords(self) -> npt.NDArray[np.float64]:
-        """Cartesian coordinates as (n, 3) array; columns are x, y, z in Å. Read-only."""
+        """Cartesian coordinates of all atoms. Read-only.
+
+        Returns
+        -------
+        ndarray of float64, shape (n, 3)
+            Columns are x, y, z in Å.
+        """
         return self._coords
 
     @property
     def x(self) -> npt.NDArray[np.float64]:
-        """x-coordinates in Å. Read-only."""
+        """x-coordinates of all atoms. Read-only.
+
+        Returns
+        -------
+        ndarray of float64, shape (n,)
+            x-coordinates in Å.
+        """
         return self._coords[:, 0]
 
     @property
     def y(self) -> npt.NDArray[np.float64]:
-        """y-coordinates in Å. Read-only."""
+        """y-coordinates of all atoms. Read-only.
+
+        Returns
+        -------
+        ndarray of float64, shape (n,)
+            y-coordinates in Å.
+        """
         return self._coords[:, 1]
 
     @property
     def z(self) -> npt.NDArray[np.float64]:
-        """z-coordinates in Å. Read-only."""
+        """z-coordinates of all atoms. Read-only.
+
+        Returns
+        -------
+        ndarray of float64, shape (n,)
+            z-coordinates in Å.
+        """
         return self._coords[:, 2]
 
     @property
     def angles(self) -> npt.NDArray[np.float64]:
-        """Angular coordinates as (n, 2) array; columns are theta (polar), phi (azimuthal) in radians. Read-only."""
+        """Angular coordinates of all atoms. Read-only.
+
+        Returns
+        -------
+        ndarray of float64, shape (n, 2)
+            Columns are theta (polar, radians) and phi (azimuthal, radians).
+        """
         return self._angles
 
     @property
     def theta(self) -> npt.NDArray[np.float64]:
-        """Polar colatitudinal angles in radians (arccos(z / r), 0→π). Read-only."""
+        """Polar colatitudinal angles of all atoms. Read-only.
+
+        Returns
+        -------
+        ndarray of float64, shape (n,)
+            Angles in radians (arccos(z / r), 0→π).
+        """
         return self._angles[:, 0]
 
     @property
     def phi(self) -> npt.NDArray[np.float64]:
-        """Azimuthal angles in radians (arctan2(y, x), 0→2π). Read-only."""
+        """Azimuthal angles of all atoms. Read-only.
+
+        Returns
+        -------
+        ndarray of float64, shape (n,)
+            Angles in radians (arctan2(y, x), 0→2π).
+        """
         return self._angles[:, 1]
 
     @property
     def r(self) -> npt.NDArray[np.float64]:
-        """Radial distances from origin in Å. Read-only."""
+        """Radial distances of all atoms from the origin. Read-only.
+
+        Returns
+        -------
+        ndarray of float64, shape (n,)
+            Radial distances in Å.
+        """
         return self._r
 
     @property
     def elms(self) -> list[str]:
-        """Element symbols for each atom. Read-only."""
+        """Element symbols for all atoms. Read-only.
+
+        Returns
+        -------
+        list of str
+            Element symbol for each atom.
+        """
         return self._elms
 
     @property
     def name(self) -> str:
-        """Human-readable name of the molecule. Read-only."""
+        """Human-readable name of the molecule. Read-only.
+
+        Returns
+        -------
+        str
+            Molecule name.
+        """
         return self._name
 
     @property
     def size(self) -> int:
-        """Number of atoms in the molecule. Read-only."""
+        """Number of atoms in the molecule. Read-only.
+
+        Returns
+        -------
+        int
+            Atom count.
+        """
         return len(self._elms)
 
     def toHDF5(self, group: object) -> None:
@@ -220,6 +329,15 @@ class Molecule(StuhrmannMixin):
         Writes: coords (float64, (n,3)), angles (float64, (n,2)), r (float64, (n,))
         all ZFP lossless; elms (str, (n,)) uncompressed; name as a group attribute.
         I(q) is not stored here.
+
+        Parameters
+        ----------
+        group : h5py.Group
+            Open, writable HDF5 group to serialize this Molecule into.
+
+        Returns
+        -------
+        None
         """
         import h5py       # lazy - keeps Scattering independent of storage deps
         import hdf5plugin # type: ignore[import]
@@ -235,6 +353,16 @@ class Molecule(StuhrmannMixin):
         """Reconstruct a Molecule from an h5py Group written by toHDF5.
 
         Loads coords, angles, and r directly from the file rather than recomputing.
+
+        Parameters
+        ----------
+        group : h5py.Group
+            Open, readable HDF5 group previously written by ``toHDF5``.
+
+        Returns
+        -------
+        Molecule
+            A new Molecule instance reconstructed from the stored data.
         """
         coords = group['coords'][:]                                             # type: ignore[index]
         angles = group['angles'][:]                                             # type: ignore[index]

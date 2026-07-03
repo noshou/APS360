@@ -7,6 +7,13 @@ from .formfact import FormFactors
 
 class StuhrmannMixin:
 
+    """Mixin providing the Stuhrmann partial-wave decomposition of I(q).
+
+    Intended to be mixed into a class that exposes ``elms``, ``theta``,
+    ``phi``, and ``r`` attributes describing atomic positions (e.g.
+    ``Molecule``).
+    """
+
     @beartype
     def stuhrmann(
         self,

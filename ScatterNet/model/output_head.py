@@ -36,7 +36,34 @@ class OutputHead(nn.Module):
         out_chunk: int,
         compile:   bool = False
     ) -> None:
-        
+
+        """Build the bilinear layer and compression MLP.
+
+        Parameters
+        ----------
+        lambda_1 : int
+            Atom embedding dimension (bilinear input size).
+        lambda_3 : int
+            Hidden width of the bilinear output and MLP input.
+        lambda_4 : int
+            Number of halving steps in the MLP; must satisfy
+            2**lambda_4 <= lambda_3.
+        out_chunk : int
+            Number of atoms processed per chunk in `forward`.
+        compile : bool, optional
+            If True, torch.compile `_forward_fn`. Default is False.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If `lambda_4` is not greater than 0, or if `lambda_4` exceeds
+            floor(log2(lambda_3)) for the given `lambda_3`.
+        """
+
         super().__init__()
         self._out_chunk = out_chunk
         
@@ -62,6 +89,30 @@ class OutputHead(nn.Module):
     @staticmethod
     def _forward_fn(bilinear, mlp, emb_c, fmag_c, mask_c):
 
+        """Compute the Debye-sum I(q) contribution for one atom chunk.
+
+        Parameters
+        ----------
+        bilinear : torch.nn.Bilinear
+            Bilinear layer combining atom embedding and form factor
+            magnitude.
+        mlp : torch.nn.Sequential
+            Compression MLP mapping the bilinear output down to a scalar
+            per atom per q-point.
+        emb_c : torch.Tensor
+            Atom embeddings for this chunk, shape (N, Mc, Q, lambda_1).
+        fmag_c : torch.Tensor
+            Form factor magnitudes for this chunk, shape (N, Mc, Q, 1).
+        mask_c : torch.Tensor
+            Padding mask for this chunk, shape (N, Mc, 1).
+
+        Returns
+        -------
+        torch.Tensor
+            Partial I(q) contribution summed over this chunk's atoms,
+            shape (N, Q).
+        """
+
         # (N,M,Q, λ₁) x (N,M,Q,1) -> (N,M,Q,λ₃)
         atomic   = F.mish(bilinear(emb_c, fmag_c))       
         
@@ -84,8 +135,27 @@ class OutputHead(nn.Module):
             Float[torch.Tensor, "N M Q"],
             Float[torch.Tensor, "N M Q"]
         ]:
-            
-        
+
+        """Accumulate the Debye sum over atom chunks to predict I(q).
+
+        Parameters
+        ----------
+        batch : Batch
+            Input batch; used for `batch.padding_mask()`.
+        msg_head : LayerHead
+            Output of MessagePass; embeds (N, M, Q, lambda_1), f_mags and
+            sigmas (N, M, Q, 1).
+
+        Returns
+        -------
+        torch.Tensor
+            `iq_accum`, predicted I(q), shape (N, Q).
+        torch.Tensor
+            `f_mags`, per-atom form factor magnitudes, shape (N, M, Q).
+        torch.Tensor
+            `sigmas`, per-atom kernel bandwidth, shape (N, M, Q).
+        """
+
         # 1. initialize values
         N, M, Q, _ = msg_head.embeds.shape
         mask       = batch.padding_mask().unsqueeze(-1).to(msg_head.embeds.dtype)  # (N, M, 1)

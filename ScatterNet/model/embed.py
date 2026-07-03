@@ -30,11 +30,20 @@ class Embed(nn.Module):
 
     def __init__(self, lambda_1: int, qPoints: int, compile: bool = False) -> None:
         
-        """
-        Args:
-            lambda_1: embedding dimension (λ₁)
-            qPoints:  number of q-points (Q)
-            compile:  set true to use torch.Compile; set false to turn off
+        """Construct the embedding, form-factor, and sigma-estimation layers.
+
+        Parameters
+        ----------
+        lambda_1 : int
+            Embedding dimension (λ₁).
+        qPoints : int
+            Number of q-points (Q).
+        compile : bool, optional
+            If True, torch.compile `_forward_fn`. Default is False.
+
+        Returns
+        -------
+        None
         """
         
         super().__init__()
@@ -57,11 +66,38 @@ class Embed(nn.Module):
         eps:    float
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         
-        """
+        """Compute atom embeddings, form factor magnitudes, and sigmas.
+
+        Parameters
+        ----------
+        prelu : torch.nn.PReLU
+            Activation applied to the raw atom embedding.
+        mbd : torch.nn.Embedding
+            Atom identity embedding table.
+        f0f1 : torch.nn.Linear
+            Linear layer approximating the real part of the form factor.
+        f2 : torch.nn.Linear
+            Linear layer approximating the imaginary part of the form
+            factor.
+        sigma : torch.nn.Bilinear
+            Bilinear layer computing the positional scaling factor from
+            the embedding and form factor magnitude.
+        vocabs : torch.Tensor
+            Atom vocabulary indices, shape (N, M).
+        mask : torch.Tensor
+            Padding mask, shape (N, M); True marks a real (non-padding)
+            atom.
+        eps : float
+            Numerical floor added to form factor magnitudes and sigmas.
+
         Returns
-            embeds: Atom identity representations. Shape: (N, M, 1, λ₁)
-            f_mags: Form factor magnitudes.        Shape: (N, M, Q, 1)
-            sigmas: Kernel variance bandwidths.    Shape: (N, M, Q, 1)
+        -------
+        torch.Tensor
+            `embeds`, atom identity representations, shape (N, M, 1, λ₁).
+        torch.Tensor
+            `f_mags`, form factor magnitudes, shape (N, M, Q, 1).
+        torch.Tensor
+            `sigmas`, kernel variance bandwidths, shape (N, M, Q, 1).
         """
         
         # get embedding: "what is this atom?" → (N, M, λ₁)
@@ -95,13 +131,20 @@ class Embed(nn.Module):
     @jaxtyped(typechecker=beartype)
     def forward(self, batch: Batch, eps: float) -> LayerHead:
     
-        """
-        Args:
-            batch: input batch; uses batch.vocab (N, M) atom indices
-            eps:   numerical floor to avoid zero form factors and sigmas
+        """Embed a batch's atoms and estimate their scattering properties.
 
-        Returns:
-            LayerHead with embeds (N,M,1,λ₁), f_mags (N,M,Q,1), sigmas (N,M,Q,1)
+        Parameters
+        ----------
+        batch : Batch
+            Input batch; uses `batch.vocab`, shape (N, M), atom indices.
+        eps : float
+            Numerical floor to avoid zero form factors and sigmas.
+
+        Returns
+        -------
+        LayerHead
+            Container with `embeds` (N, M, 1, λ₁), `f_mags` (N, M, Q, 1),
+            and `sigmas` (N, M, Q, 1).
         """
 
         embeds, f_mags, sigmas = self._fwd_fn(

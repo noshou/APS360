@@ -11,10 +11,36 @@ from Preprocess          import VOCAB
 
 class Loss(nn.Module):
 
+    """Training loss for ScatterNet: Kratky MSLE plus form-factor and sigma penalties.
+
+    Attributes
+    ----------
+    _fmag_table : torch.Tensor
+        Reference form factor magnitudes per vocabulary entry per
+        q-point, shape (V, Q) where V = len(VOCAB) + 1.
+    _q_weights_ : torch.Tensor
+        Kratky weighting (1 + q^2), shape (1, Q).
+    """
+
     _fmag_table: Float[torch.Tensor, "V Q"] # V = len(VOCAB) + 1
     _q_weights_: Float[torch.Tensor, "1 Q"] # kratky weighting
 
     def __init__(self, qgrid, energy):
+
+        """Precompute reference form factors and Kratky weights for the loss.
+
+        Parameters
+        ----------
+        qgrid : torch.Tensor
+            Q-grid points, shape (Q,).
+        energy : float
+            X-ray energy (eV) used to evaluate anomalous scattering
+            factors f1/f2 via xraydb.
+
+        Returns
+        -------
+        None
+        """
 
         super().__init__()
 
@@ -61,7 +87,24 @@ class Loss(nn.Module):
         batch: Batch,
         ) -> Float[torch.Tensor, "N Q"]:
 
-        """(1+q²) * (log1p(Î(q)) - log1p(I(q)))²: Kratky weighting emphasizes high-q structure."""
+        """Compute the Kratky-weighted mean squared log error.
+
+        (1+q²) * (log1p(Î(q)) - log1p(I(q)))²: Kratky weighting emphasizes
+        high-q structure.
+
+        Parameters
+        ----------
+        output_head : torch.Tensor
+            Predicted I(q), shape (N, Q).
+        batch : Batch
+            Input batch; uses `batch.iqval`, the reference I(q), shape
+            (N, Q).
+
+        Returns
+        -------
+        torch.Tensor
+            Per-molecule, per-q-point Kratky MSLE, shape (N, Q).
+        """
         residual = torch.log1p(output_head) - torch.log1p(batch.iqval)
         return self._q_weights_ * residual ** 2
 
@@ -73,7 +116,26 @@ class Loss(nn.Module):
         lambda_6: float
         ) -> Float[torch.Tensor, "N Q"]:
 
-        """log1p-normalized L2 between predicted and xraydb reference form factors, atom-count-normalized."""
+        """Compute an atom-count-normalized form-factor penalty.
+
+        log1p-normalized L2 between predicted and xraydb reference form
+        factors, atom-count-normalized.
+
+        Parameters
+        ----------
+        f_mag_pred : torch.Tensor
+            Predicted form factor magnitudes, shape (N, M, Q).
+        batch : Batch
+            Input batch; uses `batch.vocab` to look up reference form
+            factors and `batch.padding_mask()` to mask out padding atoms.
+        lambda_6 : float
+            Weight applied to the penalty.
+
+        Returns
+        -------
+        torch.Tensor
+            Per-molecule, per-q-point form-factor penalty, shape (N, Q).
+        """
         f_mag_real = torch.log1p(self._fmag_table[batch.vocab])
         f_mag_pred = torch.log1p(f_mag_pred)
         n_atoms = batch.padding_mask().sum(dim=1, keepdim=True).float().clamp(min=1)  # (N, 1)
@@ -88,7 +150,25 @@ class Loss(nn.Module):
         batch:    Batch
     ) -> Float[torch.Tensor, "N Q"]:
 
-        """L2 penalty on sigma bandwidths; prevents RFF bandwidths from blowing up."""
+        """Compute an atom-count-normalized L2 penalty on sigma bandwidths.
+
+        Prevents RFF bandwidths from blowing up.
+
+        Parameters
+        ----------
+        sigmas : torch.Tensor
+            Predicted per-atom per-q sigma bandwidths, shape (N, M, Q).
+        lambda_7 : float
+            Weight applied to the penalty.
+        batch : Batch
+            Input batch; uses `batch.padding_mask()` to mask out padding
+            atoms.
+
+        Returns
+        -------
+        torch.Tensor
+            Per-molecule, per-q-point sigma penalty, shape (N, Q).
+        """
         mask    = batch.padding_mask().unsqueeze(-1)       # (N, M, 1)
         n_atoms = mask.sum(dim=1).clamp(min=1)             # (N, 1)
         pen_sig = (lambda_7 * torch.pow(sigmas, 2)) * mask # (N, M, Q)
@@ -105,7 +185,31 @@ class Loss(nn.Module):
         lambda_7: float
     ) -> Float[torch.Tensor, ""]:
 
-        """Kratky MSLE + form-factor penalty + sigma L2 penalty, averaged over molecules and q-points."""
+        """Compute the total training loss.
+
+        Sums the Kratky MSLE, form-factor penalty, and sigma penalty,
+        then averages over molecules and q-points.
+
+        Parameters
+        ----------
+        output_head : torch.Tensor
+            Predicted I(q), shape (N, Q).
+        f_mag_pred : torch.Tensor
+            Predicted form factor magnitudes, shape (N, M, Q).
+        sigma_pred : torch.Tensor
+            Predicted sigma bandwidths, shape (N, M, Q).
+        batch : Batch
+            Input batch with reference I(q), vocab, and padding mask.
+        lambda_6 : float
+            Weight on the form-factor penalty term.
+        lambda_7 : float
+            Weight on the sigma L2 penalty term.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar total loss.
+        """
         msle_loss  = self._kratky_MSLE(output_head, batch)
         ff_penalty = self._ff_penalty(f_mag_pred, batch, lambda_6)
         sg_penalty = self._sg_penalty(sigma_pred, lambda_7, batch)

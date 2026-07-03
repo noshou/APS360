@@ -8,25 +8,36 @@ from torch.nn.utils.rnn import pad_sequence
 @jaxtyped(typechecker=beartype)
 @dataclass(frozen=True)
 class Batch:
-    
-    """
-    Batch of molecules.
+
+    """Batch of molecules.
 
     All tensors are zero-padded to the longest molecule in the batch (M atoms).
     Coordinates are centroid-subtracted Cartesian.
 
-    Fields:
-        vocab: VOCAB integer indices per atom (N, M)
-        iqval: target I(q) intensities (N, Q)
-        coord: centroid-subtracted Cartesian coordinates per atom (N, M, 3)
+    Attributes
+    ----------
+    vocab : torch.Tensor
+        VOCAB integer indices per atom, shape (N, M). Zero-padded; entries
+        equal to 0 mark padding atoms.
+    iqval : torch.Tensor
+        Target I(q) intensities, shape (N, Q).
+    coord : torch.Tensor
+        Centroid-subtracted Cartesian coordinates per atom, shape (N, M, 3).
     """
-    
+
     vocab: Int[torch.Tensor,   "N M"]    # N molecules, M max atoms (padded)
     iqval: Float[torch.Tensor, "N Q"]    # N molecules, Q q-points
     coord: Float[torch.Tensor, "N M 3"]  # Cartesian coordinates
     @jaxtyped(typechecker=beartype)
     def padding_mask(self) -> Bool[torch.Tensor, "N M"]:
-        """Boolean mask. True for real atoms, False for padding (vocab == 0)."""
+        """Compute the boolean mask distinguishing real atoms from padding.
+
+        Returns
+        -------
+        torch.Tensor
+            Boolean mask of shape (N, M). True for real atoms, False for
+            padding (where ``vocab == 0``).
+        """
         return self.vocab != 0
 
     @classmethod
@@ -36,17 +47,27 @@ class Batch:
         iqvals: List[Float[torch.Tensor, "Q"]],
         coords: List[Float[torch.Tensor, "M 3"]]
     ) -> "Batch":
-        
-        """
-        Pad variable-length per-molecule tensors and construct a Batch.
-        Forces all tensors to be exact same shape. Since vocabs are the 
-        only ones guaranteed not to have collisions with padding value of 0, 
-        users can only mask off of vocab.
-        
-        Args:
-            vocabs: list of N vocab index tensors, each shape (M_i,)
-            iqvals: list of N I(q) tensors, each shape (Q,)
-            coords: list of N x,y,z coordinates, each shape (M, 3)
+
+        """Pad variable-length per-molecule tensors and construct a Batch.
+
+        Forces all tensors to the exact same shape. Since vocabs are the
+        only tensors guaranteed not to collide with the padding value of 0,
+        users should only derive masks from ``vocab``.
+
+        Parameters
+        ----------
+        vocabs : list of torch.Tensor
+            List of N vocab index tensors, each of shape (M_i,).
+        iqvals : list of torch.Tensor
+            List of N I(q) tensors, each of shape (Q,).
+        coords : list of torch.Tensor
+            List of N x, y, z coordinate tensors, each of shape (M_i, 3).
+
+        Returns
+        -------
+        Batch
+            A new ``Batch`` with all tensors zero-padded to the longest
+            molecule (M atoms) in the input lists.
         """
         return cls(
             vocab=pad_sequence(vocabs, batch_first=True, padding_value=0),

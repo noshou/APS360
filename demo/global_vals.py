@@ -1,3 +1,10 @@
+"""Shared constants and precomputed grids for the SAXS demo pipeline.
+
+Defines the q-grid / beam energy, spherical-harmonic mode count and
+angular meshgrid, filesystem paths used by `precompute.py` and
+`build_demo.py`, and per-structure display names and citation metadata
+used when rendering the demo's `index.html`.
+"""
 import numpy as np
 from pathlib import Path
 

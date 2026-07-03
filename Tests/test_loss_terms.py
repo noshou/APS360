@@ -9,9 +9,33 @@ from ScatterNet.batching import Batch
 Q = 6
 
 def make_loss():
+    """Construct a Loss module on a tiny Q-point q-grid for testing.
+
+    Returns
+    -------
+    Loss
+        Loss module initialized with a linspace q-grid of length `Q` and
+        energy 12500.0 eV.
+    """
     return Loss(torch.linspace(0.1, 1.0, Q), 12500.0)
 
 def make_batch(vocab, iqval, coord):
+    """Build a padded Batch from per-molecule lists of vocab, I(q), and coordinates.
+
+    Parameters
+    ----------
+    vocab : list of list of int
+        Per-molecule atom vocabulary indices.
+    iqval : list of list of float
+        Per-molecule ground-truth I(q) values.
+    coord : list of list of list of float
+        Per-molecule atom coordinates, shape (n_atoms, 3) per molecule.
+
+    Returns
+    -------
+    Batch
+        Batched, padded representation built via `Batch.from_lists`.
+    """
     return Batch.from_lists(
         [torch.tensor(v) for v in vocab],
         [torch.tensor(i, dtype=torch.float32) for i in iqval],

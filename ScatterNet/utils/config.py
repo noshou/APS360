@@ -180,8 +180,32 @@ class RunConfig:
 
 def load_config(config_path: Optional[str] = None, **cli_overrides) -> RunConfig:
     
-    """Build RunConfig: dataclass defaults → YAML file → explicit CLI flags."""
-    
+    """Build a RunConfig by layering defaults, a YAML file, and CLI overrides.
+
+    Precedence: dataclass defaults -> YAML file -> explicit CLI flags.
+
+    Parameters
+    ----------
+    config_path : str, optional
+        Path to a YAML file whose keys override the RunConfig defaults.
+        None (default) skips this layer.
+    **cli_overrides
+        Explicit keyword overrides applied last (typically parsed from
+        CLI flags). A value of None means "not provided on CLI" and is
+        skipped.
+
+    Returns
+    -------
+    RunConfig
+        The fully resolved configuration.
+
+    Raises
+    ------
+    ValueError
+        If `config_path` or `cli_overrides` contains a key that is not a
+        field of RunConfig.
+    """
+
     cfg = RunConfig()
 
     if config_path is not None:

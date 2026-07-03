@@ -1,10 +1,9 @@
 import torch
 
-from jaxtyping       import Float, jaxtyped
-from beartype        import beartype
+from jaxtyping           import Float, jaxtyped
+from beartype            import beartype
 from ScatterNet.batching import Batch
 from Baselines.baseline  import Baseline, build_fmag_table
-
 
 class RgBaseline(Baseline):
     """

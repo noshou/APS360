@@ -1,3 +1,9 @@
+"""Setuptools packaging config for the scatternet package.
+
+Declares the `scatternet` distribution, its `ScatterNet`, `Preprocess`,
+and `Train` sub-packages, runtime dependencies, and the
+`scatternet-train` console-script entry point.
+"""
 from setuptools import setup, find_packages
 
 setup(

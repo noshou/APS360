@@ -161,7 +161,6 @@ Converts each atom's VOCAB index into three tensors that feed the rest of the pi
   | `_sigma.bias`   | (Q,)       |                                                           |
 
 2. **Forward Pass**
-
   ```{python}
   batch.vocab                           (N, M)
 
@@ -189,13 +188,23 @@ Converts each atom's VOCAB index into three tensors that feed the rest of the pi
   f_mag.unsqueeze(-1) * mask -> f_mags  (N, M, Q, 1)
   sigma                -> sigmas        (N, M, Q, 1)
   ```
-
 3. **Activations**
 
-  | Activation     | Location               | Behaviour                                                                        |
-  | -------------- | ---------------------- | -------------------------------------------------------------------------------- |
-  | `nn.PReLU(λ₁)` | After embedding lookup | Learnable per-channel negative slope. Acts on dim=1, hence the double-transpose. |
-  | `F.softplus`   | On sigma logits        | `log(1 + exp(x))`, smooth positive-enforcing.                                    |
+  | Activation      | Location               | Behaviour                                                                        |
+  | --------------- | ---------------------- | -------------------------------------------------------------------------------- |
+  | `nn.PReLU(λ₁)`* | After embedding lookup | Learnable per-channel negative slope. Acts on dim=1, hence the double-transpose. |
+  | `F.softplus`    | On sigma logits        | `log(1 + exp(x))`, smooth positive-enforcing.                                    |
+
+**Comparison of *`PReLU`*  to other activation functions:*
+
+  | Activation | λ₁  | Val loss | Val R² | Test R² |
+  | ---------- | --- | -------- | ------ | ------- |
+  | LeakyReLU  | 64  | 0.77     | 0.71   | 0.69    |
+  | PReLU      | 128 | 0.67     | 0.74   | 0.73    |
+  | PReLU      | 64  | 0.93     | 0.62   | 0.61    |
+  | LeakyReLU  | 128 | NaN      | NaN    | NaN     |
+  | ELU        | 64  | 2.44     | -0.05  | -0.01   |
+  | Mish       | 64  | NaN      | NaN    | NaN     |
 
 ---
 
@@ -262,7 +271,7 @@ The two heavy contractions use bmm on 3D-reshaped tensors rather than einsum. Th
 
 ```
   einsum('nmqd,nmql->nqdl', zrff, emb_slice)
-  ```
+```
 
 would broadcast to `(Nc, mc, Q, λ₅, λ₁)` before contracting over m. At typical values `(Nc=4, mc=64, Q=256, λ₅=128, λ₁=128)` that is ~4 GB per chunk. The bmm reformulation:
 
@@ -270,7 +279,7 @@ would broadcast to `(Nc, mc, Q, λ₅, λ₁)` before contracting over m. At typ
   zb = zrff.permute(0,2,3,1).reshape(Nc*Q, λ₅, mc)
   eb = emb.permute(0,2,1,3).reshape(Nc*Q, mc, λ₁)
   bmm(zb, eb)   # (Nc*Q, λ₅, λ₁)  ~16 MB
-  ```
+```
 
 The `weights` einsum (`'nmqd,nqd->nmq'`) is safe because there is no λ₁ factor.
 
@@ -306,7 +315,7 @@ M-chunk level (`use_reentrant=False`): `_step` inside `_pass_1` and `_pass_2` ar
   | `_omegafrq` | (λ₅, 3) | RFF frequency matrix Ω, seeded from`msg_seed` |
 
 2. **Message Passing**
-  i. **Pass 1: Accumulate Global Context**
+  i. **Pass 1: Accumulate Global Context**  
     `_pass_1` iterates over M-chunks and accumulates `features` and `chem_env` for the current N-chunk. Each `_step` is gradient-checkpointed (`use_reentrant=False`) to avoid holding the full `(Nc, M, Q, λ₅)` RFF tensor in memory.
     ```{Latex}
     # per M-chunk inputs:
@@ -334,8 +343,8 @@ M-chunk level (`use_reentrant=False`): `_step` inside `_pass_1` and `_pass_2` ar
     features  (Nc, Q, λ₅)       += step_features
     chem_env  (Nc, Q, λ₅, λ₁)   += step_chem_env
     ```
-  After the M-chunk loop, `_AllReduce` sums `features` and `chem_env` across ranks so every rank holds global sums over all atoms.
-  ii. **Pass 2: Per-Atom Update**
+  After the M-chunk loop, `_AllReduce` sums `features` and `chem_env` across ranks so every rank holds global sums over all atoms.  
+  ii. **Pass 2: Per-Atom Update**  
   `_pass_2` recomputes φ_m per M-chunk and uses the globally complete `chem_env` to update embeddings and sigmas.
   ```{rtf}
   # recompute φ_m (intermediate freed during forward by checkpointing)
@@ -376,9 +385,9 @@ M-chunk level (`use_reentrant=False`): `_step` inside `_pass_1` and `_pass_2` ar
   | `F.tanhshrink`     | Sigma delta             | `x - tanh(x)`. Near zero, output ≈ 0 (sticky region). For large                                    |
   | `F.softplus`       | Sigma output            | Ensures σ > 0 always.                                                                              |
 
-  - MishGLU Gate
-    `_proj_agg` is `nn.Linear(λ₁, 2λ₁)`. The output is split into p1 (value path) and p2 (gate path). `gate = p1 * Mish(p2)` is added to the atom embedding as a residual. The final `* mask` zeroes contributions from padding atoms.
-    The GLU pattern lets the network decide per-channel and per-q-point whether to incorporate the neighbourhood context, rather than always adding the full aggregate.
+  - MishGLU Gate  
+  `_proj_agg` is `nn.Linear(λ₁, 2λ₁)`. The output is split into p1 (value path) and p2 (gate path). `gate = p1 * Mish(p2)` is added to the atom embedding as a residual. The final `* mask` zeroes contributions from padding atoms.  
+  The GLU pattern lets the network decide per-channel and per-q-point whether to incorporate the neighbourhood context, rather than always adding the full aggregate.
   - Sigma Update
     ```{rtf}
     σ_new = softplus( σ_old + tanhshrink( bilinear(e_updated, f_mag) ) )

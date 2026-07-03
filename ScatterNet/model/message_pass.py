@@ -59,15 +59,27 @@ class MessagePass(nn.Module):
 
     Memory strategy
     ---------------
-    Checkpointing at the N-chunk level with use_reentrant=True: each N-chunk's full
-    round (_pass_1 → all_reduce → _pass_2) runs under no_grad in the forward pass,
-    so chem_env (Nc, Q, λ₅, λ₁) is created and freed per N-chunk rather than
-    kept alive for all N molecules simultaneously.
+    Checkpointing at the N-chunk level with use_reentrant=False: chem_env
+    (Nc, Q, λ₅, λ₁) only exists inside the per-N-chunk closure's own call
+    frame, so it's created and freed per N-chunk rather than kept alive for
+    all N molecules simultaneously.
 
-    Within each pass, M-chunking avoids materialising the full (Nc, M, Q, λ₅) RFF
-    tensor. The two heavy contractions use bmm on reshaped 3-D tensors rather than
-    einsum, because einsum('nmqd,nmql->nqdl') would create an (Nc,mc,Q,λ₅,λ₁)
-    intermediate before contracting over m; the tensor that caused OOM.
+    Within each pass, each M-chunk gets its own inner checkpoint() call too
+    (in `_pass_1`/`_pass_2`), so only one M-chunk's RFF intermediates are ever
+    alive at once - never the full (Nc, M, Q, λ₅) tensor. The two heavy
+    contractions use bmm on reshaped 3-D tensors rather than einsum, because
+    einsum('nmqd,nmql->nqdl') would create an (Nc,mc,Q,λ₅,λ₁) intermediate
+    before contracting over m; the tensor that caused OOM.
+
+    Compile shapes
+    --------------
+    `forward` pads N and M up to multiples of `n_chunk`/`m_chunk` before
+    chunking, so every N-chunk is exactly `n_chunk` molecules and every
+    M-chunk is exactly `m_chunk` atoms, every call - regardless of which
+    dataset bucket the batch came from. `_step1_fn`/`_step2_fn` (the compiled
+    step functions) therefore only ever see one shape for the life of the
+    module: no recompiles from a ragged tail chunk or from bucket-to-bucket
+    shape variety.
     """
 
     _lambda_1: int                          # atom embedding dimension (λ₁)
@@ -84,6 +96,7 @@ class MessagePass(nn.Module):
     _rffscale: float                        # rff_scale = (2/lambda_5) ** 0.5 to prevent triton bug
     _step1_fn: Callable
     _step2_fn: Callable
+    
     class _AllReduce(torch.autograd.Function):
 
         """
@@ -98,18 +111,80 @@ class MessagePass(nn.Module):
 
         @staticmethod
         def forward(_ctx, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+            """Sum-reduce `x` across the distributed process group.
+
+            Parameters
+            ----------
+            _ctx : torch.autograd.function.FunctionCtx
+                Autograd context (unused).
+            x : torch.Tensor
+                Local partial tensor (e.g. `features` or `chem_env`) to be
+                summed across ranks.
+
+            Returns
+            -------
+            torch.Tensor
+                `x` all-reduced (summed) across every rank.
+            """
             x = x.clone()
             dist.all_reduce(x, op=dist.ReduceOp.SUM)
             return x
 
         @staticmethod
         def backward(_ctx, grad: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+            """Sum-reduce the incoming gradient across the process group.
+
+            Parameters
+            ----------
+            _ctx : torch.autograd.function.FunctionCtx
+                Autograd context (unused).
+            grad : torch.Tensor
+                Gradient of the loss with respect to this function's
+                output, as seen by this rank (itself a partial sum since
+                each rank only saw its own atoms).
+
+            Returns
+            -------
+            torch.Tensor
+                `grad` all-reduced (summed) across every rank, giving each
+                rank the global gradient.
+            """
             dist.all_reduce(grad, op=dist.ReduceOp.SUM)
             return grad
 
     class _PassContainer(NamedTuple):
 
-        """Working state for one N-chunk during a message-passing round."""
+        """Working state for one N-chunk during a message-passing round.
+
+        Attributes
+        ----------
+        M : int
+            Total (padded) number of atoms across the whole batch.
+        Nchnk : int
+            Number of molecules in this N-chunk.
+        Mchnk : int
+            Number of atoms per M-chunk used when iterating over M.
+        emb_n : torch.Tensor
+            Atom embeddings for this N-chunk, shape (Nchnk, M, Q, λ₁).
+        msk_n : torch.Tensor
+            Padding mask for this N-chunk, shape (Nchnk, M); True = real
+            atom.
+        ffs_n : torch.Tensor
+            Form factor magnitudes for this N-chunk, shape
+            (Nchnk, M, Q, 1).
+        sig_n : torch.Tensor
+            Per-atom per-q RBF bandwidths for this N-chunk, shape
+            (Nchnk, M, Q, 1).
+        crd_n : torch.Tensor
+            Atom Cartesian coordinates (Å) for this N-chunk, shape
+            (Nchnk, M, 3).
+        features : torch.Tensor
+            Accumulated sum of RFF features over atoms, shape
+            (Nchnk, Q, λ₅).
+        chem_env : torch.Tensor
+            Accumulated kernel-weighted embedding sum, shape
+            (Nchnk, Q, λ₅, λ₁).
+        """
 
         M:        int
         Nchnk:    int
@@ -134,6 +209,37 @@ class MessagePass(nn.Module):
         compile:  bool = False
         ):
 
+        """Validate hyperparameters and build MessagePass's learned layers.
+
+        Parameters
+        ----------
+        lambda_1 : int
+            Atom embedding dimension.
+        lambda_2 : int
+            Number of message-passing rounds; must be > 0.
+        lambda_5 : int
+            Number of Random Fourier Features.
+        seed : int
+            RNG seed for the fixed RFF frequency matrix and phase offsets.
+        q_points : int
+            Number of q-points (Q).
+        n_chunk : int
+            Molecules per N-chunk; must be > 0.
+        m_chunk : int
+            Atoms per M-chunk; must be > 0.
+        compile : bool, optional
+            If True, torch.compile `_step1`/`_step2`. Default is False.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If `lambda_2`, `n_chunk`, or `m_chunk` is not greater than 0.
+        """
+
         super().__init__()
 
         if lambda_2 <= 0:
@@ -156,37 +262,73 @@ class MessagePass(nn.Module):
         self._sigbilin = nn.Bilinear(lambda_1, q_points, 1)
         self._rms_norm = nn.RMSNorm(lambda_1)
         self._q_points = q_points
-        # precomputed here (not inside _step1/_step2) so torch.compile never sees Python
+        
+        # precomputed here so torch.compile never sees Python
         # arithmetic on lambda_5: under dynamic=True it treats lambda_5 as a SymInt (it's
         # also used in reshapes below), and `(2/lambda_5) ** 0.5` would then trace as a
         # SymFloat that specializes to float64, which Triton's pow() can't mix with the
         # float32 RFF tensor (Triton has no (float32, float64) overload).
         self._rffscale = (2 / lambda_5) ** 0.5
-        self._step1_fn = torch.compile(self._step1, fullgraph=True, dynamic=True) if compile else self._step1
-        self._step2_fn = torch.compile(self._step2, fullgraph=True, dynamic=True) if compile else self._step2
+        
+        # dynamic=False: forward() now pads every N-/M-chunk fed to these
+        # to exactly n_chunk/m_chunk atoms/molecules, so these functions only ever see one
+        # shape for the module's whole lifetime - no need to trace shapes as dynamic.
+        self._step1_fn = torch.compile(self._step1, fullgraph=True) if compile else self._step1
+        self._step2_fn = torch.compile(self._step2, fullgraph=True) if compile else self._step2
 
-    @staticmethod
     def _step1(
-        biasterm: nn.Parameter,
-        omegafrq: torch.Tensor,
-        embslice: torch.Tensor, 
-        crdslice: torch.Tensor, 
-        sigslice: torch.Tensor, 
+        self,
+        embslice: torch.Tensor,
+        crdslice: torch.Tensor,
+        sigslice: torch.Tensor,
         mskslice: torch.Tensor,
         epsilon_: float,
-        rff_scale: float,
-        lambda_1: int,
-        lambda_5: int
     ):
+
+        """Compute per-M-chunk RFF features and the kernel-weighted embedding sum.
+
+        Parameters
+        ----------
+        embslice : torch.Tensor
+            Atom embeddings for this M-chunk, shape (Nc, mc, Q, λ₁).
+        crdslice : torch.Tensor
+            Atom coordinates for this M-chunk, shape (Nc, mc, 3).
+        sigslice : torch.Tensor
+            Per-atom per-q bandwidths for this M-chunk, shape
+            (Nc, mc, Q, 1).
+        mskslice : torch.Tensor
+            Padding mask for this M-chunk, shape (Nc, mc).
+        epsilon_ : float
+            Numerical floor for clamping sigma before division.
+
+        Returns
+        -------
+        torch.Tensor
+            `step_features`, partial sum of RFF features over this
+            M-chunk's atoms, shape (Nc, Q, λ₅).
+        torch.Tensor
+            `step_chem_env`, partial kernel-weighted embedding sum, shape
+            (Nc, Q, λ₅, λ₁).
+        """
+
+        # not a staticmethod: biasterm/omegafrq are read off self rather than passed as
+        # positional args. Passing an nn.Parameter as a positional arg into a compiled,
+        # checkpointed function is unsound - checkpoint's recompute-on-backward sometimes
+        # hands back a detached plain Tensor for the same saved argument, so its *type*
+        # (Parameter vs Tensor) differs between the original forward call and the backward
+        # recompute; torch.compile treats that as a reason to recompile, every single time,
+        # eventually hitting the recompile limit. Reading self._biasterm/self._omegafrq
+        # inside the method body avoids threading them through checkpoint's argument list.
+        lambda_1, lambda_5 = self._lambda_1, self._lambda_5
 
         # r̃_m = r_m / σ_m: scale coords by bandwidth so kernel range is q-dependent.
         # clamp(min=eps) caps the max RFF frequency and avoids 1/0.
         scaled_coords = crdslice.unsqueeze(-2) / sigslice.clamp(min=epsilon_) # (Nc, mc, Q, 3)
 
         # φ_m = √(2/λ₅) · cos(Ω · r̃_m + b): RFF feature vector per atom per q-point
-        proj = scaled_coords @ omegafrq.T + biasterm       # (Nc, mc, Q, λ₅)
-        zrff = rff_scale * cos(proj)                       # (Nc, mc, Q, λ₅)
-        zrff = zrff * mskslice.unsqueeze(-1).unsqueeze(-1) # zero padding atoms
+        proj = scaled_coords @ self._omegafrq.T + self._biasterm  # (Nc, mc, Q, λ₅)
+        zrff = self._rffscale * cos(proj)                         # (Nc, mc, Q, λ₅)
+        zrff = zrff * mskslice.unsqueeze(-1).unsqueeze(-1)        # zero padding atoms
 
         # Σ_m φ_m: partial sum of RFF features over atoms in this M-chunk
         step_features = zrff.sum(dim=1) # (Nc, Q, λ₅)
@@ -209,6 +351,20 @@ class MessagePass(nn.Module):
         After this pass:
             features  = Σ_m φ_m        (kernel weight normaliser)
             chem_env  = Σ_m φ_m ⊗ e_m (kernel-weighted embedding sum)
+
+        Parameters
+        ----------
+        cont : MessagePass._PassContainer
+            Working state for this N-chunk; `features` and `chem_env` are
+            accumulated (functionally) from their current values.
+        eps : float
+            Numerical floor for sigma clamping inside `_step1`.
+
+        Returns
+        -------
+        MessagePass._PassContainer
+            `cont` with `features` and `chem_env` updated to their fully
+            accumulated values across all M-chunks.
         """
 
         features: Float[torch.Tensor, "Nchnk Q λ₅"]    = cont.features
@@ -222,18 +378,7 @@ class MessagePass(nn.Module):
             sig_slice = cont.sig_n[:, m0:m1]
             msk_slice = cont.msk_n[:, m0:m1]
             
-            args = (
-                self._biasterm,
-                self._omegafrq,
-                emb_slice,
-                crd_slice,
-                sig_slice,
-                msk_slice,
-                eps,
-                self._rffscale,
-                self._lambda_1,
-                self._lambda_5
-            )
+            args = (emb_slice, crd_slice, sig_slice, msk_slice, eps)
 
             step_feat, step_chem = checkpoint(self._step1_fn, *args, use_reentrant=False)  # type: ignore[misc]
             features = features + step_feat
@@ -241,31 +386,58 @@ class MessagePass(nn.Module):
 
         return cont._replace(features=features, chem_env=chem_env)
 
-    @staticmethod
     def _step2(
-        biasterm: nn.Parameter,
-        rms_norm: nn.RMSNorm,
-        proj_agg: nn.Linear,
-        sigbilin: nn.Bilinear,
-        omegafrq: torch.Tensor,
-        embslice: torch.Tensor, 
-        crdslice: torch.Tensor, 
-        sigslice: torch.Tensor, 
+        self,
+        embslice: torch.Tensor,
+        crdslice: torch.Tensor,
+        sigslice: torch.Tensor,
         mskslice: torch.Tensor,
         ffsslice: torch.Tensor,
         features: torch.Tensor,
         chem_env: torch.Tensor,
         epsilon_: float,
-        rff_scale: float,
-        q_points: int,
-        lambda_1: int,
-        lambda_5: int
         ):
+
+        """Compute the per-atom neighbourhood aggregate and updated embedding/sigma.
+
+        Parameters
+        ----------
+        embslice : torch.Tensor
+            Atom embeddings for this M-chunk, shape (Nc, mc, Q, λ₁).
+        crdslice : torch.Tensor
+            Atom coordinates for this M-chunk, shape (Nc, mc, 3).
+        sigslice : torch.Tensor
+            Per-atom per-q bandwidths for this M-chunk, shape
+            (Nc, mc, Q, 1).
+        mskslice : torch.Tensor
+            Padding mask for this M-chunk, shape (Nc, mc).
+        ffsslice : torch.Tensor
+            Form factor magnitudes for this M-chunk, shape (Nc, mc, Q, 1).
+        features : torch.Tensor
+            Fully accumulated RFF feature sum from `_pass_1`, shape
+            (Nc, Q, λ₅).
+        chem_env : torch.Tensor
+            Fully accumulated kernel-weighted embedding sum from
+            `_pass_1`, shape (Nc, Q, λ₅, λ₁).
+        epsilon_ : float
+            Numerical floor for clamping sigma and the aggregate
+            denominator.
+
+        Returns
+        -------
+        torch.Tensor
+            `new_emb`, updated atom embeddings, shape (Nc, mc, Q, λ₁).
+        torch.Tensor
+            `new_sig`, updated per-atom per-q bandwidths, shape
+            (Nc, mc, Q, 1).
+        """
+
+        q_points, lambda_1, lambda_5 = self._q_points, self._lambda_1, self._lambda_5
 
         # recompute φ_m for this M-chunk (same as _pass_1, but now chem_env is complete)
         scaled_coords = crdslice.unsqueeze(-2) / sigslice.clamp(min=epsilon_) # (Nc, mc, Q, 3)
-        proj = scaled_coords @ omegafrq.T + biasterm # (Nc, mc, Q, λ₅)
-        zrff = rff_scale * cos(proj) # (Nc, mc, Q, λ₅)
+        proj = scaled_coords @ self._omegafrq.T + self._biasterm # (Nc, mc, Q, λ₅)
+        zrff = self._rffscale * cos(proj) # (Nc, mc, Q, λ₅)
         mask = mskslice.unsqueeze(-1).unsqueeze(-1) # (Nc, mc, 1, 1)
         zrff = zrff * mask
 
@@ -287,21 +459,21 @@ class MessagePass(nn.Module):
         weights = torch.einsum('nmqd, nqd -> nmq', zrff, features).abs() # (Nc, mc, Q)
 
         # normalised aggregate: kernel-weighted average of neighbour embeddings
-        agg = rms_norm(locality / weights.unsqueeze(-1).clamp(min=epsilon_)) # (Nc, mc, Q, λ₁)
+        agg = self._rms_norm(locality / weights.unsqueeze(-1).clamp(min=epsilon_)) # (Nc, mc, Q, λ₁)
 
         # MishGLU gate: one linear projects to 2λ₁, split into value p1 and gate p2.
         # gate = p1 · Mish(p2) selectively passes neighbourhood signal into the residual stream.
-        p1, p2 = proj_agg(agg).chunk(2, dim=-1) # each (Nc, mc, Q, λ₁)
+        p1, p2 = self._proj_agg(agg).chunk(2, dim=-1) # each (Nc, mc, Q, λ₁)
         gate   = p1 * F.mish(p2) * mask               # (Nc, mc, Q, λ₁)
 
         # residual update
-        new_emb = embslice + gate       
+        new_emb = embslice + gate
 
-        # sigma update: tanhshrink(x) = x - tanh(x) is near-zero for small x ("sticky" -
-        # sigma barely moves when the bilinear output is small) and grows linearly for large x.
-        # softplus keeps σ strictly positive.
+        # sigma update: tanhshrink(x) = x - tanh(x) is near-zero 
+        # for small x ("sticky" sigma barely moves when the bilinear output is small) 
+        # and grows linearly for large x. softplus keeps σ strictly positive.
         f_in    = ffsslice.transpose(-1, -2).expand(-1, -1, q_points, -1)
-        new_sig = F.softplus(sigslice + F.tanhshrink(sigbilin(new_emb, f_in)))
+        new_sig = F.softplus(sigslice + F.tanhshrink(self._sigbilin(new_emb, f_in)))
 
         return new_emb, new_sig
 
@@ -312,6 +484,21 @@ class MessagePass(nn.Module):
 
         Uses the fully-accumulated chem_env from _pass_1 so every atom attends to
         all others despite M-chunking (all-pairs coverage is preserved).
+
+        Parameters
+        ----------
+        cont : MessagePass._PassContainer
+            Working state for this N-chunk, with `features` and
+            `chem_env` already fully accumulated by `_pass_1`.
+        eps : float
+            Numerical floor for sigma clamping and the aggregate
+            denominator inside `_step2`.
+
+        Returns
+        -------
+        MessagePass._PassContainer
+            `cont` with `emb_n` and `sig_n` replaced by their updated
+            values.
         """
 
         new_emb_m = []
@@ -326,28 +513,18 @@ class MessagePass(nn.Module):
             crd_slice = cont.crd_n[:, m0:m1]
             msk_slice = cont.msk_n[:, m0:m1]
             cont_feat = cont.features
-            cont_chnv = cont.chem_env 
-            
-            args = (
-                self._biasterm,
-                self._rms_norm,
-                self._proj_agg,
-                self._sigbilin,
-                self._omegafrq,
-                emb_slice,
-                crd_slice,
-                sig_slice,
-                msk_slice,
-                ffs_slice,
-                cont_feat,
-                cont_chnv,
-                eps,
-                self._rffscale,
-                self._q_points,
-                self._lambda_1,
-                self._lambda_5
-            )
+            cont_chnv = cont.chem_env
 
+            args = (
+                emb_slice, 
+                crd_slice, 
+                sig_slice, 
+                msk_slice, 
+                ffs_slice, 
+                cont_feat, 
+                cont_chnv, 
+                eps
+            )
             emb_c, sig_c = checkpoint(self._step2_fn, *args, use_reentrant=False)  # type: ignore[misc]
             new_emb_m.append(emb_c)
             new_sig_m.append(sig_c)
@@ -355,6 +532,45 @@ class MessagePass(nn.Module):
         new_emb = torch.cat(new_emb_m, dim=1)  # (Nchnk, M, Q, λ₁)
         new_sig = torch.cat(new_sig_m, dim=1)  # (Nchnk, M, Q, 1)
         return cont._replace(emb_n=new_emb, sig_n=new_sig)
+
+    @staticmethod
+    def _pad_to_multiple(t: torch.Tensor, chunk: int, dim: int) -> torch.Tensor:
+
+        """
+        Zero-pad `t` along `dim` up to the next multiple of `chunk`.
+
+        Lets every N-chunk/M-chunk fed to the compiled step functions be exactly
+        `chunk` elements wide, every call, so torch.compile only ever sees one
+        shape per compiled function - no ragged tail chunk, no recompiles from
+        shape variety. Padded rows are all-zero; the padding_mask entries built
+        from them are False (real atom/molecule = True), so _step1/_step2 zero
+        their RFF contribution and the caller slices the padding back off before
+        returning.
+
+        Parameters
+        ----------
+        t : torch.Tensor
+            Tensor to pad.
+        chunk : int
+            Chunk size; `t` is padded so `dim`'s size becomes a multiple
+            of this.
+        dim : int
+            Dimension along which to pad.
+
+        Returns
+        -------
+        torch.Tensor
+            `t` zero-padded along `dim` up to the next multiple of
+            `chunk` (returned unchanged if already a multiple).
+        """
+
+        size = t.shape[dim]
+        pad_to = -(-size // chunk) * chunk  # ceil division
+        if pad_to == size:
+            return t
+        pad_shape = list(t.shape)
+        pad_shape[dim] = pad_to - size
+        return torch.cat([t, t.new_zeros(pad_shape)], dim=dim)
 
     def _all_reduce(self, x: torch.Tensor, use_all_reduce: bool) -> torch.Tensor:
 
@@ -368,7 +584,21 @@ class MessagePass(nn.Module):
         counts (an off-by-one from `ceil(N/ws)`), so they can end up issuing a
         different NUMBER of N-chunk rounds, and thus a different number of
         all_reduce calls overall, one rank hangs forever waiting for a collective
-        the other rank never issues (NCCL watchdog timeout)."""
+        the other rank never issues (NCCL watchdog timeout).
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Tensor to all-reduce (`features` or `chem_env`).
+        use_all_reduce : bool
+            Whether to actually apply the all-reduce.
+
+        Returns
+        -------
+        torch.Tensor
+            `x` all-reduced across ranks, or unchanged if no process
+            group is active or `use_all_reduce` is False.
+        """
 
         if not use_all_reduce or not dist.is_available() or not dist.is_initialized():
             return x
@@ -377,42 +607,69 @@ class MessagePass(nn.Module):
     @jaxtyped(typechecker=beartype)
     def forward(self, batch: Batch, embed_head: LayerHead, eps: float, use_all_reduce: bool = True) -> LayerHead:
 
-        """
-        Run λ₂ rounds of RFF message passing.
+        """Run λ₂ rounds of RFF message passing.
 
-        Args:
-            batch:          molecule geometry; uses coord (N, M, 3) Cartesian positions (Å)
-            embed_head:     output of Embed; embeds (N, M, 1, λ₁), f_mags and sigmas (N, M, Q, 1)
-            eps:            numerical floor for sigma clamping and aggregate denominator
-            use_all_reduce: whether to all-reduce features/chem_env across ranks between
-                            the two passes. True (default) for TP and single-GPU, where
-                            the shard being processed is a slice of the SAME molecules on
-                            every rank. Must be False for ScatterNet's DP path, where each
-                            rank processes a disjoint set of molecules and there is nothing
-                            to reconcile — see `_all_reduce`'s docstring for why this isn't
-                            optional (it's a correctness/deadlock issue, not just a no-op).
-        Returns:
-            LayerHead with embeds updated to (N, M, Q, λ₁) and sigmas updated; f_mags unchanged
+        Parameters
+        ----------
+        batch : Batch
+            Molecule geometry; uses `coord` (N, M, 3) Cartesian positions
+            (Å).
+        embed_head : LayerHead
+            Output of Embed; embeds (N, M, 1, λ₁), f_mags and sigmas
+            (N, M, Q, 1).
+        eps : float
+            Numerical floor for sigma clamping and the aggregate
+            denominator.
+        use_all_reduce : bool, optional
+            Whether to all-reduce features/chem_env across ranks between
+            the two passes. True (default) for TP and single-GPU, where
+            the shard being processed is a slice of the SAME molecules on
+            every rank. Must be False for ScatterNet's DP path, where each
+            rank processes a disjoint set of molecules and there is
+            nothing to reconcile - see `_all_reduce`'s docstring for why
+            this isn't optional (it's a correctness/deadlock issue, not
+            just a no-op).
+
+        Returns
+        -------
+        LayerHead
+            `embed_head` with `embeds` updated to (N, M, Q, λ₁) and
+            `sigmas` updated; `f_mags` unchanged.
         """
 
-        # expand Q dim from 1 → Q upfront; zero-copy stride-0 view until a contiguous op fires
-        embeds       = embed_head.embeds.expand(-1, -1, self._q_points, -1)
+        embeds_raw   = embed_head.embeds  # (N, M, 1, λ₁); Q not yet expanded
         sigmas       = embed_head.sigmas
         coord        = batch.coord
         padding_mask = batch.padding_mask()
         f_mags       = embed_head.f_mags
 
-        N, M, _ = coord.shape
+        N_real, M_real, _ = coord.shape
         Q       = sigmas.shape[2]
         Cn      = self._nchunk
         Cm      = self._mchunk
+
+        # Pad N (molecules) and M (atoms) up to multiples of Cn/Cm so every N-chunk/M-chunk
+        # fed to the compiled step functions is exactly (Cn, Cm) every call - one shape for
+        # the whole run, no recompiles from a ragged tail chunk. Padding is done on
+        # embeds_raw (Q still singleton) so the Q-expand right after stays a zero-copy
+        # stride-0 view instead of materialising a (N, M, Q, λ₁) tensor early.
+        for dim, chunk in ((0, Cn), (1, Cm)):
+            embeds_raw   = self._pad_to_multiple(embeds_raw,   chunk, dim)
+            sigmas       = self._pad_to_multiple(sigmas,       chunk, dim)
+            coord        = self._pad_to_multiple(coord,        chunk, dim)
+            f_mags       = self._pad_to_multiple(f_mags,       chunk, dim)
+            padding_mask = self._pad_to_multiple(padding_mask, chunk, dim)
+
+        # expand Q dim from 1 → Q upfront; zero-copy stride-0 view until a contiguous op fires
+        embeds = embeds_raw.expand(-1, -1, self._q_points, -1)
+        N, M   = coord.shape[0], coord.shape[1]  # padded sizes; always multiples of Cn/Cm
 
         for _ in range(self._lambda_2):
             new_embeds_n = []
             new_sigmas_n = []
 
             for n0 in range(0, N, Cn):
-                n1 = min(n0 + Cn, N)
+                n1 = n0 + Cn  # N is padded to a multiple of Cn, so every N-chunk is exactly Cn
 
                 # Nc derived from emb_s.shape[0] inside the closure rather than closed over as a
                 # variable; Python closures capture by reference so a loop variable would give the
@@ -439,15 +696,37 @@ class MessagePass(nn.Module):
                     cont = self._pass_2(cont, eps)
                     return cont.emb_n, cont.sig_n
 
-                # use_reentrant=True: forward runs under no_grad so chem_env is created and freed
-                # per N-chunk. use_reentrant=False would keep all N-chunks' chem_env alive
-                # simultaneously (the _pass_2._step closures hold a reference to it).
-                args = (embeds[n0:n1], padding_mask[n0:n1], f_mags[n0:n1], sigmas[n0:n1], coord[n0:n1])
+                # use_reentrant=False: chem_env lives only inside this closure's call frame,
+                # not behind a persistent reference held elsewhere, so it's still freed once
+                # this N-chunk's forward/recompute finishes rather than kept alive for every
+                # N-chunk simultaneously - unlike the older nested-_step-closure version this
+                # replaced, where a persistent closure held chem_env alive across N-chunks.
+                #
+                # embeds[n0:n1].contiguous(): embeds is a stride-0 broadcast view over Q
+                # (see the expand() above). Left as a view, checkpoint's recompute-on-backward
+                # sometimes hands the compiled step function a materialised (real-stride)
+                # copy instead of the original broadcast view, so the same argument's memory
+                # layout differs between the original forward call and the recompute -
+                # torch.compile treats that as a reason to recompile, same failure mode as
+                # passing biasterm as a positional arg (see _step1's comment). Materialising
+                # per N-chunk here (Cn*M_pad*Q*λ1) is far smaller than doing it for the whole
+                # batch up front, and keeps the layout identical on every call.
+                args = (
+                    embeds[n0:n1].contiguous(), 
+                    padding_mask[n0:n1], 
+                    f_mags[n0:n1], 
+                    sigmas[n0:n1], 
+                    coord[n0:n1]
+                )
                 new_emb, new_sig = checkpoint(_n_chunk_round, *args, use_reentrant=False)  # type: ignore[misc]
                 new_embeds_n.append(new_emb)
                 new_sigmas_n.append(new_sig)
 
             embeds = torch.cat(new_embeds_n, dim=0)  # (N, M, Q, λ₁)
             sigmas = torch.cat(new_sigmas_n, dim=0)  # (N, M, Q, 1)
+
+        # strip the N/M padding added above before returning
+        embeds = embeds[:N_real, :M_real]
+        sigmas = sigmas[:N_real, :M_real]
 
         return embed_head._replace(embeds=embeds, sigmas=sigmas)

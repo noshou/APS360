@@ -6,8 +6,7 @@ import h5py
 from Preprocess import Encoding
 
 class BatchSet(Dataset):
-    """
-    A PyTorch Dataset where each item is a pre-built batch of molecules.
+    """A PyTorch Dataset where each item is a pre-built batch of molecules.
 
     Molecules vary enormously in atom count (2-atom QM9 molecules up to
     thousands-of-atom MOFs). A standard DataLoader with batch_size=N would
@@ -50,21 +49,46 @@ class BatchSet(Dataset):
         enc: Encoding,
         batches: list,
     ):
-        """
-        Args:
-            hdf5_db:  path to raw HDF5 data.
-            enc:      Encoding instance for element→VOCAB mapping.
-            batches:  pre-built batches from Batcher.
+        """Initialize the BatchSet with pre-built batches from a Batcher.
+
+        Parameters
+        ----------
+        hdf5_db : str
+            Path to raw HDF5 data.
+        enc : Encoding
+            Encoding instance for element to VOCAB mapping.
+        batches : list
+            Pre-built batches from ``Batcher``, each a list of
+            (grp, stem, atoms) rows.
         """
         self._batches = batches
         self._enc     = enc
         self._db_path = hdf5_db
-    
+
     def __len__(self) -> int:
+        """Return the number of pre-built batches in this dataset.
+
+        Returns
+        -------
+        int
+            Number of batches.
+        """
         return len(self._batches)
 
     def __getitem__(self, i: int) -> Batch:
-        """Load and return sub-batch ``i`` as a typed, shape-validated ``Batch``."""
+        """Load and return sub-batch ``i`` as a typed, shape-validated ``Batch``.
+
+        Parameters
+        ----------
+        i : int
+            Index of the batch to load.
+
+        Returns
+        -------
+        Batch
+            The loaded batch, with vocab, I(q) intensities, and coordinates
+            read from the HDF5 file and padded via ``Batch.from_lists``.
+        """
         rows  = self._batches[i]
         vocab: List = []
         iqval: List = []

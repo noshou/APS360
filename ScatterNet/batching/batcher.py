@@ -10,9 +10,8 @@ _TRAIN = 0.7
 _VAL   = 0.15
 _TEST  = 0.15
 class Batcher:
-    
-    """
-    Factory that builds train, validation, and test BatchSets from an HDF5 dataset.
+
+    """Factory that builds train, validation, and test BatchSets from an HDF5 dataset.
 
     Call ``get_sets()`` to retrieve ``(train, val, test)`` as ``BatchSet`` objects
     ready for use with ``DataLoader(batch_size=1, collate_fn=lambda x: x[0])``.
@@ -46,22 +45,38 @@ class Batcher:
         train_percent:  float = _TRAIN,
         val_percent:    float = _VAL,
         test_percent:   float = _TEST
-    ): 
-        
+    ):
+
+        """Construct train, validation, and test BatchSets from an HDF5 dataset.
+
+        Parameters
+        ----------
+        hdf5_db : str
+            Path to raw HDF5 data.
+        enc : Encoding
+            Encoding instance for SQLite queries.
+        batches : list of tuple of int
+            List of (min_atoms, max_atoms) size buckets to load.
+        seed : int
+            RNG seed for reproducible train/val/test splits. Must be >= 0.
+        atom_size_ceil : int, optional
+            Maximum total atoms per batch; exceeded buckets are split via
+            binary search. If <= 0, set to 3x the max atom count (default -1).
+        train_percent : float, optional
+            Fraction of molecules for training (default 0.7).
+        val_percent : float, optional
+            Fraction of molecules for validation (default 0.15).
+        test_percent : float, optional
+            Fraction of molecules for testing (default 0.15). The larger of
+            val/test receives the floor-rounding remainder; ties go to test.
+
+        Raises
+        ------
+        ValueError
+            If any of ``train_percent``, ``val_percent``, ``test_percent`` is
+            <= 0, if they do not sum to 1, or if ``seed`` is negative.
         """
-        Args:
-            hdf5_db:        path to raw HDF5 data.
-            enc:            Encoding instance for SQLite queries.
-            batches:        list of (min_atoms, max_atoms) size buckets to load.
-            atom_size_ceil: maximum total atoms per batch; exceeded buckets are
-                            split via binary search. If <=0, set to 3× max atom count.
-            seed:           RNG seed for reproducible train/val/test splits.
-            train_percent:  fraction of molecules for training.
-            val_percent:    fraction for validation.
-            test_percent:   fraction for testing. The larger of
-                            val/test receives the floor-rounding remainder; ties go to test.
-        """
-        
+
         if (
             train_percent <= 0 or 
             val_percent   <= 0 or 
@@ -86,18 +101,33 @@ class Batcher:
         batches: list[tuple[int,int]],
         atom_size_ceil: int,
     ) -> list:
-        
-        """
-        Build the flat list of batches across all size buckets.
 
-        Args:
-            hdf5_db:        path to raw HDF5 data.
-            enc:            Encoding instance for SQLite queries.
-            batches:        list of (min_atoms, max_atoms) size buckets.
-            atom_size_ceil: maximum total atoms per batch.
+        """Build the flat list of batches across all size buckets.
 
-        Returns:
+        Parameters
+        ----------
+        hdf5_db : str
+            Path to raw HDF5 data.
+        enc : Encoding
+            Encoding instance for SQLite queries.
+        batches : list of tuple of int
+            List of (min_atoms, max_atoms) size buckets.
+        atom_size_ceil : int
+            Maximum total atoms per batch.
+
+        Returns
+        -------
+        list
             Flat list of batches, each a list of (grp, stem, atoms) rows.
+
+        Raises
+        ------
+        FileNotFoundError
+            If ``hdf5_db`` does not exist.
+        PermissionError
+            If ``hdf5_db`` cannot be read due to insufficient permissions.
+        OSError
+            If the HDF5 file cannot otherwise be opened.
         """
         try:
             with h5py.File(hdf5_db, "r"):
@@ -116,6 +146,18 @@ class Batcher:
             hi: int,
             query: list,
         ) -> None:
+            """Recursively bisect ``query[lo:hi+1]`` until each part fits under the atom ceiling.
+
+            Parameters
+            ----------
+            lo : int
+                Inclusive start index into ``query``.
+            hi : int
+                Inclusive end index into ``query``.
+            query : list
+                Full list of (grp, stem, atoms) rows being split; only the
+                ``[lo, hi]`` slice is considered on this call.
+            """
             sub = query[lo:hi+1]
             count = sum(row[2] for row in sub)
             if count <= atom_size_ceil or hi <= lo:
@@ -154,6 +196,39 @@ class Batcher:
         enc:          Encoding,
         batches_flat: list,
     ):
+        """Collapse tiny batches, split each into train/val/test, and store the resulting BatchSets.
+
+        Batches with fewer than 3 molecules are merged into a neighbouring
+        batch (by nearest median atom count, ties merge down), then each
+        remaining batch is independently split at the molecule level using
+        a seeded RNG. The results are wrapped into ``BatchSet`` instances and
+        assigned to ``self._train``, ``self._val``, and ``self._test``.
+
+        Parameters
+        ----------
+        seed : int
+            RNG seed for reproducible splits.
+        trn_p : float
+            Fraction of molecules per batch for training.
+        val_p : float
+            Fraction of molecules per batch for validation.
+        tst_p : float
+            Fraction of molecules per batch for testing.
+        hdf5_db : str
+            Path to raw HDF5 data, forwarded to ``BatchSet``.
+        enc : Encoding
+            Encoding instance for element to VOCAB mapping, forwarded to
+            ``BatchSet``.
+        batches_flat : list
+            Flat list of batches (each a list of (grp, stem, atoms) rows)
+            produced by ``_batches_init``. Mutated in place while merging
+            undersized batches.
+
+        Raises
+        ------
+        ValueError
+            If only one batch remains and it has fewer than 3 molecules.
+        """
         # Collapse batches with fewer than 3 molecules into an adjacent batch.
         # Merge direction: toward the neighbour whose median atom count is closer.
         # Tie or edge case: merge down (into previous).
@@ -212,6 +287,12 @@ class Batcher:
         self._test  = BatchSet(hdf5_db, enc, [b for b in test_batches  if b])
     
     def get_sets(self) -> Tuple[BatchSet, BatchSet, BatchSet]:
-        return self._train, self._val, self._test 
-    
-        
+        """Return the pre-built train, validation, and test BatchSets.
+
+        Returns
+        -------
+        tuple of BatchSet
+            A ``(train, val, test)`` tuple of ``BatchSet`` instances, ready
+            for use with ``DataLoader(batch_size=1, collate_fn=lambda x: x[0])``.
+        """
+        return self._train, self._val, self._test

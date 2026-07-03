@@ -21,12 +21,42 @@ class _DistributedSum(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        """Sum-reduce `x` across all ranks in the process group.
+
+        Parameters
+        ----------
+        ctx : torch.autograd.function.FunctionCtx
+            Autograd context (unused; nothing needs to be saved for backward).
+        x : torch.Tensor
+            Local partial tensor (e.g. a partial I(q) sum) to be summed
+            across ranks.
+
+        Returns
+        -------
+        torch.Tensor
+            `x` all-reduced (summed) across every rank in the process group.
+        """
         x = x.clone()
         dist.all_reduce(x, op=dist.ReduceOp.SUM)
         return x
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        """Pass the incoming gradient through unchanged.
+
+        Parameters
+        ----------
+        ctx : torch.autograd.function.FunctionCtx
+            Autograd context (unused).
+        grad : torch.Tensor
+            Gradient of the loss with respect to this function's output.
+
+        Returns
+        -------
+        torch.Tensor
+            `grad` unchanged; the gradient is already global on every rank
+            since all ranks compute the same loss after the forward all-reduce.
+        """
         return grad
 
 
@@ -49,6 +79,27 @@ class _AllGatherDim1(torch.autograd.Function):
         m0:     int,
         M_full: int,
     ) -> torch.Tensor:
+        """Gather per-atom shards from every rank along the atom dimension.
+
+        Parameters
+        ----------
+        ctx : torch.autograd.function.FunctionCtx
+            Autograd context; used to stash `m0` and the local shard width
+            (`M_local`) for `backward`.
+        x : torch.Tensor
+            This rank's local shard, shape (N, M_local, ...).
+        m0 : int
+            Starting atom index of this rank's shard within the full
+            `M_full` atoms.
+        M_full : int
+            Total (unsharded) number of atoms across all ranks.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape (N, M_full, ...) with every rank's shard
+            concatenated along dim 1, with any padding trimmed off.
+        """
         ws       = dist.get_world_size()
         N        = x.shape[0]
         M_local  = x.shape[1]
@@ -70,6 +121,26 @@ class _AllGatherDim1(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):  # type: ignore[override]
+        """Slice out the gradient belonging to this rank's atom shard.
+
+        Parameters
+        ----------
+        ctx : torch.autograd.function.FunctionCtx
+            Autograd context holding `m0` and `M_local` saved in `forward`.
+        grad : torch.Tensor
+            Gradient of the loss with respect to the gathered
+            (N, M_full, ...) output.
+
+        Returns
+        -------
+        torch.Tensor
+            Gradient slice for this rank's own atoms, shape
+            (N, M_local, ...).
+        None
+            Placeholder gradient for the `m0` argument (not a tensor).
+        None
+            Placeholder gradient for the `M_full` argument (not a tensor).
+        """
         return grad[:, ctx.m0 : ctx.m0 + ctx.M_local].contiguous(), None, None
 
 
@@ -156,6 +227,46 @@ class ScatterNet(nn.Module):
         compile:   bool = False,
     ) -> None:
 
+        """Construct the Embed, MessagePass, and OutputHead submodules.
+
+        Parameters
+        ----------
+        lambda_1 : int
+            Atom embedding dimension.
+        lambda_2 : int
+            Number of message passing rounds.
+        lambda_3 : int
+            OutputHead hidden width.
+        lambda_4 : int
+            Number of halving steps in the OutputHead MLP.
+        lambda_5 : int
+            Number of Random Fourier Features used in MessagePass.
+        msg_seed : int
+            RNG seed for MessagePass's fixed RFF frequency matrix.
+        atm_chunk : int
+            Atoms per M-chunk in MessagePass and OutputHead.
+        mol_chunk : int
+            Molecules per N-chunk in MessagePass (controls chem_env peak
+            size).
+        q_points : int
+            Number of q-grid points (Q).
+        eps_embd : float
+            Numerical floor used inside Embed.
+        eps_msgp : float
+            Numerical floor used inside MessagePass.
+        dp_atom_threshold : int, optional
+            Atom-count threshold below which training batches may be
+            routed to the data-parallel path instead of tensor-parallel.
+            0 (default) always uses tensor-parallel.
+        compile : bool, optional
+            If True, torch.compile Embed/MessagePass/OutputHead's
+            checkpointed step functions. Default is False.
+
+        Returns
+        -------
+        None
+        """
+
         super().__init__()
         self._emb      = Embed(lambda_1, q_points, compile=compile)
         self._msg      = MessagePass(lambda_1, lambda_2, lambda_5, msg_seed, q_points, n_chunk=mol_chunk, m_chunk=atm_chunk, compile=compile)
@@ -174,20 +285,32 @@ class ScatterNet(nn.Module):
             float,
         ]:
 
-        """
-        Args:
-            batch: input batch of molecules
-        Returns:
-            iq:          predicted I(q),                     shape (N, Q)
-            f_mags:      per-atom form factor magnitudes,    shape (N, M, Q)
-            sigmas:      per-atom gaussian kernel bandwidth,  shape (N, M, Q)
-            local_batch: the slice of `batch` these outputs correspond to.
-                         Equal to `batch` unchanged unless DP-routed this
-                         batch (in which case N above is the local molecule
-                         count, not the global one) - pass this to the loss,
-                         not the original `batch`.
-            loss_scale:  local_N / global_N when DP-routed; 1.0 otherwise.
-                         Multiply the loss by this before backward().
+        """Run the ScatterNet forward pass, routing to TP, DP, or single-GPU.
+
+        Parameters
+        ----------
+        batch : Batch
+            Input batch of molecules (atom vocabulary, coordinates, and
+            target I(q) values).
+
+        Returns
+        -------
+        torch.Tensor
+            `iq`, predicted I(q), shape (N, Q).
+        torch.Tensor
+            `f_mags`, per-atom form factor magnitudes, shape (N, M, Q).
+        torch.Tensor
+            `sigmas`, per-atom Gaussian kernel bandwidth, shape (N, M, Q).
+        Batch
+            `local_batch`, the slice of `batch` these outputs correspond
+            to. Equal to `batch` unchanged unless this batch was routed to
+            the data-parallel path (in which case N above is the local
+            molecule count, not the global one) - pass this to the loss,
+            not the original `batch`.
+        float
+            `loss_scale`, local_N / global_N when data-parallel routed;
+            1.0 otherwise. Multiply the loss by this before calling
+            backward().
         """
 
         embed_head = self._emb(batch, self._eps_embd)

@@ -19,13 +19,38 @@ from ScatterNet.utils.config           import RunConfig, load_config
 from ScatterNet.utils             import Loss
 
 def _first(x):
-    """collate_fn that unwraps the single-element list from batch_size=1."""
+    """Collate function that unwraps the single-element list from batch_size=1.
+
+    Parameters
+    ----------
+    x : list
+        Single-element list produced by the DataLoader's default batching.
+
+    Returns
+    -------
+    object
+        The one element contained in `x`.
+    """
     return x[0]
 
 def _rclone_push(path: str, dest: str | None):
-    """Copy a checkpoint to a durable rclone remote (e.g. Drive) so it survives a
-    Kaggle session timeout - /kaggle/working is not reliably persisted on a crash.
-    No-op if dest is None or the file is missing; never raises into the train loop."""
+    """Copy a checkpoint to a durable rclone remote so it survives a session timeout.
+
+    /kaggle/working is not reliably persisted on a crash, so checkpoints are
+    also pushed to a remote (e.g. Drive) via rclone. No-op if `dest` is None
+    or the file is missing; never raises into the train loop.
+
+    Parameters
+    ----------
+    path : str
+        Local path of the file to copy.
+    dest : str or None
+        rclone remote destination, or None to skip the push.
+
+    Returns
+    -------
+    None
+    """
     if not dest or not os.path.exists(path):
         return
     try:
@@ -59,6 +84,18 @@ class _LoopProfiler:
     """
 
     def __init__(self, rank: int, device: str, enabled: bool):
+        """Initialize the profiler's timing and memory-tracking state.
+
+        Parameters
+        ----------
+        rank : int
+            Rank of this process, used to tag printed output.
+        device : str
+            Torch device string (e.g. 'cuda:0' or 'cpu').
+        enabled : bool
+            Whether profiling is active. When False, all methods are
+            near-zero no-ops.
+        """
         self.rank    = rank
         self.enabled = enabled
         self.device  = device
@@ -71,11 +108,31 @@ class _LoopProfiler:
         self.peak_bi       = -1       # which batch hit peak_alloc_gb
 
     def _sync(self):
+        """Synchronize the current CUDA device, if profiling on CUDA.
+
+        Returns
+        -------
+        None
+        """
         if self.cuda:
             torch.cuda.synchronize()   # current device (set per-process via set_device)
 
     @contextmanager
     def section(self, name: str, rec: dict | None = None):
+        """Context manager that times a named code section.
+
+        Parameters
+        ----------
+        name : str
+            Name of the section, used as a key in `totals` and `rec`.
+        rec : dict or None, optional
+            Per-batch record dict to also store this section's elapsed
+            time in, keyed by `name`.
+
+        Yields
+        ------
+        None
+        """
         if not self.enabled:
             yield
             return
@@ -91,8 +148,20 @@ class _LoopProfiler:
                 rec[name] = dt
 
     def start_batch(self, rec: dict):
-        """Charge time blocked in the DataLoader (since the previous batch ended)
-        to 'data_wait'. Call at the very top of the loop body, before any .to()."""
+        """Charge time blocked in the DataLoader since the previous batch ended.
+
+        Recorded under the 'data_wait' key. Call at the very top of the loop
+        body, before any `.to()`.
+
+        Parameters
+        ----------
+        rec : dict
+            Per-batch record dict to store 'data_wait' time in.
+
+        Returns
+        -------
+        None
+        """
         if not self.enabled:
             return
         now = perf_counter()
@@ -104,6 +173,18 @@ class _LoopProfiler:
             torch.cuda.reset_peak_memory_stats()
 
     def end_batch(self, rec: dict):
+        """Finalize a batch's timing record and update peak-memory statistics.
+
+        Parameters
+        ----------
+        rec : dict
+            Per-batch record dict, appended to `records` after peak CUDA
+            memory fields are attached.
+
+        Returns
+        -------
+        None
+        """
         if not self.enabled:
             return
         if self.cuda:
@@ -123,6 +204,12 @@ class _LoopProfiler:
               "grad_allreduce", "clip", "step"]
 
     def report(self):
+        """Print the accumulated per-section timing and memory report.
+
+        Returns
+        -------
+        None
+        """
         if not self.enabled or not self.records:
             return
         n      = len(self.records)
@@ -152,6 +239,19 @@ class _LoopProfiler:
         # whether label is "data" or "compute" (different lengths otherwise shift
         # every field after it).
         def _top(key, label):
+            """Print the 3 heaviest batches by a given record key.
+
+            Parameters
+            ----------
+            key : str
+                Record field to rank batches by (e.g. 'data_wait', 'compute').
+            label : str
+                Short label used in the printed line prefix.
+
+            Returns
+            -------
+            None
+            """
             rows = sorted(self.records, key=lambda r: r.get(key, 0.0), reverse=True)[:3]
             for r in rows:
                 mem = f"peak_alloc={r['peak_alloc_gb']:6.2f}G" if "peak_alloc_gb" in r else ""
@@ -190,8 +290,16 @@ class _LoopProfiler:
 
 # CLI
 def _parse_args():
-    """Parse CLI arguments. All model/training flags default to None so that
-    load_config can distinguish 'not provided' from an explicit zero or false."""
+    """Parse CLI arguments.
+
+    All model/training flags default to None so that `load_config` can
+    distinguish 'not provided' from an explicit zero or false.
+
+    Returns
+    -------
+    argparse.Namespace
+        Parsed command-line arguments.
+    """
     p = argparse.ArgumentParser(
         description="Train ScatterNet. All flags override --config values."
     )
@@ -240,11 +348,30 @@ def _parse_args():
 
 # eval helper
 def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
-    """Run one pass over loader without gradients and return (mean_loss, R2).
+    """Run one pass over `loader` without gradients and return (mean_loss, R2).
 
     Both ranks call this with identical loaders (same seed, no shuffle), so
     the TP all_reduce/gather inside the model works correctly. Only rank 0
     uses the returned values for logging and checkpointing.
+
+    Parameters
+    ----------
+    loader : torch.utils.data.DataLoader
+        Loader yielding batches to evaluate over (val or test set).
+    model : ScatterNet
+        Model to evaluate; called in `eval()` mode.
+    criterion : Loss
+        Loss module used to compute the evaluation loss.
+    cfg : RunConfig
+        Run configuration, used for `lambda_6` and `lambda_7`.
+    device : str
+        Torch device to move batch tensors to.
+
+    Returns
+    -------
+    tuple of (float, float)
+        Mean loss over all molecules, and the R2 score computed in
+        log1p space.
     """
     model.eval()
     total_loss = 0.0
@@ -275,9 +402,10 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
 
 # distributed worker
 def _worker(rank: int, cfg: RunConfig):
-    """
-    Per-process training worker. When launched with mp.spawn this runs on
-    rank i with GPU cuda:i. When called directly (single GPU) rank is 0.
+    """Run the per-process training worker for one rank.
+
+    When launched with mp.spawn this runs on rank i with GPU cuda:i. When
+    called directly (single GPU) rank is 0.
 
     Parallelism routing is handled inside ScatterNet.forward, per batch: by
     default atoms are sharded across ranks for tensor parallelism (TP) -
@@ -290,6 +418,18 @@ def _worker(rank: int, cfg: RunConfig):
     (partial gradients per atom shard), and DP relies on ScatterNet.forward's
     loss_scale to make the same SUM reconstruct the correct global-mean
     gradient too - see the comment at the grad_allreduce call site below.
+
+    Parameters
+    ----------
+    rank : int
+        Rank of this process (0-based), also used as the CUDA device index.
+    cfg : RunConfig
+        Full run configuration (paths, model hyperparameters, training
+        schedule, and profiler settings).
+
+    Returns
+    -------
+    None
     """
 
     world_size = torch.cuda.device_count()
@@ -360,9 +500,34 @@ def _worker(rank: int, cfg: RunConfig):
     if cfg.profiler:
         ws_proxy = max(world_size, 1)
         def _bucket_nm_proxy(i):
+            """Compute the N*M_shard compute-time proxy for bucket `i`.
+
+            Parameters
+            ----------
+            i : int
+                Index of the bucket in `train_set._batches`.
+
+            Returns
+            -------
+            int
+                Number of molecules in the bucket times the per-rank
+                atom-shard size (ceil-divided max atom count).
+            """
             rows = train_set._batches[i]
             return len(rows) * ((max(r[2] for r in rows) + ws_proxy - 1) // ws_proxy)
         def _bucket_max_m(i):
+            """Return the raw maximum atom count M for bucket `i`.
+
+            Parameters
+            ----------
+            i : int
+                Index of the bucket in `train_set._batches`.
+
+            Returns
+            -------
+            int
+                Maximum atom count among molecules in the bucket.
+            """
             return max(r[2] for r in train_set._batches[i])
 
         n_each  = 1 + cfg.prof_warmup + cfg.prof_active
@@ -388,6 +553,18 @@ def _worker(rank: int, cfg: RunConfig):
                                  collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin)
         if rank == 0:
             def _describe(i):
+                """Format a bucket's molecule count and max atom count for logging.
+
+                Parameters
+                ----------
+                i : int
+                    Index of the bucket in `train_set._batches`.
+
+                Returns
+                -------
+                str
+                    Human-readable description, e.g. '12 mols x 340 atoms'.
+                """
                 rows = train_set._batches[i]
                 return f"{len(rows)} mols x {max(r[2] for r in rows)} atoms"
             print(f"[profiler] probing {mode}", flush=True)
@@ -476,6 +653,17 @@ def _worker(rank: int, cfg: RunConfig):
     loop_prof = _LoopProfiler(rank, device, enabled=cfg.profiler)
 
     def _on_trace_ready(p):
+        """Handle a completed torch.profiler trace: print a kernel table and save it.
+
+        Parameters
+        ----------
+        p : torch.profiler.profile
+            The profiler instance whose trace just completed.
+
+        Returns
+        -------
+        None
+        """
         # Print a kernel table straight to stdout - TensorBoard's inline view
         # hangs through Kaggle's proxy, but stdout always works. Still write the
         # trace file so it can be opened in Perfetto / chrome://tracing if wanted.
@@ -526,9 +714,22 @@ def _worker(rank: int, cfg: RunConfig):
     )
 
     def _save_resume(ep, batch_idx):
-        """Write the resume checkpoint (weights + optimizer + position) and push it
-        off-box. batch_idx >= 0 marks a mid-epoch save; -1 marks an epoch boundary.
-        Both TP ranks hold identical weights, so rank 0's state_dict is complete."""
+        """Write the resume checkpoint (weights, optimizer, and position) and push it off-box.
+
+        Both TP ranks hold identical weights, so rank 0's state_dict is complete.
+
+        Parameters
+        ----------
+        ep : int
+            Current epoch number.
+        batch_idx : int
+            Batch index within the epoch; -1 marks an epoch boundary,
+            >= 0 marks a mid-epoch save at that batch.
+
+        Returns
+        -------
+        None
+        """
         torch.save({
             "epoch":     ep,
             "batch_idx": batch_idx,
@@ -598,7 +799,20 @@ def _worker(rank: int, cfg: RunConfig):
                 loss = criterion.loss(iq, fmags, sigmas, local_batch, cfg.lambda_6, cfg.lambda_7) * loss_scale
 
             if rank == 0 and cfg.verbosity == "diagnostic":
-                def _s(t): return f"nan={t.isnan().any().item()} inf={t.isinf().any().item()} min={t.float().min().item()} max={t.float().max().item()}"
+                def _s(t):
+                    """Format a tensor's NaN/Inf/min/max summary for debug printing.
+
+                    Parameters
+                    ----------
+                    t : torch.Tensor
+                        Tensor to summarize.
+
+                    Returns
+                    -------
+                    str
+                        Summary string with nan/inf flags and min/max values.
+                    """
+                    return f"nan={t.isnan().any().item()} inf={t.isinf().any().item()} min={t.float().min().item()} max={t.float().max().item()}"
                 if _bi < 10:
                     print(f"  [debug] batch {_bi}  loss={loss.item()}  iq_nan={iq.isnan().any().item()}  iq_inf={iq.isinf().any().item()}", flush=True)
                 if loss.isnan() or loss.isinf():
@@ -739,13 +953,24 @@ def _worker(rank: int, cfg: RunConfig):
 
 # entry point
 def main(cfg: RunConfig | None = None):
-    """
-    Entry point. Pass a RunConfig directly (e.g. from a Kaggle notebook),
-    or leave None to parse sys.argv.
+    """Entry point for training.
+
+    Pass a RunConfig directly (e.g. from a Kaggle notebook), or leave None
+    to parse sys.argv.
 
     With multiple GPUs, launches one process per GPU via mp.spawn.
     Each process initialises NCCL and runs the full training loop with
     M-dimension tensor parallelism.
+
+    Parameters
+    ----------
+    cfg : RunConfig or None, optional
+        Run configuration to use directly. If None, built by parsing
+        CLI arguments and `load_config`.
+
+    Returns
+    -------
+    None
     """
 
     if cfg is None:

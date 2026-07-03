@@ -1,5 +1,6 @@
 import xraydb
 import re
+import time
 import numpy as np
 import torch
 
@@ -15,9 +16,25 @@ def build_fmag_table(
     qgrid:  Float[torch.Tensor, "Q"],
     energy: float,
 ) -> Float[torch.Tensor, "V Q"]:
-    """
-    Build atomic form factor magnitude table for all VOCAB ions.
-    Index 0 is the padding sentinel (all zeros).
+    """Build atomic form factor magnitude table for all VOCAB ions.
+
+    Index 0 is the padding sentinel (all zeros). For transuranic ions the
+    tabulated f0 form factor is used directly; for special-case and regular
+    ions f0 is combined with Chantler anomalous corrections f1/f2 via
+    ``hypot`` to give the energy-dependent form factor magnitude.
+
+    Parameters
+    ----------
+    qgrid : torch.Tensor
+        q-point grid in inverse angstroms, shape ``(Q,)``.
+    energy : float
+        X-ray energy in eV, used for anomalous f1/f2 corrections.
+
+    Returns
+    -------
+    torch.Tensor
+        Form factor magnitude table of shape ``(V, Q)`` where ``V`` is
+        ``len(VOCAB) + 1``. Row 0 is all zeros (padding sentinel).
     """
     table = torch.zeros(len(VOCAB) + 1, len(qgrid))
     sgrid = (qgrid / (4 * torch.pi)).numpy()
@@ -50,11 +67,86 @@ def build_fmag_table(
 
 
 class Baseline(ABC):
+    """Abstract base class for all baseline scattering-curve predictors.
+
+    Subclasses implement ``__call__`` to predict I(q) for a batch of
+    molecules. Baselines that need training statistics (e.g. per-element
+    or per-atom-count means) override ``fit`` to accumulate those
+    statistics from a training loader; baselines that are purely
+    analytical (e.g. form-factor or Guinier based) can rely on the
+    no-op default. ``timed_call`` wraps ``__call__`` with a CPU-time-per-atom
+    measurement, so every baseline is directly comparable on cost without
+    each subclass having to implement its own timing.
+    """
 
     def fit(self, loader: Iterable[Batch]) -> "Baseline":
+        """Fit the baseline to training data.
+
+        Default no-op implementation for baselines that require no
+        training (purely analytical baselines). Subclasses that need
+        training statistics should override this method.
+
+        Parameters
+        ----------
+        loader : Iterable[Batch]
+            Iterable of training batches.
+
+        Returns
+        -------
+        Baseline
+            This instance, to allow chaining (e.g. ``baseline.fit(loader)``).
+        """
         return self
 
     @abstractmethod
     @jaxtyped(typechecker=beartype)
     def __call__(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:
+        """Predict I(q) for every molecule in a batch.
+
+        Parameters
+        ----------
+        batch : Batch
+            Batch of molecules to predict scattering curves for.
+
+        Returns
+        -------
+        torch.Tensor
+            Predicted I(q) curves of shape ``(N, Q)``, one row per
+            molecule in the batch.
+        """
         ...
+
+    def timed_call(
+        self,
+        batch: Batch,
+    ) -> tuple[Float[torch.Tensor, "N Q"], float]:
+        """Predict I(q) for a batch while measuring CPU time spent per atom.
+
+        Wraps ``__call__`` so every baseline - existing and future, with
+        no changes to the subclass itself - can be compared on cost per
+        atom on equal footing.
+
+        Parameters
+        ----------
+        batch : Batch
+            Batch of molecules to predict scattering curves for.
+
+        Returns
+        -------
+        tuple of (torch.Tensor, float)
+            ``(pred, cpu_seconds_per_atom)``. ``pred`` is identical to
+            calling this baseline directly, shape ``(N, Q)``.
+            ``cpu_seconds_per_atom`` is the CPU time spent inside
+            ``__call__`` (measured with ``time.process_time()``, so
+            wall-clock waits and other processes are not counted) divided
+            by the total number of real, non-padding atoms across the
+            batch. 0.0 if the batch has no real atoms.
+        """
+        n_atoms = int(batch.padding_mask().sum().item())
+
+        start   = time.process_time()
+        pred    = self(batch)
+        elapsed = time.process_time() - start
+
+        cpu_seconds_per_atom = elapsed / n_atoms if n_atoms > 0 else 0.0
+        return pred, cpu_seconds_per_atom
