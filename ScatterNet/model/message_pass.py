@@ -87,6 +87,12 @@ class MessagePass(nn.Module):
     _lambda_5: int                          # number of Random Fourier Features (λ₅)
     _nchunk:   int                          # molecules per N-chunk
     _mchunk:   int                          # atoms per M-chunk
+
+    # Shared small-shape tiers for Cn_eff/Cm_eff in forward(): when a bucket's real N or M
+    # is a small fraction of n_chunk/m_chunk, round up to the smallest tier instead of the
+    # full chunk size, bounding the number of distinct compiled shapes to len(_CHUNK_TIERS)
+    # per axis instead of one shape per distinct real size.
+    _CHUNK_TIERS: tuple[int, ...] = (8, 16, 32, 64, 128)
     _proj_agg: nn.Linear                    # projects aggregated context λ₁ → 2λ₁ for MishGLU gating
     _omegafrq: Float[torch.Tensor, "λ₅ 3"]  # fixed RFF frequency matrix: λ₅ random 3-D directions
     _biasterm: nn.Parameter                 # RFF random phase offsets b ∈ R^λ₅
@@ -273,6 +279,16 @@ class MessagePass(nn.Module):
         # dynamic=False: forward() now pads every N-/M-chunk fed to these
         # to exactly n_chunk/m_chunk atoms/molecules, so these functions only ever see one
         # shape for the module's whole lifetime - no need to trace shapes as dynamic.
+        # Exception: forward() rounds down to a small tier (_CHUNK_TIERS) instead of the
+        # full chunk size when a bucket's real N or M is a small fraction of n_chunk/m_chunk
+        # (avoids an 8x+ memory blowup on those buckets - see forward()'s Cn_eff/Cm_eff).
+        # That introduces a handful of extra distinct shapes beyond the one steady-state
+        # (n_chunk, m_chunk) shape, so the default torch._dynamo recompile cache limit (8)
+        # isn't enough headroom; widen it to comfortably fit len(_CHUNK_TIERS) on each axis.
+        if compile:
+            torch._dynamo.config.cache_size_limit = max(
+                torch._dynamo.config.cache_size_limit, 4 * len(self._CHUNK_TIERS)
+            )
         self._step1_fn = torch.compile(self._step1, fullgraph=True) if compile else self._step1
         self._step2_fn = torch.compile(self._step2, fullgraph=True) if compile else self._step2
 
@@ -572,6 +588,45 @@ class MessagePass(nn.Module):
         pad_shape[dim] = pad_to - size
         return torch.cat([t, t.new_zeros(pad_shape)], dim=dim)
 
+    @classmethod
+    def _tier_chunk(cls, real: int, chunk: int) -> int:
+
+        """
+        Effective chunk size for a bucket whose real N or M may be far smaller
+        than the configured chunk.
+
+        Padding a bucket's real size up to the full `chunk` wastes
+        `chunk/real` memory and compute when `real` is a small fraction of
+        `chunk` (see forward()'s Cn_eff/Cm_eff - this is what caused two real
+        OOMs, one on each axis). Rounding up to the exact next multiple of a
+        fine granularity fixes the waste but produces one distinct compiled
+        shape per distinct `real` value, which can exceed torch.compile's
+        recompile cache limit under `fullgraph=True` when many different
+        bucket sizes are seen over an epoch. Rounding up to the smallest
+        shared tier in `_CHUNK_TIERS` instead bounds the number of distinct
+        shapes to `len(_CHUNK_TIERS)`, regardless of how many distinct real
+        sizes occur.
+
+        Parameters
+        ----------
+        real : int
+            The real (unpadded) size along this axis.
+        chunk : int
+            The configured chunk size (`n_chunk` or `m_chunk`). Only called
+            when `real <= chunk`; the tier is capped at `chunk`.
+
+        Returns
+        -------
+        int
+            The smallest tier in `_CHUNK_TIERS` that is `>= real`, capped at
+            `chunk`.
+        """
+
+        for tier in cls._CHUNK_TIERS:
+            if tier >= real:
+                return min(tier, chunk)
+        return chunk
+
     def _all_reduce(self, x: torch.Tensor, use_all_reduce: bool) -> torch.Tensor:
 
         """Apply _AllReduce if a process group is active AND the caller wants one;
@@ -653,12 +708,11 @@ class MessagePass(nn.Module):
         # of huge molecules, e.g. 7 mols x 6046 atoms) have N_real << Cn: padding all the
         # way up to Cn there inflates every per-chunk tensor (chem_env, RFF intermediates)
         # by Cn/N_real - an 8x+ memory/compute blowup on exactly the buckets already
-        # tightest on memory (this caused a real OOM). Round up to a coarser small
-        # granularity instead in that case, so distinct small-N buckets collapse onto a
+        # tightest on memory (this caused a real OOM). Round up to the smallest shared
+        # tier instead (see `_tier_chunk`), so distinct small-N buckets collapse onto a
         # handful of shared compiled shapes rather than either the full Cn (wasteful) or
-        # one shape per distinct N_real (recompile storm).
-        _SMALL_N_GRANULARITY = 8
-        Cn_eff = min(Cn, max(_SMALL_N_GRANULARITY, -(-N_real // _SMALL_N_GRANULARITY) * _SMALL_N_GRANULARITY)) if N_real <= Cn else Cn
+        # one shape per distinct N_real (recompile-limit blowout - hit in practice).
+        Cn_eff = self._tier_chunk(N_real, Cn) if N_real <= Cn else Cn
 
         # Same reasoning on the M (atom) axis: DP-routed buckets with huge N but tiny M
         # (e.g. 5273 mols x 11 atoms) keep M unsharded, so padding M all the way up to
@@ -666,8 +720,7 @@ class MessagePass(nn.Module):
         # on the (N_padded, M_padded, Q, λ₁) tensors materialised across all N-chunks
         # before the final `torch.cat` - this is what actually caused the OOM (a single
         # 5+ GiB allocation on that cat), not the N-axis case above.
-        _SMALL_M_GRANULARITY = 8
-        Cm_eff = min(Cm, max(_SMALL_M_GRANULARITY, -(-M_real // _SMALL_M_GRANULARITY) * _SMALL_M_GRANULARITY)) if M_real <= Cm else Cm
+        Cm_eff = self._tier_chunk(M_real, Cm) if M_real <= Cm else Cm
 
         # Pad N (molecules) and M (atoms) up to multiples of Cn_eff/Cm_eff so every
         # N-chunk/M-chunk fed to the compiled step functions is exactly (Cn_eff, Cm_eff)
