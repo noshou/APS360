@@ -648,12 +648,24 @@ class MessagePass(nn.Module):
         Cn      = self._nchunk
         Cm      = self._mchunk
 
-        # Pad N (molecules) and M (atoms) up to multiples of Cn/Cm so every N-chunk/M-chunk
-        # fed to the compiled step functions is exactly (Cn, Cm) every call - one shape for
-        # the whole run, no recompiles from a ragged tail chunk. Padding is done on
+        # For most buckets N_real >> Cn, so padding N up to a multiple of Cn wastes at
+        # most Cn-1 molecules of compute - negligible. But "heavy-M" buckets (a handful
+        # of huge molecules, e.g. 7 mols x 6046 atoms) have N_real << Cn: padding all the
+        # way up to Cn there inflates every per-chunk tensor (chem_env, RFF intermediates)
+        # by Cn/N_real - an 8x+ memory/compute blowup on exactly the buckets already
+        # tightest on memory (this caused a real OOM). Round up to a coarser small
+        # granularity instead in that case, so distinct small-N buckets collapse onto a
+        # handful of shared compiled shapes rather than either the full Cn (wasteful) or
+        # one shape per distinct N_real (recompile storm).
+        _SMALL_N_GRANULARITY = 8
+        Cn_eff = min(Cn, max(_SMALL_N_GRANULARITY, -(-N_real // _SMALL_N_GRANULARITY) * _SMALL_N_GRANULARITY)) if N_real <= Cn else Cn
+
+        # Pad N (molecules) and M (atoms) up to multiples of Cn_eff/Cm so every N-chunk/M-chunk
+        # fed to the compiled step functions is exactly (Cn_eff, Cm) every call - one shape
+        # per distinct bucket shape, no recompiles from a ragged tail chunk. Padding is done on
         # embeds_raw (Q still singleton) so the Q-expand right after stays a zero-copy
         # stride-0 view instead of materialising a (N, M, Q, λ₁) tensor early.
-        for dim, chunk in ((0, Cn), (1, Cm)):
+        for dim, chunk in ((0, Cn_eff), (1, Cm)):
             embeds_raw   = self._pad_to_multiple(embeds_raw,   chunk, dim)
             sigmas       = self._pad_to_multiple(sigmas,       chunk, dim)
             coord        = self._pad_to_multiple(coord,        chunk, dim)
@@ -662,14 +674,14 @@ class MessagePass(nn.Module):
 
         # expand Q dim from 1 → Q upfront; zero-copy stride-0 view until a contiguous op fires
         embeds = embeds_raw.expand(-1, -1, self._q_points, -1)
-        N, M   = coord.shape[0], coord.shape[1]  # padded sizes; always multiples of Cn/Cm
+        N, M   = coord.shape[0], coord.shape[1]  # padded sizes; N a multiple of Cn_eff, M a multiple of Cm
 
         for _ in range(self._lambda_2):
             new_embeds_n = []
             new_sigmas_n = []
 
-            for n0 in range(0, N, Cn):
-                n1 = n0 + Cn  # N is padded to a multiple of Cn, so every N-chunk is exactly Cn
+            for n0 in range(0, N, Cn_eff):
+                n1 = n0 + Cn_eff  # N is padded to a multiple of Cn_eff, so every N-chunk is exactly Cn_eff
 
                 # Nc derived from emb_s.shape[0] inside the closure rather than closed over as a
                 # variable; Python closures capture by reference so a loop variable would give the
