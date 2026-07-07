@@ -660,12 +660,22 @@ class MessagePass(nn.Module):
         _SMALL_N_GRANULARITY = 8
         Cn_eff = min(Cn, max(_SMALL_N_GRANULARITY, -(-N_real // _SMALL_N_GRANULARITY) * _SMALL_N_GRANULARITY)) if N_real <= Cn else Cn
 
-        # Pad N (molecules) and M (atoms) up to multiples of Cn_eff/Cm so every N-chunk/M-chunk
-        # fed to the compiled step functions is exactly (Cn_eff, Cm) every call - one shape
-        # per distinct bucket shape, no recompiles from a ragged tail chunk. Padding is done on
-        # embeds_raw (Q still singleton) so the Q-expand right after stays a zero-copy
-        # stride-0 view instead of materialising a (N, M, Q, λ₁) tensor early.
-        for dim, chunk in ((0, Cn_eff), (1, Cm)):
+        # Same reasoning on the M (atom) axis: DP-routed buckets with huge N but tiny M
+        # (e.g. 5273 mols x 11 atoms) keep M unsharded, so padding M all the way up to
+        # atm_chunk (e.g. 80) when M_real is a fraction of that wastes ~Cm/M_real memory
+        # on the (N_padded, M_padded, Q, λ₁) tensors materialised across all N-chunks
+        # before the final `torch.cat` - this is what actually caused the OOM (a single
+        # 5+ GiB allocation on that cat), not the N-axis case above.
+        _SMALL_M_GRANULARITY = 8
+        Cm_eff = min(Cm, max(_SMALL_M_GRANULARITY, -(-M_real // _SMALL_M_GRANULARITY) * _SMALL_M_GRANULARITY)) if M_real <= Cm else Cm
+
+        # Pad N (molecules) and M (atoms) up to multiples of Cn_eff/Cm_eff so every
+        # N-chunk/M-chunk fed to the compiled step functions is exactly (Cn_eff, Cm_eff)
+        # every call - one shape per distinct bucket shape, no recompiles from a ragged
+        # tail chunk. Padding is done on embeds_raw (Q still singleton) so the Q-expand
+        # right after stays a zero-copy stride-0 view instead of materialising a
+        # (N, M, Q, λ₁) tensor early.
+        for dim, chunk in ((0, Cn_eff), (1, Cm_eff)):
             embeds_raw   = self._pad_to_multiple(embeds_raw,   chunk, dim)
             sigmas       = self._pad_to_multiple(sigmas,       chunk, dim)
             coord        = self._pad_to_multiple(coord,        chunk, dim)
@@ -674,7 +684,7 @@ class MessagePass(nn.Module):
 
         # expand Q dim from 1 → Q upfront; zero-copy stride-0 view until a contiguous op fires
         embeds = embeds_raw.expand(-1, -1, self._q_points, -1)
-        N, M   = coord.shape[0], coord.shape[1]  # padded sizes; N a multiple of Cn_eff, M a multiple of Cm
+        N, M   = coord.shape[0], coord.shape[1]  # padded sizes; N a multiple of Cn_eff, M a multiple of Cm_eff
 
         for _ in range(self._lambda_2):
             new_embeds_n = []
@@ -691,7 +701,7 @@ class MessagePass(nn.Module):
                     cont = self._PassContainer(
                         M        = M,
                         Nchnk    = Nc_s,
-                        Mchnk    = Cm,
+                        Mchnk    = Cm_eff,
                         emb_n    = emb_s,
                         msk_n    = msk_s,
                         ffs_n    = ffs_s,
