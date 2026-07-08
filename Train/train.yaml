@@ -5,7 +5,7 @@
 
 # paths - local defaults; override on the CLI for other environments
 hdf5:        Preprocess/I(q)@L=50.h5
-db:          Preprocess/scatternet
+db:          Preprocess/iq_train_set
 ckpt_best:   scatternet_best.pt
 ckpt_resume: scatternet_resume.pt
 metrics:     scatternet_metrics.json
