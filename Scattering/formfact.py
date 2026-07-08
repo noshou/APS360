@@ -1,8 +1,9 @@
 import re
-import numpy as np
-from beartype import beartype
+import numpy        as np
 import numpy.typing as npt
-from xraydb import f0, f1_chantler, f2_chantler, chantler_energies
+
+from beartype    import beartype
+from xraydb      import f0, f1_chantler, f2_chantler, chantler_energies
 from dataclasses import dataclass, field
 
 # Strip charge notation to get bare element symbol (e.g. Mn2+ → Mn, Na+ → Na)

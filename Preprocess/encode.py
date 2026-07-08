@@ -1,11 +1,11 @@
 import re
-import json
 import sqlite3
 import h5py
 import hdf5plugin  # noqa: F401
-from beartype import beartype
+
+from beartype        import beartype
 from beartype.typing import List, Tuple
-from .vocab import VOCAB
+from .vocab          import VOCAB
 import os
 
 class Encoding:
@@ -30,22 +30,23 @@ class Encoding:
     """
 
     _CHARGE_RE = re.compile(r'[0-9]*[+\-]+$')
-    
+
     _ENCODING_SCHEMA = """
     CREATE TABLE IF NOT EXISTS items (
-        stem      TEXT       NOT NULL,
-        grp       TEXT       NOT NULL,
-        atoms     INTEGER    NOT NULL,
-        VOCAB_idx JSON_ARRAY NOT NULL,
+        stem      TEXT    NOT NULL,
+        grp       TEXT    NOT NULL,
+        atoms     INTEGER NOT NULL,
+        VOCAB_idx BLOB    NOT NULL,
         PRIMARY KEY (stem, grp)
     );
-    CREATE INDEX IF NOT EXISTS idx_atoms ON items(atoms);
     """
+
+    _INDEX_SCHEMA = "CREATE INDEX IF NOT EXISTS idx_atoms ON items(atoms);"
 
     _CHUNK = 10_000
     _path: str
     _max:  int
-    
+
     _initialized = False
     _instance = None
 
@@ -92,11 +93,11 @@ class Encoding:
         if self._initialized:
             return
 
-        # Register adapters before opening the connection context
-        sqlite3.register_adapter(list, self._adapt_array)
-        sqlite3.register_converter("JSON_ARRAY", self._convert_array)
+        sqlite3.register_converter("BLOB", self._convert_array)
 
         conn = sqlite3.connect(_DBPATH, detect_types=sqlite3.PARSE_DECLTYPES)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")  # checkpoint once at close, not every 4 MB
         cursor = conn.cursor()
         cursor.executescript(self._ENCODING_SCHEMA)
 
@@ -121,13 +122,17 @@ class Encoding:
                         except (LookupError, ValueError):
                             continue
 
-                        buf.append((stem, group_name, len(enc), enc))
+                        buf.append((stem, group_name, len(enc), bytes(enc)))
                         if len(buf) >= self._CHUNK:
                             cursor.executemany(_ENCODING_ADD, buf)
+                            conn.commit()
                             buf.clear()
                 if buf:
                     cursor.executemany(_ENCODING_ADD, buf)
+                    conn.commit()
 
+            # Build index after all data inserted — single-pass B-tree, no fragmentation
+            cursor.executescript(self._INDEX_SCHEMA)
             conn.commit()
         finally:
             cursor.execute("SELECT MAX(atoms) FROM items")
@@ -161,37 +166,11 @@ class Encoding:
         else:
             return self._CHARGE_RE.sub('', ion).lower()
 
-    @beartype
-    def _adapt_array(self, lst: list) -> str:
-        """Serialize a list to a JSON string for SQLite storage.
+    def _adapt_array(self, lst: list) -> bytes:
+        return bytes(lst)
 
-        Parameters
-        ----------
-        lst : list
-            List to serialize.
-
-        Returns
-        -------
-        str
-            JSON-encoded representation of `lst`.
-        """
-        return json.dumps(lst)
-
-    @beartype
-    def _convert_array(self, text: bytes) -> list:
-        """Deserialize a JSON-encoded SQLite column back into a list.
-
-        Parameters
-        ----------
-        text : bytes
-            UTF-8 encoded JSON bytes read from the database.
-
-        Returns
-        -------
-        list
-            The decoded list.
-        """
-        return json.loads(text.decode("utf-8"))
+    def _convert_array(self, blob: bytes) -> list:
+        return list(blob)
 
     @beartype
     def _encode_ions(self, ions: List[str]) -> List[int]:
@@ -225,7 +204,7 @@ class Encoding:
         if len(enc) == 0:
             raise ValueError("ion list is empty")
         return enc
-    
+
     @beartype
     def get_in_range(self, min_atoms: int, max_atoms: int) -> List[Tuple[str, str, int, List[int]]]:
         """Return all molecules whose atom count falls in [min_atoms, max_atoms].
@@ -256,6 +235,7 @@ class Encoding:
             ORDER BY atoms ASC
         """
 
+        sqlite3.register_converter("BLOB", self._convert_array)
         conn = sqlite3.connect(self._path, detect_types=sqlite3.PARSE_DECLTYPES)
         try:
             cursor = conn.cursor()
@@ -313,7 +293,7 @@ class Encoding:
         finally:
             conn.close()
         return self._max
-    
+
     def count(self) -> int:
         """Return the total number of molecules in the dataset.
 

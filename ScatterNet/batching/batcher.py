@@ -1,10 +1,11 @@
 import bisect
-from Preprocess import Encoding
-from beartype.typing import List, Tuple
-import h5py
-from .batch_set import BatchSet
 import numpy as np
-from numpy.random import default_rng
+import h5py
+
+from Preprocess      import Encoding
+from beartype.typing import List, Tuple
+from .batch_set      import BatchSet
+from numpy.random    import default_rng
 
 _TRAIN = 0.7
 _VAL   = 0.15

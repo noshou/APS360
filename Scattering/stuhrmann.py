@@ -1,8 +1,39 @@
-import numpy as np
+import os
+import numpy        as np
 import numpy.typing as npt
-from beartype import beartype
+import torch
+
+from beartype         import beartype
 from .spherical_funcs import sphHarm, sphBess
-from .formfact import FormFactors
+from .formfact        import FormFactors
+
+def _detect_gpu() -> tuple[torch.device, torch.dtype, torch.dtype | None, bool] | None:
+    """Return (device, float_dtype, complex_dtype_or_None, is_dml) or None.
+
+    Set env var FORCE_CPU=1 to disable GPU detection entirely.
+    DirectML (AMD/Intel via DirectX 12) does not support ComplexFloat, so we
+    use a real-split path (is_dml=True, cdtype=None) and compute real/imaginary
+    parts separately.
+    CUDA/ROCm uses float64/complex128 for full precision.
+    """
+    if os.environ.get('FORCE_CPU'):
+        return None
+    try:
+        import torch_directml           # Windows AMD/Intel GPU via DirectX 12
+        return torch_directml.device(), torch.float32, None, True
+    except ImportError:
+        pass
+    if torch.cuda.is_available():       # CUDA (Kaggle T4) or ROCm (native Linux)
+        return torch.device('cuda'), torch.float64, torch.complex128, False
+    return None
+
+# GPU quad (device, fdtype, cdtype_or_None, is_dml), or None if CPU / FORCE_CPU.
+_GPU: tuple[torch.device, torch.dtype, torch.dtype | None, bool] | None = _detect_gpu()
+
+# Atoms below this threshold are faster on CPU (GPU transfer cost > compute gain).
+# Above it, the (K, N) @ (N, Q) matmul is large enough to justify the round-trip.
+# Empirically: ~1 ms PCIe transfer at N=1000; CPU compute at N=1000 ≈ 7 ms.
+_GPU_THRESHOLD: int = 200
 
 
 class StuhrmannMixin:
@@ -32,6 +63,11 @@ class StuhrmannMixin:
         Output index: k = l*(l+1)//2 + m  for l = 0..lMax, m = 0..l.
         Total modes: (lMax+1)*(lMax+2)//2.
 
+        sphHarm and sphBess stay scipy/numpy — they are O(K·N) and O(L·Q·N)
+        respectively and not the bottleneck.  The dominant cost is the inner
+        matmul Y_l @ W.T which is O(K·N·Q) and runs on _DEVICE (GPU when
+        available, CPU otherwise).
+
         Parameters
         ----------
         ff : FormFactors
@@ -57,28 +93,91 @@ class StuhrmannMixin:
         if missing:
             raise ValueError(f"stuhrmann: ions {missing} in molecule not found in FormFactors")
 
-        N_reduced = (lMax + 1) * (lMax + 2) // 2
-        B_lm = np.zeros((N_reduced, ff.qvals.size), dtype=np.complex128)
-
-        # Process atoms in chunks to bound peak memory.
-        # Peak per chunk: Y~(lMax+1)²×chunk×16B + j~(lMax+1)×Q×chunk×8B.
-        # At chunk=5000, lMax=50, Q=51 this is ~312 MB - safe for WSL.
-        CHUNK = 5_000
         N = len(self.elms)
-        for start in range(0, N, CHUNK):
-            sl   = slice(start, min(start + CHUNK, N))
-            Y    = sphHarm(lMax, self.theta[sl], self.phi[sl])   # ((lMax+1)(lMax+2)//2, chunk)
-            j    = sphBess(ff.qvals, lMax, self.r[sl])           # (lMax+1, Q, chunk)
-            f    = np.stack([ff.ff[ion] for ion in self.elms[sl]])  # (chunk, Q)
-            Y_conj = Y.conj()                                    # (K, chunk) - once per chunk
-            for l in range(lMax + 1):
-                W  = f.T * j[l]                                  # (Q, chunk)
-                k0 = l * (l + 1) // 2
-                Y_l = Y_conj[k0 : k0 + l + 1]                   # (l+1, chunk)
-                B_lm[k0 : k0 + l + 1] += Y_l @ W.T              # (l+1, Q)
 
-        # Precompute ±m symmetry weights: m=0 → 1, m>0 → 2.
-        weights = np.array([2.0 - (m == 0)
-                            for l in range(lMax + 1) for m in range(l + 1)])  # (N_reduced,)
-        I_q = (weights[:, None] * np.abs(B_lm) ** 2).sum(axis=0) * 4 * np.pi
-        return I_q.astype(np.float64), B_lm
+        use_gpu = _GPU is not None and N >= _GPU_THRESHOLD
+        if use_gpu:
+            try:
+                return self._stuhrmann_compute(_GPU, ff, lMax, N)  # type: ignore[arg-type]
+            except Exception:
+                pass  # DirectML failed — fall through to CPU
+
+        cpu_quad = (torch.device('cpu'), torch.float64, torch.complex128, False)
+        return self._stuhrmann_compute(cpu_quad, ff, lMax, N)
+
+    def _stuhrmann_compute(
+        self,
+        quad:  tuple,
+        ff:    FormFactors,
+        lMax:  int,
+        N:     int,
+    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.complex128]]:
+        device, fdtype, cdtype, is_dml = quad
+
+        N_reduced = (lMax + 1) * (lMax + 2) // 2
+        Q         = ff.qvals.size
+
+        # DirectML does not support ComplexFloat kernels, so we split B_lm into
+        # real and imaginary parts and perform two real matmuls per l-band instead.
+        # The math: (Y_r + i·Y_i) @ W.T = (Y_r @ W.T) + i·(Y_i @ W.T)
+        # |B_lm|² = B_r² + B_i²  — pure real, no complex ops needed on device.
+        if is_dml:
+            B_r = torch.zeros((N_reduced, Q), dtype=fdtype, device=device)
+            B_i = torch.zeros((N_reduced, Q), dtype=fdtype, device=device)
+        else:
+            B_lm = torch.zeros((N_reduced, Q), dtype=cdtype, device=device)
+
+        # Process atoms in chunks to bound peak GPU memory.
+        # Peak per chunk on device (DML real-split, float32):
+        #   Y_r + Y_i ~ 2×K×chunk×4B + j~(L+1)×Q×chunk×4B + f~chunk×Q×4B.
+        # At chunk=5000, lMax=50, Q=51: ~290 MB — well within 8 GB VRAM.
+        CHUNK = 5_000
+        for start in range(0, N, CHUNK):
+            sl = slice(start, min(start + CHUNK, N))
+
+            Y = sphHarm(lMax, self.theta[sl], self.phi[sl])      # (K, chunk), complex128
+            j = sphBess(ff.qvals, lMax, self.r[sl])              # (lMax+1, Q, chunk), float64
+            f = np.stack([ff.ff[ion] for ion in self.elms[sl]])  # (chunk, Q), float64
+
+            j_t = torch.as_tensor(j).to(device=device, dtype=fdtype)  # (lMax+1, Q, chunk)
+
+            if is_dml:
+                # Split f = f_r + i·f_i (f_r = f0+f1, f_i = f2) into real tensors.
+                # Full expansion: (f_r+i·f_i)·j·(Y_r+i·Y_i)
+                #   B_r += j·(f_r·Y_r - f_i·Y_i)
+                #   B_i += j·(f_r·Y_i + f_i·Y_r)
+                Y_conj = np.conj(Y)
+                Y_r  = torch.as_tensor(Y_conj.real).to(device=device, dtype=fdtype)  # (K, chunk)
+                Y_i  = torch.as_tensor(Y_conj.imag).to(device=device, dtype=fdtype)  # (K, chunk)
+                f_rt = torch.as_tensor(np.real(f)).to(device=device, dtype=fdtype)   # (chunk, Q)
+                f_it = torch.as_tensor(np.imag(f)).to(device=device, dtype=fdtype)   # (chunk, Q) f2
+                for l in range(lMax + 1):
+                    Wr = f_rt.T * j_t[l]   # (Q, chunk)
+                    Wi = f_it.T * j_t[l]   # (Q, chunk)
+                    k0 = l * (l + 1) // 2
+                    Yl_r = Y_r[k0 : k0 + l + 1]   # (l+1, chunk)
+                    Yl_i = Y_i[k0 : k0 + l + 1]   # (l+1, chunk)
+                    B_r[k0 : k0 + l + 1] += Yl_r @ Wr.T - Yl_i @ Wi.T  # (l+1, Q)
+                    B_i[k0 : k0 + l + 1] += Yl_r @ Wi.T + Yl_i @ Wr.T  # (l+1, Q)
+            else:
+                # Keep f fully complex so f2 flows through naturally.
+                f_t  = torch.as_tensor(f).to(device=device, dtype=cdtype)            # (chunk, Q)
+                Y_t  = torch.as_tensor(np.conj(Y)).to(device=device, dtype=cdtype)   # (K, chunk)
+                for l in range(lMax + 1):
+                    W   = f_t.T * j_t[l].to(dtype=cdtype)                   # (Q, chunk) complex
+                    k0  = l * (l + 1) // 2
+                    Y_l = Y_t[k0 : k0 + l + 1]                              # (l+1, chunk)
+                    B_lm[k0 : k0 + l + 1] += Y_l @ W.T                     # (l+1, Q)
+
+        # ±m symmetry weights: m=0 → 1, m>0 → 2.
+        weights = torch.tensor(
+            [2.0 - (m == 0) for l in range(lMax + 1) for m in range(l + 1)],
+            dtype=fdtype, device=device,
+        )
+        if is_dml:
+            I_q    = (weights[:, None] * (B_r ** 2 + B_i ** 2)).sum(dim=0) * (4 * np.pi)
+            B_lm_np = (B_r.cpu().numpy() + 1j * B_i.cpu().numpy()).astype(np.complex128)
+            return I_q.cpu().numpy().astype(np.float64), B_lm_np
+        else:
+            I_q = (weights[:, None] * B_lm.abs() ** 2).sum(dim=0).real * (4 * np.pi)
+            return I_q.cpu().numpy().astype(np.float64), B_lm.cpu().numpy().astype(np.complex128)

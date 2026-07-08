@@ -1,8 +1,9 @@
-from jaxtyping import Bool, Float, Int, jaxtyped
-from beartype import beartype
-from beartype.typing import List
-from dataclasses import dataclass
 import torch
+
+from jaxtyping          import Bool, Float, Int, jaxtyped
+from beartype           import beartype
+from beartype.typing    import List
+from dataclasses        import dataclass
 from torch.nn.utils.rnn import pad_sequence
 
 @jaxtyped(typechecker=beartype)

@@ -6,17 +6,16 @@ import subprocess
 import torch
 import torch.distributed as dist
 
-from contextlib import contextmanager
-from time       import perf_counter
-
+from contextlib                  import contextmanager
+from time                        import perf_counter
 from torch.multiprocessing.spawn import spawn as mp_spawn  # type: ignore[attr-defined]
 from dataclasses                 import replace as dc_replace
 from torch.utils.data            import DataLoader, Subset
 from Preprocess                  import Encoding
 from ScatterNet                  import ScatterNet
 from ScatterNet.batching         import Batcher
-from ScatterNet.utils.config           import RunConfig, load_config
-from ScatterNet.utils             import Loss
+from ScatterNet.utils.config     import RunConfig, load_config
+from ScatterNet.utils            import Loss
 
 def _first(x):
     """Collate function that unwraps the single-element list from batch_size=1.
@@ -472,7 +471,7 @@ def _worker(rank: int, cfg: RunConfig):
     )
     train_set, val_set, test_set = batcher.get_sets()
 
-    pin = device != "cpu"
+    pin = device != "cpu" and not str(device).startswith("privateuseone")
     pw  = cfg.num_workers > 0
     train_loader = DataLoader(train_set, batch_size=1, shuffle=True,  collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
     val_loader   = DataLoader(val_set,   batch_size=1, shuffle=False, collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin, persistent_workers=pw)
@@ -533,22 +532,38 @@ def _worker(rank: int, cfg: RunConfig):
         n_each  = 1 + cfg.prof_warmup + cfg.prof_active
         n_group = max(1, n_each // 3)
 
-        by_nm = sorted(range(len(train_set)), key=_bucket_nm_proxy, reverse=True)
-        by_m  = sorted(range(len(train_set)), key=_bucket_max_m,   reverse=True)
+        if cfg.prof_molecules:
+            # hardcoded fixture list — build a lookup from (grp, stem) → batch index
+            key_to_bi: dict = {}
+            for bi, batch in enumerate(train_set._batches):
+                for grp, stem, _ in batch:
+                    key_to_bi[(grp, stem)] = bi
+            fixture_bis: list[int] = []
+            for grp, stem in cfg.prof_molecules:
+                bi = key_to_bi.get((grp, stem))
+                if bi is not None and bi not in fixture_bis:
+                    fixture_bis.append(bi)
+            worst = fixture_bis
+            n_hm = min(n_group, len(worst))
+            prof_group_bounds = (n_hm, min(2 * n_group, len(worst)))
+            mode = f"hardcoded fixtures ({len(worst)} batches)"
+        else:
+            by_nm = sorted(range(len(train_set)), key=_bucket_nm_proxy, reverse=True)
+            by_m  = sorted(range(len(train_set)), key=_bucket_max_m,   reverse=True)
 
-        heavy_nm = by_nm[:n_group]
-        seen     = set(heavy_nm)
-        heavy_m  = [i for i in by_m if i not in seen][:n_group]
-        seen    |= set(heavy_m)
+            heavy_nm = by_nm[:n_group]
+            seen     = set(heavy_nm)
+            heavy_m  = [i for i in by_m if i not in seen][:n_group]
+            seen    |= set(heavy_m)
 
-        n_regular  = max(0, n_each - len(heavy_nm) - len(heavy_m))
-        mid        = len(by_nm) // 2
-        band_start = max(0, mid - n_regular)
-        regular    = [i for i in by_nm[band_start:] if i not in seen][:n_regular]
+            n_regular  = max(0, n_each - len(heavy_nm) - len(heavy_m))
+            mid        = len(by_nm) // 2
+            band_start = max(0, mid - n_regular)
+            regular    = [i for i in by_nm[band_start:] if i not in seen][:n_regular]
 
-        worst = heavy_nm + heavy_m + regular
-        prof_group_bounds = (len(heavy_nm), len(heavy_nm) + len(heavy_m))
-        mode  = f"{len(heavy_nm)} heaviest N*M_shard + {len(heavy_m)} heaviest M + {len(regular)} median"
+            worst = heavy_nm + heavy_m + regular
+            prof_group_bounds = (len(heavy_nm), len(heavy_nm) + len(heavy_m))
+            mode  = f"{len(heavy_nm)} heaviest N*M_shard + {len(heavy_m)} heaviest M + {len(regular)} median"
         prof_loader = DataLoader(Subset(train_set, worst), batch_size=1, shuffle=False,
                                  collate_fn=_first, num_workers=cfg.num_workers, pin_memory=pin)
         if rank == 0:

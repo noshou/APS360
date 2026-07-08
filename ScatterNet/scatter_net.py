@@ -1,13 +1,13 @@
 import torch
 import torch.distributed as dist
 
-from dataclasses        import replace as _dc_replace
-from torch              import nn
-from jaxtyping          import Float, jaxtyped
-from beartype           import beartype
-from beartype.typing    import Tuple
-from .batching          import Batch
-from .model             import Embed, MessagePass, OutputHead
+from dataclasses     import replace as _dc_replace
+from torch           import nn
+from jaxtyping       import Float, jaxtyped
+from beartype        import beartype
+from beartype.typing import Tuple
+from .batching       import Batch
+from .model          import Embed, MessagePass, OutputHead
 
 
 class _DistributedSum(torch.autograd.Function):

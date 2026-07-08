@@ -1,7 +1,8 @@
-import numpy as np
-from beartype import beartype
-from scipy.special import spherical_jn, sph_harm_y
+import numpy        as np
 import numpy.typing as npt
+
+from beartype      import beartype
+from scipy.special import spherical_jn, sph_harm_y
 
 @beartype
 def sphHarm(

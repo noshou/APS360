@@ -1,3 +1,14 @@
+# Default install (CPU / Kaggle CUDA): pip install -r requirements.txt
+# -----------------------------------------------------------------------
+# ROCm variant (Vega64, gfx900, native Linux or WSL2 w/ ROCm 5.7 driver):
+#   pip install -r requirements.txt --index-url https://download.pytorch.org/whl/rocm5.7
+#   then swap the torch line below to: torch==2.3.1+rocm5.7
+#
+# ROCm 5.7 is the last release with official gfx900 (Vega 10 / GCN5) support.
+# ROCm 6.0+ dropped gfx900 from the support matrix.
+# Required env var for gfx900 ISA (fixes sramecc flag mismatch):
+#   export HSA_OVERRIDE_GFX_VERSION=9.0.0
+# -----------------------------------------------------------------------
 torch==2.12.0
 numpy==2.4.6
 scipy==1.17.1

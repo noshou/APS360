@@ -1,6 +1,7 @@
 import torch
+
 from jaxtyping import Float
-from typing import NamedTuple
+from typing    import NamedTuple
 
 class LayerHead(NamedTuple):
     

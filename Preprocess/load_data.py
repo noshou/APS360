@@ -1,12 +1,13 @@
-import numpy as np
+import numpy  as np
 import pandas as pd
 import h5py, os
 import hdf5plugin  # pip install hdf5plugin
-from beartype import beartype
-from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
-from itertools import islice
 import sys
-from tqdm import tqdm
+
+from beartype            import beartype
+from concurrent.futures  import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from itertools           import islice
+from tqdm                import tqdm
 from Scattering.formfact import FormFactors
 from Scattering.molecule import Molecule
 
@@ -48,11 +49,20 @@ def _process_mol(xyz_path: str) -> tuple[str, np.ndarray, Molecule] | None:
         intensity, and `mol` is the parsed `Molecule`. Returns None if
         parsing or the Stuhrmann computation raises any exception.
     """
-    assert _ff is not None and _lMax is not None
     try:
+        assert _ff is not None and _lMax is not None
         mol = Molecule.fromXYZ(xyz_path)
         I_q, _ = mol.stuhrmann(_ff, _lMax)
-    except Exception:
+    except Exception as _e:
+        # Log first occurrence of each unique error type to stderr for diagnosis.
+        _key = type(_e).__name__ + ':' + str(_e)[:120]
+        if not hasattr(_process_mol, '_seen'):
+            _process_mol._seen = set()  # type: ignore[attr-defined]
+        if _key not in _process_mol._seen: #type: ignore
+            _process_mol._seen.add(_key)   #type: ignore
+            import traceback as _tb
+            print(f"[_process_mol] FAIL {os.path.basename(xyz_path)}: {_key}", flush=True)
+            _tb.print_exc()
         return None
     return os.path.basename(xyz_path)[:-4], I_q, mol
 
@@ -101,9 +111,10 @@ def buildDB(
     ff: FormFactors,
     lMax: int,
     out_path: str,
-    sources_tsv: str | None = None,
-    makeup_tsv: str | None  = None,
-    workers: int | None     = None,
+    sources_tsv: str | None         = None,
+    makeup_tsv: str | None          = None,
+    workers: int | None             = None,
+    atom_range: tuple[int,int]|None = None,
     ) -> None:
 
     """Compute Stuhrmann decompositions for all XYZ files and write to an HDF5 database.
@@ -157,6 +168,70 @@ def buildDB(
     data_compress = hdf5plugin.Zfp(reversible=True)                # type: ignore[attr-defined]
     meta_compress = hdf5plugin.Bitshuffle(cname='zstd', clevel=22) # type: ignore[attr-defined]
 
+    # Integrity check: if the file exists but is corrupt, auto-recover by
+    # copying readable groups to a new file before proceeding.
+    if os.path.exists(out_path):
+        try:
+            with h5py.File(out_path, 'r') as _chk:
+                _ = list(_chk.keys())
+                # Also probe group-level keys to catch metadata corruption
+                # that only surfaces when iterating below root level.
+                for _gname in groups:
+                    if _gname in _chk:
+                        _ = list(_chk[_gname].keys()) #type: ignore
+        except Exception as _e:
+            # "already open for write" means HDF5 consistency flag was left set
+            # by an abrupt kill — h5clear fixes it without touching data.
+            if any(s in str(_e) for s in ('already open for write', 'file consistency', 'bad object header version')):
+                import subprocess, platform
+                print(f"[buildDB] Clearing HDF5 consistency flags on {out_path}...")
+                if platform.system() == 'Windows':
+                    # h5clear is not available natively on Windows; run via WSL.
+                    wsl_path = out_path.replace('\\', '/').replace('C:', '/mnt/c')
+                    subprocess.run(['wsl', '-d', 'Ubuntu-24.04', '--', 'h5clear', '-s', wsl_path], check=True)
+                else:
+                    subprocess.run(['h5clear', '-s', out_path], check=True)
+                print("[buildDB] Flags cleared, proceeding normally.")
+            else:
+                print(f"[buildDB] WARNING: {out_path} is corrupt ({_e}). Auto-recovering...")
+                _tmp = out_path + '.recovering.h5'
+                _bad = out_path + '.corrupt.h5'
+                try:
+                    with h5py.File(out_path, 'r') as _src, h5py.File(_tmp, 'w') as _dst:
+                        for _key in ('q_grid', 'sources_tsv', 'makeup_tsv'):
+                            try:
+                                _src.copy(_key, _dst)
+                            except Exception:
+                                pass
+                        for _attr in ('lMax', 'energy'):
+                            if _attr in _src.attrs:
+                                _dst.attrs[_attr] = _src.attrs[_attr]
+                        for _gname in groups:
+                            _dst.create_group(_gname)
+                            _ok = 0
+                            try:
+                                for _mol in _src[_gname]: #type: ignore
+                                    try:
+                                        _src.copy(f'{_gname}/{_mol}', _dst[_gname])
+                                        _ok += 1
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            print(f"[buildDB]   recovered {_gname}: {_ok}")
+                except Exception as _e2:
+                    print(f"[buildDB]   recovery failed ({_e2}), starting fresh")
+                    if os.path.exists(_tmp):
+                        os.remove(_tmp)
+                    _tmp = None
+                if _tmp and os.path.exists(_tmp):
+                    os.rename(out_path, _bad)
+                    os.rename(_tmp, out_path)
+                    print(f"[buildDB]   corrupt file saved as {_bad}")
+                else:
+                    os.rename(out_path, _bad)
+                    print(f"[buildDB]   starting fresh (corrupt file saved as {_bad})")
+
     with h5py.File(out_path, 'a', libver='latest') as hf:
 
         hf.attrs['lMax']   = lMax
@@ -183,10 +258,20 @@ def buildDB(
                     **meta_compress
                     )
 
-        all_xyz = {
-            gname: [e.path for e in os.scandir(gdir) if e.name.endswith('.xyz')]
-            for gname, gdir in groups.items()
-        }
+        def _atom_count(path: str) -> int | None:
+            try:
+                with open(path) as _f:
+                    return int(_f.readline())
+            except (ValueError, OSError):
+                return None
+
+        all_xyz = {}
+        for gname, gdir in groups.items():
+            paths = [e.path for e in os.scandir(gdir) if e.name.endswith('.xyz')]
+            if atom_range is not None:
+                lo, hi = atom_range
+                paths = [p for p in paths if (n := _atom_count(p)) is not None and lo <= n <= hi]
+            all_xyz[gname] = paths
         total = sum(len(v) for v in all_xyz.values())
 
         _TMP       = '__tmp__'
@@ -197,15 +282,20 @@ def buildDB(
         _n_workers = workers or os.cpu_count() or 1
         _inflight  = _n_workers * 4
 
-        with ProcessPoolExecutor(
-            max_workers=_n_workers,
-            initializer=_worker_init,
-            initargs=(ff, lMax),
-        ) as pool, tqdm(
-            total=total, unit='mol', file=sys.stderr, dynamic_ncols=True,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, {rate_fmt}]{postfix}',
-            miniters=100, mininterval=2.0,
-        ) as pbar:
+        def _make_pool():
+            return ProcessPoolExecutor(
+                max_workers=_n_workers,
+                initializer=_worker_init,
+                initargs=(ff, lMax),
+            )
+
+        pool = _make_pool()
+        try:
+          with tqdm(
+              total=total, unit='mol', file=sys.stderr, dynamic_ncols=True,
+              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, {rate_fmt}]{postfix}',
+              miniters=100, mininterval=2.0,
+          ) as pbar:
             for group_name, xyz_paths in all_xyz.items():
                 hf_group = hf.require_group(group_name)
 
@@ -238,15 +328,47 @@ def buildDB(
                     # with FIRST_COMPLETED avoids rebuilding the waiter set on
                     # every single completion (the O(n²) trap of repeatedly
                     # calling next(as_completed(futures))).
-                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    try:
+                        done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    except Exception:
+                        done = set()
 
                     for fut in done:
-                        del futures[fut]
-                        nxt = next(it, None)
-                        if nxt is not None:
-                            futures[pool.submit(_process_mol, nxt)] = nxt
+                        path = futures.pop(fut)
+                        try:
+                            nxt = next(it, None)
+                            if nxt is not None:
+                                futures[pool.submit(_process_mol, nxt)] = nxt
+                        except BrokenProcessPool:
+                            pbar.write(f"[buildDB] pool broken after {path}, restarting...")
+                            hf.flush()
+                            pool.shutdown(wait=False)
+                            pool = _make_pool()
+                            # Re-queue remaining inflight paths (excluding the crashed one)
+                            remaining = list(futures.values())
+                            futures = {}
+                            for p in remaining:
+                                futures[pool.submit(_process_mol, p)] = p
+                            if nxt is not None:
+                                futures[pool.submit(_process_mol, nxt)] = nxt
+                            break  # restart while loop with new pool
 
-                        result = fut.result()
+                        try:
+                            result = fut.result()
+                        except BrokenProcessPool:
+                            pbar.write(f"[buildDB] pool broken getting result, restarting...")
+                            hf.flush()
+                            pool.shutdown(wait=False)
+                            pool = _make_pool()
+                            remaining = list(futures.values())
+                            futures = {}
+                            for p in remaining:
+                                futures[pool.submit(_process_mol, p)] = p
+                            break
+                        except Exception:
+                            pbar.update()
+                            continue
+
                         if result is None:
                             pbar.update()
                             continue
@@ -284,3 +406,5 @@ def buildDB(
                                 f"{kb_per_mol:.1f} KB/mol | "
                                 f"est. total {est_gb:.0f} GB"
                             )
+        finally:
+            pool.shutdown(wait=False)

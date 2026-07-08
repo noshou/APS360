@@ -1,40 +1,69 @@
-from __future__ import annotations
-
-import yaml
+from __future__  import annotations
 from dataclasses import dataclass, field
 from typing      import Optional
 
+import yaml
+
+
 # Default size buckets: each tuple is (min_atoms, max_atoms) for one batch group.
 DEFAULT_BUCKETS: list[tuple[int, int]] = [
-    (   1,    3), (   4,    6),
-    (   7,   12), (  13,   14),
-    (  15,   16), (  17,   17),
-    (  18,   18), (  19,   19),
-    (  20,   20), (  21,   21),
-    (  22,   23), (  24,   26),
-    (  27,   33), (  34,   40),
-    (  41,   45), (  46,   50),
-    (  51,   55), (  56,   60),
-    (  61,   64), (  65,   69),
-    (  70,   74), (  75,   80),
-    (  81,   84), (  85,   90),
-    (  91,   96), (  97,  102),
-    ( 103,  108), ( 109,  116),
-    ( 117,  124), ( 125,  132),
-    ( 133,  142), ( 143,  152),
-    ( 153,  160), ( 161,  170),
-    ( 171,  180), ( 181,  192),
-    ( 193,  202), ( 203,  216),
-    ( 217,  228), ( 229,  242),
-    ( 243,  258), ( 259,  276),
-    ( 277,  296), ( 297,  316),
-    ( 317,  336), ( 337,  364),
-    ( 365,  392), ( 393,  428),
-    ( 429,  472), ( 473,  524),
-    ( 525,  596), ( 597,  696),
-    ( 697,  856), ( 857, 1208),
-    (1209, 3177), (3178, 4251),
-    (4252, 6046), (6047, 78819),
+    (    1,    3),
+    (    4,    6),
+    (    7,   12),
+    (   13,   14),
+    (   15,   16),
+    (   17,   17),
+    (   18,   18),
+    (   19,   19),
+    (   20,   20),
+    (   21,   21),
+    (   22,   23),
+    (   24,   26),
+    (   27,   33),
+    (   34,   40),
+    (   41,   45),
+    (   46,   50),
+    (   51,   55),
+    (   56,   60),
+    (   61,   64),
+    (   65,   69),
+    (   70,   74),
+    (   75,   80),
+    (   81,   84),
+    (   85,   90),
+    (   91,   96),
+    (   97,  102),
+    (  103,  108),
+    (  109,  116),
+    (  117,  124),
+    (  125,  132),
+    (  133,  142),
+    (  143,  152),
+    (  153,  160),
+    (  161,  170),
+    (  171,  180),
+    (  181,  192),
+    (  193,  202),
+    (  203,  216),
+    (  217,  228),
+    (  229,  242),
+    (  243,  258),
+    (  259,  276),
+    (  277,  296),
+    (  297,  316),
+    (  317,  336),
+    (  337,  364),
+    (  365,  392),
+    (  393,  428),
+    (  429,  472),
+    (  473,  524),
+    (  525,  596),
+    (  597,  696),
+    (  697,  856),
+    (  857, 1208),
+    ( 1209, 3177),
+    ( 3178, 4251),
+    ( 4252, 6046)
     ]
 
 @dataclass
@@ -173,6 +202,7 @@ class RunConfig:
     profiler:       bool           = False     # diagnostic mode: per-rank torch.profiler + section timers; trace saved to ./profiler_trace/
     prof_warmup:    int            = 1         # profiler schedule warmup batches (profiled, discarded)
     prof_active:    int            = 3         # profiler schedule active batches (recorded); loop runs 1+warmup+active batches
+    prof_molecules: Optional[list] = None      # hardcoded [(grp, stem), ...] fixture list; None = dynamic selection
 
     # data
     buckets: list[tuple[int, int]] = field(default_factory=lambda: DEFAULT_BUCKETS)
