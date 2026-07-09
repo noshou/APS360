@@ -583,10 +583,11 @@ def _worker(rank: int, cfg: RunConfig):
                 rows = train_set._batches[i]
                 return f"{len(rows)} mols x {max(r[2] for r in rows)} atoms"
             print(f"[profiler] probing {mode}", flush=True)
+            n_hm, n_hmax = prof_group_bounds
             for label, group, proxy_fn in (
-                ("worst N*M_shard", heavy_nm, _bucket_nm_proxy),
-                ("worst M",         heavy_m,  _bucket_max_m),
-                ("median sample",   regular,  _bucket_nm_proxy),
+                ("worst N*M_shard", worst[:n_hm],     _bucket_nm_proxy),
+                ("worst M",         worst[n_hm:n_hmax], _bucket_max_m),
+                ("median sample",   worst[n_hmax:],   _bucket_nm_proxy),
             ):
                 if group:
                     print(f"  {label:<16s} proxy={proxy_fn(group[0]):<8d} {_describe(group[0])}", flush=True)
@@ -1025,8 +1026,16 @@ def main(cfg: RunConfig | None = None):
             prof_active    = A.prof_active,
         )
 
+    assert cfg is not None
+
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1:
+        # build the encoding DB once here, before spawning workers -- each worker
+        # process also constructs Encoding(cfg.db, cfg.hdf5), and if the sqlite3
+        # file doesn't exist yet they'd race to create it concurrently and hit
+        # "database is locked". Pre-building means every worker takes the
+        # fast, lock-free "found existing database" path instead.
+        Encoding(cfg.db, cfg.hdf5)
         mp_spawn(_worker, args=(cfg,), nprocs=n_gpus, join=True)
     else:
         _worker(0, cfg)
