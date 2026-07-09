@@ -93,20 +93,27 @@ class Encoding:
         if self._initialized:
             return
 
+        # Build into a temp path and atomically rename to _DBPATH only on full success.
+        # A crash mid-build (e.g. two processes racing to build the same DB, or an
+        # interrupted Kaggle session) must never leave a file at _DBPATH itself --
+        # os.path.exists(_DBPATH) above is the only signal callers have that the DB
+        # is usable, and it can't distinguish "complete" from "partially written".
+        _DBPATH_TMP = f"{_DBPATH}.building-{os.getpid()}"
+
         sqlite3.register_converter("BLOB", self._convert_array)
 
-        conn = sqlite3.connect(_DBPATH, detect_types=sqlite3.PARSE_DECLTYPES)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA wal_autocheckpoint=0")  # checkpoint once at close, not every 4 MB
-        cursor = conn.cursor()
-        cursor.executescript(self._ENCODING_SCHEMA)
-
-        _ENCODING_ADD = """
-        INSERT OR IGNORE INTO items (stem, grp, atoms, VOCAB_idx)
-        VALUES (?,?,?,?)
-        """
-
+        conn = sqlite3.connect(_DBPATH_TMP, detect_types=sqlite3.PARSE_DECLTYPES)
         try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA wal_autocheckpoint=0")  # checkpoint once at close, not every 4 MB
+            cursor = conn.cursor()
+            cursor.executescript(self._ENCODING_SCHEMA)
+
+            _ENCODING_ADD = """
+            INSERT OR IGNORE INTO items (stem, grp, atoms, VOCAB_idx)
+            VALUES (?,?,?,?)
+            """
+
             with h5py.File(hdf5_path, "r") as f:
                 buf: List[Tuple] = []
                 for group_name, group_obj in f.items():
@@ -134,12 +141,20 @@ class Encoding:
             # Build index after all data inserted — single-pass B-tree, no fragmentation
             cursor.executescript(self._INDEX_SCHEMA)
             conn.commit()
-        finally:
+
             cursor.execute("SELECT MAX(atoms) FROM items")
             max_ = cursor.fetchone()
-            self._max = max_[0] if max_[0] is not None else 0
+            build_max = max_[0] if max_[0] is not None else 0
+        except BaseException:
             conn.close()
+            if os.path.exists(_DBPATH_TMP):
+                os.remove(_DBPATH_TMP)
+            raise
+        else:
+            conn.close()
+            os.replace(_DBPATH_TMP, _DBPATH)  # atomic on the same filesystem
 
+        self._max  = build_max
         self._path = _DBPATH
         self._initialized = True
 
