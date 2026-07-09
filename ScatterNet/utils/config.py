@@ -112,7 +112,7 @@ class RunConfig:
                     use TP regardless of this threshold (evaluate() relies on both ranks seeing
                     identical full-batch outputs).
     compile:        If True, torch.compile the checkpointed step functions in Embed, MessagePass,
-                    and OutputHead (fullgraph=True, dynamic=True). False (default) runs them eager.
+                    OutputHead, and Loss (fullgraph=True, dynamic=True). False (default) runs them eager.
     eps_embd:       Numerical floor in the Embed module (avoids division by zero).
     eps_msgp:       Numerical floor in MessagePass sigma clamping and aggregate denominator.
 
@@ -124,7 +124,7 @@ class RunConfig:
     Training
     --------
     lr:             Adam learning rate.
-    weight_decay:   Adam L2 c imweight decay.
+    weight_decay:   Adam L2 weight decay coefficient.
     grad_clip:      Max gradient norm for gradient clipping (torch.nn.utils.clip_grad_norm_).
     epochs:         Number of full passes over all batches.
     batcher_seed:   RNG seed for the train/val/test molecule split (reproducible splits).
@@ -179,7 +179,7 @@ class RunConfig:
     atm_chunk:      int            = 1024
     mol_chunk:      int            = 32
     dp_atom_threshold: int         = 0         # 0 = always TP (old behaviour); see docstring above
-    compile:        bool           = False     # torch.compile Embed/MessagePass/OutputHead's checkpointed step functions
+    compile:        bool           = False     # torch.compile Embed/MessagePass/OutputHead/Loss's checkpointed step functions
     eps_embd:       float          = 1e-8
     eps_msgp:       float          = 1e-3
 

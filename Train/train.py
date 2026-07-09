@@ -621,7 +621,7 @@ def _worker(rank: int, cfg: RunConfig):
         compile   = cfg.compile,
     ).to(device)
 
-    criterion = Loss(q_grid, energy).to(device)
+    criterion = Loss(q_grid, energy, compile=cfg.compile).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     start_epoch = 1

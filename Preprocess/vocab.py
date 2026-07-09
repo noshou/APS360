@@ -99,34 +99,5 @@ class _IonVocab:
         """
         return len(self.ions)
 
-    def transuranic_indices(self) -> frozenset[int]:
-        """Return VOCAB indices of all transuranic ions present in the vocabulary.
-
-        Transuranics have f0 scattering factors but no f1/f2, so they may need
-        special handling in the form factor computation.
-
-        Returns
-        -------
-        frozenset of int
-            VOCAB indices of all transuranic ions found in `index`.
-        """
-        return frozenset(self.index[ion] for ion in self.TRANSURANICS if ion in self.index)
-
-    def special_case_indices(self) -> dict[str, int]:
-        """Return a mapping from special-case alias to its resolved VOCAB index.
-
-        Special cases are non-standard ion strings ('sival', 'cval') that
-        are remapped to a canonical element before lookup. The returned index is
-        that of the resolved ion, not the alias itself.
-
-        Returns
-        -------
-        dict of str to int
-            Mapping such as ``{'sival': index_of_si, 'cval': index_of_c}``.
-        """
-        return {alias: self.index[resolved]
-                for alias, resolved in self.SPECIAL_CASES.items()
-                if resolved in self.index}
-
 VOCAB: _IonVocab = _IonVocab.load()
 

@@ -57,7 +57,10 @@ class BatchSet(Dataset):
         hdf5_db : str
             Path to raw HDF5 data.
         enc : Encoding
-            Encoding instance for element to VOCAB mapping.
+            Encoding instance used to fetch VOCAB_idx lazily, one batch at
+            a time, in ``__getitem__`` -- so only the batch currently being
+            materialized is ever resident in memory, not the whole dataset's
+            encodings.
         batches : list
             Pre-built batches from ``Batcher``, each a list of
             (grp, stem, atoms) rows.
@@ -91,6 +94,8 @@ class BatchSet(Dataset):
             read from the HDF5 file and padded via ``Batch.from_lists``.
         """
         rows  = self._batches[i]
+        vocab_by_key = self._enc.get_vocab_for_keys([(grp, stem) for grp, stem, _ in rows])
+
         vocab: List = []
         iqval: List = []
         coord: List = []
@@ -98,9 +103,7 @@ class BatchSet(Dataset):
         with h5py.File(self._db_path, "r") as db:
             for grp, stem, _ in rows:
                 mol = db[grp][stem]									   # type: ignore
-                raw  = mol["elms"][:].tolist()                         # type: ignore
-                elms = [e.decode() if isinstance(e, bytes) else e for e in raw]
-                vocab.append(torch.tensor(self._enc._encode_ions(elms)))
+                vocab.append(torch.tensor(vocab_by_key[(grp, stem)]))
                 iqval.append(torch.tensor(mol["I_q"][:]))              # type: ignore
                 coord.append(torch.tensor(mol["coords"][:]))           # type: ignore
 

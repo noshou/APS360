@@ -178,7 +178,7 @@ class Batcher:
             if min_a > max_a:
                 print(f"Invalid bucket {i} ({min_a}, {max_a}): skipping...")
                 continue
-            query = enc.get_meta_in_range(min_a, max_a)
+            query = enc.get_in_range(min_a, max_a)
             count = sum(row[2] for row in query)
             if count > atom_size_ceil:
                 split_batch(0, len(query) - 1, query)
@@ -218,8 +218,8 @@ class Batcher:
         hdf5_db : str
             Path to raw HDF5 data, forwarded to ``BatchSet``.
         enc : Encoding
-            Encoding instance for element to VOCAB mapping, forwarded to
-            ``BatchSet``.
+            Encoding instance for lazy per-batch VOCAB_idx lookups, forwarded
+            to ``BatchSet``.
         batches_flat : list
             Flat list of batches (each a list of (grp, stem, atoms) rows)
             produced by ``_batches_init``. Mutated in place while merging

@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from torch               import nn
+from typing               import Callable
 from jaxtyping           import jaxtyped, Float
 from beartype            import beartype
 from ScatterNet.batching import Batch
@@ -24,8 +25,9 @@ class Loss(nn.Module):
 
     _fmag_table: Float[torch.Tensor, "V Q"] # V = len(VOCAB) + 1
     _q_weights_: Float[torch.Tensor, "1 Q"] # kratky weighting
+    _fwd_fn:     Callable # torch.compiled or plain _loss_fn, per the compile flag
 
-    def __init__(self, qgrid, energy):
+    def __init__(self, qgrid, energy, compile: bool = False):
 
         """Precompute reference form factors and Kratky weights for the loss.
 
@@ -36,6 +38,8 @@ class Loss(nn.Module):
         energy : float
             X-ray energy (eV) used to evaluate anomalous scattering
             factors f1/f2 via xraydb.
+        compile : bool, optional
+            If True, torch.compile `_loss_fn`. Default is False.
 
         Returns
         -------
@@ -79,100 +83,74 @@ class Loss(nn.Module):
 
         self.register_buffer('_fmag_table', fmag_table)
         self.register_buffer('_q_weights_', (1 + qgrid**2).unsqueeze(0))
+        self._fwd_fn = torch.compile(self._loss_fn, dynamic=True, fullgraph=True) if compile else self._loss_fn
 
-    @jaxtyped(typechecker=beartype)
-    def _kratky_MSLE(
-        self,
-        output_head: Float[torch.Tensor, "N Q"],
-        batch: Batch,
-        ) -> Float[torch.Tensor, "N Q"]:
+    @staticmethod
+    def _loss_fn(
+        fmag_table:  torch.Tensor,
+        q_weights:   torch.Tensor,
+        output_head: torch.Tensor,
+        f_mag_pred:  torch.Tensor,
+        sigma_pred:  torch.Tensor,
+        iqval:       torch.Tensor,
+        vocab:       torch.Tensor,
+        mask:        torch.Tensor,
+        lambda_6:    float,
+        lambda_7:    float
+    ) -> torch.Tensor:
 
-        """Compute the Kratky-weighted mean squared log error.
+        """Compute the total training loss.
 
-        (1+q²) * (log1p(Î(q)) - log1p(I(q)))²: Kratky weighting emphasizes
-        high-q structure.
+        Sums the Kratky MSLE, form-factor penalty, and sigma penalty,
+        then averages over molecules and q-points.
 
         Parameters
         ----------
+        fmag_table : torch.Tensor
+            Reference form factor magnitudes per vocabulary entry per
+            q-point, shape (V, Q).
+        q_weights : torch.Tensor
+            Kratky weighting (1 + q^2), shape (1, Q).
         output_head : torch.Tensor
             Predicted I(q), shape (N, Q).
-        batch : Batch
-            Input batch; uses `batch.iqval`, the reference I(q), shape
-            (N, Q).
-
-        Returns
-        -------
-        torch.Tensor
-            Per-molecule, per-q-point Kratky MSLE, shape (N, Q).
-        """
-        residual = torch.log1p(output_head) - torch.log1p(batch.iqval)
-        return self._q_weights_ * residual ** 2
-
-    @jaxtyped(typechecker=beartype)
-    def _ff_penalty(
-        self,
-        f_mag_pred: Float[torch.Tensor, "N M Q"],
-        batch: Batch,
-        lambda_6: float
-        ) -> Float[torch.Tensor, "N Q"]:
-
-        """Compute an atom-count-normalized form-factor penalty.
-
-        log1p-normalized L2 between predicted and xraydb reference form
-        factors, atom-count-normalized.
-
-        Parameters
-        ----------
         f_mag_pred : torch.Tensor
             Predicted form factor magnitudes, shape (N, M, Q).
-        batch : Batch
-            Input batch; uses `batch.vocab` to look up reference form
-            factors and `batch.padding_mask()` to mask out padding atoms.
+        sigma_pred : torch.Tensor
+            Predicted sigma bandwidths, shape (N, M, Q).
+        iqval : torch.Tensor
+            Reference I(q), shape (N, Q).
+        vocab : torch.Tensor
+            Atom vocabulary indices, shape (N, M).
+        mask : torch.Tensor
+            Padding mask, shape (N, M); True marks a real (non-padding)
+            atom.
         lambda_6 : float
-            Weight applied to the penalty.
-
-        Returns
-        -------
-        torch.Tensor
-            Per-molecule, per-q-point form-factor penalty, shape (N, Q).
-        """
-        f_mag_real = torch.log1p(self._fmag_table[batch.vocab])
-        f_mag_pred = torch.log1p(f_mag_pred)
-        n_atoms = batch.padding_mask().sum(dim=1, keepdim=True).float().clamp(min=1)  # (N, 1)
-        mask = batch.padding_mask().unsqueeze(-1)  # (N, M, 1)
-        return ((lambda_6*((f_mag_pred-f_mag_real)**2)*mask).sum(dim=1))/n_atoms
-
-    @jaxtyped(typechecker=beartype)
-    def _sg_penalty(
-        self,
-        sigmas:   Float[torch.Tensor, "N M Q"],
-        lambda_7: float,
-        batch:    Batch
-    ) -> Float[torch.Tensor, "N Q"]:
-
-        """Compute an atom-count-normalized L2 penalty on sigma bandwidths.
-
-        Prevents RFF bandwidths from blowing up.
-
-        Parameters
-        ----------
-        sigmas : torch.Tensor
-            Predicted per-atom per-q sigma bandwidths, shape (N, M, Q).
+            Weight on the form-factor penalty term.
         lambda_7 : float
-            Weight applied to the penalty.
-        batch : Batch
-            Input batch; uses `batch.padding_mask()` to mask out padding
-            atoms.
+            Weight on the sigma L2 penalty term.
 
         Returns
         -------
         torch.Tensor
-            Per-molecule, per-q-point sigma penalty, shape (N, Q).
+            Scalar total loss.
         """
-        mask    = batch.padding_mask().unsqueeze(-1)       # (N, M, 1)
-        n_atoms = mask.sum(dim=1).clamp(min=1)             # (N, 1)
-        pen_sig = (lambda_7 * torch.pow(sigmas, 2)) * mask # (N, M, Q)
-        return pen_sig.sum(dim=1) / n_atoms                # (N, Q)
+
+        # Kratky-weighted MSLE: (1+q²) * (log1p(Î(q)) - log1p(I(q)))²
+        residual  = torch.log1p(output_head) - torch.log1p(iqval)
+        msle_loss = q_weights * residual ** 2  # (N, Q)
+
+        mask_2d = mask.unsqueeze(-1)                                     # (N, M, 1)
+        n_atoms = mask.sum(dim=1, keepdim=True).float().clamp(min=1)     # (N, 1)
+
+        # form-factor penalty: log1p-normalized L2 vs xraydb reference, atom-count-normalized
+        f_mag_real = torch.log1p(fmag_table[vocab])
+        f_mag_pred = torch.log1p(f_mag_pred)
+        ff_penalty = ((lambda_6 * ((f_mag_pred - f_mag_real) ** 2)) * mask_2d).sum(dim=1) / n_atoms  # (N, Q)
+
+        # sigma L2 penalty, atom-count-normalized
+        sg_penalty = ((lambda_7 * torch.pow(sigma_pred, 2)) * mask_2d).sum(dim=1) / n_atoms  # (N, Q)
+
+        return (msle_loss + ff_penalty + sg_penalty).mean()
 
     @jaxtyped(typechecker=beartype)
     def loss(
@@ -210,8 +188,15 @@ class Loss(nn.Module):
         torch.Tensor
             Scalar total loss.
         """
-        msle_loss  = self._kratky_MSLE(output_head, batch)
-        ff_penalty = self._ff_penalty(f_mag_pred, batch, lambda_6)
-        sg_penalty = self._sg_penalty(sigma_pred, lambda_7, batch)
-
-        return (msle_loss + ff_penalty + sg_penalty).mean()
+        return self._fwd_fn(
+            self._fmag_table,
+            self._q_weights_,
+            output_head,
+            f_mag_pred,
+            sigma_pred,
+            batch.iqval,
+            batch.vocab,
+            batch.padding_mask(),
+            lambda_6,
+            lambda_7,
+        )

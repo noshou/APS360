@@ -24,8 +24,8 @@ class Encoding:
 
     Examples
     --------
-    >>> from Preprocess import encode
-    >>> encode("my_dataset", "I(q)@L=50.h5")
+    >>> from Preprocess import Encoding
+    >>> Encoding("my_dataset", "I(q)@L=50.h5")
     # writes my_dataset-ENCODING.sqlite3
     """
 
@@ -166,9 +166,6 @@ class Encoding:
         else:
             return self._CHARGE_RE.sub('', ion).lower()
 
-    def _adapt_array(self, lst: list) -> bytes:
-        return bytes(lst)
-
     def _convert_array(self, blob: bytes) -> list:
         return list(blob)
 
@@ -206,48 +203,16 @@ class Encoding:
         return enc
 
     @beartype
-    def get_in_range(self, min_atoms: int, max_atoms: int) -> List[Tuple[str, str, int, List[int]]]:
-        """Return all molecules whose atom count falls in [min_atoms, max_atoms].
+    def get_in_range(self, min_atoms: int, max_atoms: int) -> List[Tuple[str, str, int]]:
+        """Return metadata for all molecules whose atom count falls in [min_atoms, max_atoms].
 
-        Results are ordered by atom count ascending so a caller can greedily
-        accumulate rows and split when a running total exceeds a ceiling.
-
-        Parameters
-        ----------
-        min_atoms : int
-            Lower bound (inclusive).
-        max_atoms : int
-            Upper bound (inclusive).
-
-        Returns
-        -------
-        list of tuple of (str, str, int, list of int)
-            ``(grp, stem, atoms, VOCAB_idx)`` tuples.  ``grp`` and
-            ``stem`` are the HDF5 keys needed to load tensor data via
-            ``f[grp][stem]``.  ``VOCAB_idx`` is the list of integer VOCAB
-            indices for each atom in the molecule.
-        """
-
-        _QUERY = """
-            SELECT grp, stem, atoms, VOCAB_idx
-            FROM items
-            WHERE atoms BETWEEN ? AND ?
-            ORDER BY atoms ASC
-        """
-
-        sqlite3.register_converter("BLOB", self._convert_array)
-        conn = sqlite3.connect(self._path, detect_types=sqlite3.PARSE_DECLTYPES)
-        try:
-            cursor = conn.cursor()
-            cursor.execute(_QUERY, (min_atoms, max_atoms))
-            results = cursor.fetchall()
-        finally:
-            conn.close()
-        return results
-
-    @beartype
-    def get_meta_in_range(self, min_atoms: int, max_atoms: int) -> List[Tuple[str, str, int]]:
-        """Like get_in_range but omits VOCAB_idx, for lazy loading pipelines.
+        Omits ``VOCAB_idx`` deliberately: callers that build long-lived,
+        whole-dataset row lists (e.g. ``Batcher``) should stay lightweight,
+        and fetch ``VOCAB_idx`` lazily per batch via ``get_vocab_for_keys``
+        instead of holding every molecule's encoding in memory for the
+        life of the run. Results are ordered by atom count ascending so a
+        caller can greedily accumulate rows and split when a running total
+        exceeds a ceiling.
 
         Parameters
         ----------
@@ -259,7 +224,8 @@ class Encoding:
         Returns
         -------
         list of tuple of (str, str, int)
-            ``(grp, stem, atoms)`` tuples ordered by atom count ascending.
+            ``(grp, stem, atoms)`` tuples. ``grp`` and ``stem`` are the
+            HDF5 keys needed to load tensor data via ``f[grp][stem]``.
         """
         _QUERY = """
             SELECT grp, stem, atoms
@@ -275,6 +241,45 @@ class Encoding:
         finally:
             conn.close()
         return results
+
+    @beartype
+    def get_vocab_for_keys(self, keys: List[Tuple[str, str]]) -> dict:
+        """Fetch VOCAB_idx for a specific set of (grp, stem) keys.
+
+        For lazy, per-batch loading: ``BatchSet.__getitem__`` calls this
+        with just the keys of the one batch it's currently materializing,
+        so only that batch's encodings are ever resident in memory, not
+        the whole dataset's.
+
+        Parameters
+        ----------
+        keys : list of tuple of (str, str)
+            (grp, stem) pairs to look up.
+
+        Returns
+        -------
+        dict
+            Mapping from (grp, stem) to its VOCAB_idx list of ints. Keys
+            with no matching row are omitted.
+        """
+        if not keys:
+            return {}
+
+        sqlite3.register_converter("BLOB", self._convert_array)
+        conn = sqlite3.connect(self._path, detect_types=sqlite3.PARSE_DECLTYPES)
+        try:
+            cursor = conn.cursor()
+            placeholders = ",".join("(?,?)" for _ in keys)
+            params = [v for grp, stem in keys for v in (stem, grp)]
+            cursor.execute(
+                f"SELECT grp, stem, VOCAB_idx FROM items WHERE (stem, grp) IN ({placeholders})",
+                params,
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+
+        return {(grp, stem): vocab_idx for grp, stem, vocab_idx in rows}
 
     def max_atom_count(self) -> int:
         """Return the largest atom count across all molecules in the database.
