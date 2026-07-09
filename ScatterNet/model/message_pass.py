@@ -282,12 +282,18 @@ class MessagePass(nn.Module):
         # Exception: forward() rounds down to a small tier (_CHUNK_TIERS) instead of the
         # full chunk size when a bucket's real N or M is a small fraction of n_chunk/m_chunk
         # (avoids an 8x+ memory blowup on those buckets - see forward()'s Cn_eff/Cm_eff).
-        # That introduces a handful of extra distinct shapes beyond the one steady-state
-        # (n_chunk, m_chunk) shape, so the default torch._dynamo recompile cache limit (8)
-        # isn't enough headroom; widen it to comfortably fit len(_CHUNK_TIERS) on each axis.
+        # Each axis independently sees len(_CHUNK_TIERS) tiered shapes PLUS the one
+        # full-chunk shape (used whenever real N/M exceeds the chunk) - so the real ceiling
+        # on distinct (Cn_eff, Cm_eff) combos is (len(_CHUNK_TIERS)+1)**2, not just
+        # len(_CHUNK_TIERS). A limit of 4*len(_CHUNK_TIERS)=20 undercounted this (real
+        # datasets routinely exercise >20 distinct combos across an epoch's bucket
+        # diversity), causing mid-run cache evictions -> full Dynamo retraces costing
+        # tens of seconds to minutes each, observed directly in profiler runs as isolated
+        # batches taking 40-250s versus a few seconds for the same bucket group otherwise.
+        # Set comfortably above the real ceiling instead of guessing.
         if compile:
             torch._dynamo.config.cache_size_limit = max(
-                torch._dynamo.config.cache_size_limit, 4 * len(self._CHUNK_TIERS)
+                torch._dynamo.config.cache_size_limit, 2 * (len(self._CHUNK_TIERS) + 1) ** 2
             )
         self._step1_fn = torch.compile(self._step1, fullgraph=True) if compile else self._step1
         self._step2_fn = torch.compile(self._step2, fullgraph=True) if compile else self._step2
