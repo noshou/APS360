@@ -113,6 +113,10 @@ class RunConfig:
                     identical full-batch outputs).
     compile:        If True, torch.compile the checkpointed step functions in Embed, MessagePass,
                     OutputHead, and Loss (fullgraph=True, dynamic=True). False (default) runs them eager.
+    amp:            If True, run forward/backward under fp16 autocast + GradScaler (CUDA only;
+                    no-op on CPU). Halves activation memory and uses Turing/Ampere fp16 tensor
+                    cores. MessagePass's RFF projection is kept in fp32 to avoid overflow.
+                    False (default) trains in fp32.
     eps_embd:       Numerical floor in the Embed module (avoids division by zero).
     eps_msgp:       Numerical floor in MessagePass sigma clamping and aggregate denominator.
 
@@ -180,6 +184,7 @@ class RunConfig:
     mol_chunk:      int            = 32
     dp_atom_threshold: int         = 0         # 0 = always TP (old behaviour); see docstring above
     compile:        bool           = False     # torch.compile Embed/MessagePass/OutputHead/Loss's checkpointed step functions
+    amp:            bool           = False     # fp16 autocast + GradScaler (CUDA only); RFF projection stays fp32
     eps_embd:       float          = 1e-8
     eps_msgp:       float          = 1e-3
 

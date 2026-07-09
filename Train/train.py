@@ -323,6 +323,7 @@ def _parse_args():
     p.add_argument("--mol_chunk",      type=int,   default=None)
     p.add_argument("--dp_atom_threshold", type=int, default=None)
     p.add_argument("--compile",        action="store_const", const=True, default=None)
+    p.add_argument("--amp",            action="store_const", const=True, default=None)
     p.add_argument("--eps_embd",       type=float, default=None)
     p.add_argument("--eps_msgp",       type=float, default=None)
 
@@ -373,6 +374,7 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
         log1p space.
     """
     model.eval()
+    amp = bool(cfg.amp) and device.startswith("cuda")
     total_loss = 0.0
     total_mols = 0
     ss_res = 0.0
@@ -382,8 +384,10 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
     with torch.no_grad():
         for batch in loader:
             batch             = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
-            iq, fmags, sigmas, _, _ = model(batch)  # eval always TP-routes (model.eval()); local_batch==batch, loss_scale==1.0
-            loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
+                iq, fmags, sigmas, _, _ = model(batch)  # eval always TP-routes (model.eval()); local_batch==batch, loss_scale==1.0
+                loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7)
+            iq = iq.float()   # R2/metrics accumulate in fp32 regardless of AMP
             n = batch.iqval.shape[0]
             total_loss += loss.item() * n
             total_mols += n
@@ -624,6 +628,19 @@ def _worker(rank: int, cfg: RunConfig):
     criterion = Loss(q_grid, energy, compile=cfg.compile).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
+    # Mixed precision: fp16 autocast + GradScaler (CUDA only). GradScaler(enabled=False)
+    # makes scale()/unscale_()/step()/update() pass-throughs, so the loop below is byte-for-
+    # byte the same math in fp32 mode. Correctness under the manual TP/DP grad all-reduce
+    # depends on both ranks keeping the loss scale in LOCKSTEP: they start from the same init
+    # scale, and the grad all-reduce (below) runs BEFORE unscale_, so each rank unscales the
+    # identical summed gradient, makes the same inf/nan skip decision, and calls the same
+    # update() - the scale factor can never diverge across ranks (a divergence would corrupt
+    # the scaled-grad SUM, since it mixes grads scaled by different factors).
+    amp    = bool(cfg.amp) and device.startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=amp)
+    if rank == 0 and amp:
+        print("mixed precision: fp16 autocast + GradScaler ON (RFF projection kept fp32)", flush=True)
+
     start_epoch = 1
     history: list = []
     best_val = float("inf")
@@ -810,9 +827,11 @@ def _worker(rank: int, cfg: RunConfig):
             optimizer.zero_grad(set_to_none=True)
 
             with loop_prof.section("forward", rec):
-                iq, fmags, sigmas, local_batch, loss_scale = model(batch)
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
+                    iq, fmags, sigmas, local_batch, loss_scale = model(batch)
             with loop_prof.section("loss", rec):
-                loss = criterion.loss(iq, fmags, sigmas, local_batch, cfg.lambda_6, cfg.lambda_7) * loss_scale
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
+                    loss = criterion.loss(iq, fmags, sigmas, local_batch, cfg.lambda_6, cfg.lambda_7) * loss_scale
 
             if rank == 0 and cfg.verbosity == "diagnostic":
                 def _s(t):
@@ -841,7 +860,7 @@ def _worker(rank: int, cfg: RunConfig):
                     print(f"    vocab shape: {local_batch.vocab.shape}  n_real_atoms: {local_batch.padding_mask().sum().item()}", flush=True)
 
             with loop_prof.section("backward", rec):
-                loss.backward()
+                scaler.scale(loss).backward()
 
             # With TP, each rank's parameter gradients are a partial sum over its
             # atom shard, so they must be summed across ranks (SUM, not average -
@@ -859,9 +878,23 @@ def _worker(rank: int, cfg: RunConfig):
                             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
 
             with loop_prof.section("clip", rec):
+                # unscale BEFORE clip so the norm acts on true gradients; done AFTER the
+                # all-reduce above so both ranks unscale the identical summed grad (keeps the
+                # scale in lockstep - see the scaler comment near its construction). No-op
+                # when amp is off.
+                scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             with loop_prof.section("step", rec):
-                optimizer.step()
+                scaler.step(optimizer)   # internally skips the step if grads are inf/nan (fp16 overflow)
+                scaler.update()
+
+            # Grad-norm diagnostic, hoisted ABOVE the profiler branch so it fires in
+            # profiler mode too (that branch `continue`s past the rest of the tail). This
+            # is the main lever for debugging an AMP run under the profiler: grad_norm goes
+            # inf when fp16 grads overflow - expected, GradScaler then skips the step and
+            # halves the scale, and this line makes that visible.
+            if rank == 0 and cfg.verbosity == "diagnostic" and (_bi < 12 or not torch.isfinite(grad_norm)):
+                print(f"  [grad] batch {_bi}  grad_norm={grad_norm.item()}", flush=True)
 
             if _prof is not None:
                 _prof.step()
@@ -882,9 +915,6 @@ def _worker(rank: int, cfg: RunConfig):
                     loop_prof.report()
                     break
                 continue                  # skip the metrics/logging tail during profiling
-
-            if rank == 0 and cfg.verbosity == "diagnostic" and (_bi < 12 or not torch.isfinite(grad_norm)):
-                print(f"  [grad] batch {_bi}  grad_norm={grad_norm.item()}", flush=True)
 
             n = local_batch.iqval.shape[0]
             train_loss_sum += loss.item() * n
@@ -1009,6 +1039,7 @@ def main(cfg: RunConfig | None = None):
             mol_chunk      = A.mol_chunk,
             dp_atom_threshold = A.dp_atom_threshold,
             compile        = A.compile,
+            amp            = A.amp,
             eps_embd       = A.eps_embd,
             eps_msgp       = A.eps_msgp,
             lambda_6       = A.lambda_6,

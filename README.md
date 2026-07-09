@@ -628,15 +628,18 @@ Standard Adam (not AdamW; weight decay is applied inside the gradient update, no
 ```
 1. Move batch to device
 2. optimizer.zero_grad(set_to_none=True)
-3. iq, fmags, sigmas, local_batch, loss_scale = model(batch)
-4. loss = criterion.loss(iq, fmags, sigmas, local_batch, λ₆, λ₇) * loss_scale
-5. loss.backward()
-6. [distributed] dist.all_reduce(SUM) on every param.grad
-7. clip_grad_norm_(model.parameters(), grad_clip)
-8. optimizer.step()
+3. [autocast fp16 if amp] iq, fmags, sigmas, local_batch, loss_scale = model(batch)
+4. [autocast fp16 if amp] loss = criterion.loss(iq, fmags, sigmas, local_batch, λ₆, λ₇) * loss_scale
+5. scaler.scale(loss).backward()
+6. [distributed] dist.all_reduce(SUM) on every param.grad   (grads still scaled)
+7. scaler.unscale_(optimizer)
+8. clip_grad_norm_(model.parameters(), grad_clip)
+9. scaler.step(optimizer);  scaler.update()
 ```
 
 Step 6 is explicit because the model uses tensor/data parallelism (see [ScatterNet §7](#7-scatternet)), not DDP. In TP mode, each rank's `param.grad` after backward is a partial sum over its atom shard, so a SUM all_reduce is required (DDP would average). In DP mode, `loss_scale = local_N / global_N` (step 4) makes the same SUM reconstruct the correct global-mean gradient from each rank's rescaled local-mean loss - one all-reduce rule serves both routing modes.
+
+**Mixed precision (`amp`).** With `amp=True` the forward and loss run under fp16 `autocast` and gradients are scaled by a `GradScaler` (CUDA only; `amp=False` makes every scaler call a pass-through, so the fp32 path is unchanged). The RFF projection in `MessagePass` (`coord/σ @ Ω`) is forced back to fp32 via a nested `autocast(enabled=False)`: `σ` clamps at `eps_msgp≈1e-3`, so the scaled coordinate can reach ~1e5 and overflow fp16's 65504 into `cos(inf)=NaN`; that projection is a tiny inner-dim-3 contraction, so fp32 there is nearly free while the heavy `bmm`s stay in fp16 tensor cores. **Ordering matters for the manual all-reduce:** the SUM in step 6 runs on the *scaled* grads and *before* `unscale_` (step 7), so both ranks unscale the identical summed gradient, make the same inf/nan skip decision, and evolve the scale factor in lockstep - a per-rank scale divergence would corrupt the scaled-grad sum. `grad_norm` (step 8) goes to `inf` on an fp16 overflow batch; `scaler.step` then skips the update and halves the scale, and (under `verbosity="diagnostic"`) that batch is printed.
 
 ### Epoch Metrics
 

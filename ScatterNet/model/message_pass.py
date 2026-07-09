@@ -350,12 +350,18 @@ class MessagePass(nn.Module):
 
         # r̃_m = r_m / σ_m: scale coords by bandwidth so kernel range is q-dependent.
         # clamp(min=eps) caps the max RFF frequency and avoids 1/0.
-        scaled_coords = crdslice.unsqueeze(-2) / sigslice.clamp(min=epsilon_) # (Nc, mc, Q, 3)
+        # Forced to fp32 (autocast disabled): under AMP the fp16 path overflows here.
+        # sigslice.clamp(min=eps) can be ~1e-3, so scaled_coords reaches ~1e5 and the
+        # `@ omega.T` projection blows past fp16's 65504 -> cos(inf) = NaN. This is a tiny
+        # inner-dim-3 -> λ₅ contraction, so fp32 costs almost nothing; the heavy bmm below
+        # still runs in fp16 under the outer autocast (no-op when AMP is off).
+        with torch.autocast(device_type=crdslice.device.type, enabled=False):
+            scaled_coords = crdslice.float().unsqueeze(-2) / sigslice.float().clamp(min=epsilon_) # (Nc, mc, Q, 3)
 
-        # φ_m = √(2/λ₅) · cos(Ω · r̃_m + b): RFF feature vector per atom per q-point
-        proj = scaled_coords @ self._omegafrq.T + self._biasterm  # (Nc, mc, Q, λ₅)
-        zrff = self._rffscale * cos(proj)                         # (Nc, mc, Q, λ₅)
-        zrff = zrff * mskslice.unsqueeze(-1).unsqueeze(-1)        # zero padding atoms
+            # φ_m = √(2/λ₅) · cos(Ω · r̃_m + b): RFF feature vector per atom per q-point
+            proj = scaled_coords @ self._omegafrq.T + self._biasterm  # (Nc, mc, Q, λ₅)
+            zrff = self._rffscale * cos(proj)                         # (Nc, mc, Q, λ₅)
+        zrff = zrff * mskslice.unsqueeze(-1).unsqueeze(-1)           # zero padding atoms
 
         # Σ_m φ_m: partial sum of RFF features over atoms in this M-chunk
         step_features = zrff.sum(dim=1) # (Nc, Q, λ₅)
@@ -461,10 +467,12 @@ class MessagePass(nn.Module):
 
         q_points, lambda_1, lambda_5 = self._q_points, self._lambda_1, self._lambda_5
 
-        # recompute φ_m for this M-chunk (same as _pass_1, but now chem_env is complete)
-        scaled_coords = crdslice.unsqueeze(-2) / sigslice.clamp(min=epsilon_) # (Nc, mc, Q, 3)
-        proj = scaled_coords @ self._omegafrq.T + self._biasterm # (Nc, mc, Q, λ₅)
-        zrff = self._rffscale * cos(proj) # (Nc, mc, Q, λ₅)
+        # recompute φ_m for this M-chunk (same as _pass_1, but now chem_env is complete).
+        # fp32 (autocast disabled) for the same fp16-overflow reason as _step1 - see there.
+        with torch.autocast(device_type=crdslice.device.type, enabled=False):
+            scaled_coords = crdslice.float().unsqueeze(-2) / sigslice.float().clamp(min=epsilon_) # (Nc, mc, Q, 3)
+            proj = scaled_coords @ self._omegafrq.T + self._biasterm # (Nc, mc, Q, λ₅)
+            zrff = self._rffscale * cos(proj) # (Nc, mc, Q, λ₅)
         mask = mskslice.unsqueeze(-1).unsqueeze(-1) # (Nc, mc, 1, 1)
         zrff = zrff * mask
 
