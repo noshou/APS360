@@ -886,12 +886,12 @@ def _worker(rank: int, cfg: RunConfig):
             if rank == 0 and cfg.verbosity == "diagnostic" and (_bi < 12 or not torch.isfinite(grad_norm)):
                 print(f"  [grad] batch {_bi}  grad_norm={grad_norm.item()}", flush=True)
 
-            n = batch.iqval.shape[0]
+            n = local_batch.iqval.shape[0]
             train_loss_sum += loss.item() * n
             train_mols     += n
             with torch.no_grad():
                 log_pred      = torch.log1p(iq)
-                log_target    = torch.log1p(batch.iqval)
+                log_target    = torch.log1p(local_batch.iqval)
                 train_ss_res += ((log_pred - log_target) ** 2).sum().item()
                 train_sum_y  += log_target.sum().item()
                 train_sum_y2 += (log_target ** 2).sum().item()
