@@ -7,12 +7,13 @@ from beartype        import beartype
 from beartype.typing import Tuple
 from ..batching      import Batch
 from .layer_head     import LayerHead
+from ..utils.no_trilin_bilin import NoTrilinBilin
 from collections     import OrderedDict
 from numpy           import log2, floor
 from typing          import Callable
 
 class OutputHead(nn.Module):
-    
+
     """
     Collapses per-atom contributions into a predicted I(q) curve.
 
@@ -23,9 +24,9 @@ class OutputHead(nn.Module):
     The forward pass is chunked to avoid storing the
     (N, M, Q, lambda_3) bilinear output tensor.
     """
-    
-    _bilinear: nn.Bilinear   
-    _mlp:      nn.Sequential 
+
+    _bilinear: NoTrilinBilin
+    _mlp:      nn.Sequential
     _fwd_fn:   Callable
     
     def __init__(
@@ -72,7 +73,11 @@ class OutputHead(nn.Module):
         if lambda_4 > floor(log2(lambda_3)):
             raise ValueError(f"lambda_4 must be <= {int(floor(log2(lambda_3)))} for lambda_3={lambda_3}")
         
-        self._bilinear = nn.Bilinear(lambda_1, 1, lambda_3)
+        # NoTrilinBilin, not nn.Bilinear: in2_features=1 here, the exact degenerate
+        # case NoTrilinBilin targets (see its docstring) - also avoids nn.Bilinear's
+        # F.bilinear op forcing a torch.compile graph break (aten::_trilinear isn't
+        # Inductor-supported), so this now fuses into the surrounding compiled graph.
+        self._bilinear = NoTrilinBilin(lambda_1, 1, lambda_3)
 
         dims = [lambda_3 // 2**i for i in range(lambda_4 + 1)]
         if dims[-1] != 1:
@@ -93,7 +98,7 @@ class OutputHead(nn.Module):
 
         Parameters
         ----------
-        bilinear : torch.nn.Bilinear
+        bilinear : NoTrilinBilin
             Bilinear layer combining atom embedding and form factor
             magnitude.
         mlp : torch.nn.Sequential

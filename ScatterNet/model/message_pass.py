@@ -9,6 +9,7 @@ from ..batching             import Batch
 from jaxtyping              import jaxtyped, Float, Bool
 from beartype               import beartype
 from .layer_head            import LayerHead
+from ..utils.no_trilin_bilin import NoTrilinBilin
 from typing                 import NamedTuple, Callable
 
 class MessagePass(nn.Module):
@@ -96,7 +97,7 @@ class MessagePass(nn.Module):
     _proj_agg: nn.Linear                    # projects aggregated context λ₁ → 2λ₁ for MishGLU gating
     _omegafrq: Float[torch.Tensor, "λ₅ 3"]  # fixed RFF frequency matrix: λ₅ random 3-D directions
     _biasterm: nn.Parameter                 # RFF random phase offsets b ∈ R^λ₅
-    _sigbilin: nn.Bilinear                  # updates σ from (updated embedding, form factor)
+    _sigbilin: NoTrilinBilin                # updates σ from (updated embedding, form factor)
     _rms_norm: nn.RMSNorm                   # normalises aggregated context before gating
     _q_points: int                          # number of q-points (Q)
     _rffscale: float                        # rff_scale = (2/lambda_5) ** 0.5 to prevent triton bug
@@ -265,7 +266,11 @@ class MessagePass(nn.Module):
         self._proj_agg = nn.Linear(lambda_1, 2 * lambda_1)
         self.register_buffer('_omegafrq', torch.from_numpy(rng.standard_normal((lambda_5, 3))).float())
         self._biasterm = nn.Parameter(torch.from_numpy(rng.uniform(0, 2*np.pi, size=(self._lambda_5))).float())
-        self._sigbilin = nn.Bilinear(lambda_1, q_points, 1)
+        # NoTrilinBilin, not nn.Bilinear: out_features=1 here, the exact degenerate
+        # case NoTrilinBilin targets (see its docstring) - also avoids nn.Bilinear's
+        # F.bilinear op forcing a torch.compile graph break (aten::_trilinear isn't
+        # Inductor-supported), so this now fuses into the surrounding compiled graph.
+        self._sigbilin = NoTrilinBilin(lambda_1, q_points, 1)
         self._rms_norm = nn.RMSNorm(lambda_1)
         self._q_points = q_points
         
