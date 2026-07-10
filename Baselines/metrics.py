@@ -43,6 +43,33 @@ class EvalResult:
     msle_by_atom_bin: dict = field(default_factory=dict)  # label -> mean per-molecule MSLE
     n_by_atom_bin:     dict = field(default_factory=dict)  # label -> molecule count in that bin
 
+    def to_json(self) -> dict:
+        """Serialize to plain JSON-able types, for checkpointing across sessions."""
+        return {
+            "name": self.name, "msle": self.msle, "r2_log1p": self.r2_log1p,
+            "r2_raw": self.r2_raw, "us_per_atom": self.us_per_atom,
+            "r2_per_q": np.asarray(self.r2_per_q).tolist(),
+            "pct_err_per_q": np.asarray(self.pct_err_per_q).tolist(),
+            "mean_true_log1p_per_q": np.asarray(self.mean_true_log1p_per_q).tolist(),
+            "mean_pred_log1p_per_q": np.asarray(self.mean_pred_log1p_per_q).tolist(),
+            "msle_by_atom_bin": self.msle_by_atom_bin,
+            "n_by_atom_bin": self.n_by_atom_bin,
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> "EvalResult":
+        """Inverse of `to_json` -- rebuilds the per-q numpy arrays."""
+        return cls(
+            name=data["name"], msle=data["msle"], r2_log1p=data["r2_log1p"],
+            r2_raw=data["r2_raw"], us_per_atom=data["us_per_atom"],
+            r2_per_q=np.array(data["r2_per_q"]),
+            pct_err_per_q=np.array(data["pct_err_per_q"]),
+            mean_true_log1p_per_q=np.array(data["mean_true_log1p_per_q"]),
+            mean_pred_log1p_per_q=np.array(data["mean_pred_log1p_per_q"]),
+            msle_by_atom_bin=data["msle_by_atom_bin"],
+            n_by_atom_bin=data["n_by_atom_bin"],
+        )
+
 
 @torch.no_grad()
 def evaluate(baseline: Baseline, loader: Iterable[Batch], q_grid: torch.Tensor, name: str) -> EvalResult:
