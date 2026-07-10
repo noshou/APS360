@@ -117,6 +117,11 @@ class RunConfig:
                     no-op on CPU). Halves activation memory and uses Turing/Ampere fp16 tensor
                     cores. MessagePass's RFF projection is kept in fp32 to avoid overflow.
                     False (default) trains in fp32.
+    amp_init_scale: GradScaler starting loss scale when amp is on. Default 1024 (not torch's
+                    65536): this model's activations sit near O(1) after mean-normalization, so
+                    a lower start avoids the initial overflow/back-off thrash a 65536 scale
+                    causes here. GradScaler still auto-grows/backs-off from this. Ignored when
+                    amp is off.
     eps_embd:       Numerical floor in the Embed module (avoids division by zero).
     eps_msgp:       Numerical floor in MessagePass sigma clamping and aggregate denominator.
 
@@ -185,6 +190,7 @@ class RunConfig:
     dp_atom_threshold: int         = 0         # 0 = always TP (old behaviour); see docstring above
     compile:        bool           = False     # torch.compile Embed/MessagePass/OutputHead/Loss's checkpointed step functions
     amp:            bool           = False     # fp16 autocast + GradScaler (CUDA only); RFF projection stays fp32
+    amp_init_scale: float          = 1024.0    # GradScaler starting loss scale (amp only); lower than torch's 65536
     eps_embd:       float          = 1e-8
     eps_msgp:       float          = 1e-3
 

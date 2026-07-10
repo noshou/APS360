@@ -324,6 +324,7 @@ def _parse_args():
     p.add_argument("--dp_atom_threshold", type=int, default=None)
     p.add_argument("--compile",        action="store_const", const=True, default=None)
     p.add_argument("--amp",            action="store_const", const=True, default=None)
+    p.add_argument("--amp_init_scale", type=float, default=None)
     p.add_argument("--eps_embd",       type=float, default=None)
     p.add_argument("--eps_msgp",       type=float, default=None)
 
@@ -637,9 +638,9 @@ def _worker(rank: int, cfg: RunConfig):
     # update() - the scale factor can never diverge across ranks (a divergence would corrupt
     # the scaled-grad SUM, since it mixes grads scaled by different factors).
     amp    = bool(cfg.amp) and device.startswith("cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=amp)
+    scaler = torch.amp.GradScaler("cuda", init_scale=cfg.amp_init_scale, enabled=amp)
     if rank == 0 and amp:
-        print("mixed precision: fp16 autocast + GradScaler ON (RFF projection kept fp32)", flush=True)
+        print(f"mixed precision: fp16 autocast + GradScaler ON (init_scale={cfg.amp_init_scale}, RFF+Debye kept fp32)", flush=True)
 
     start_epoch = 1
     history: list = []
@@ -1040,6 +1041,7 @@ def main(cfg: RunConfig | None = None):
             dp_atom_threshold = A.dp_atom_threshold,
             compile        = A.compile,
             amp            = A.amp,
+            amp_init_scale = A.amp_init_scale,
             eps_embd       = A.eps_embd,
             eps_msgp       = A.eps_msgp,
             lambda_6       = A.lambda_6,

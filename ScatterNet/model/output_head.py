@@ -119,16 +119,20 @@ class OutputHead(nn.Module):
         """
 
         # (N,M,Q, λ₁) x (N,M,Q,1) -> (N,M,Q,λ₃)
-        atomic   = F.mish(bilinear(emb_c, fmag_c))       
-        
+        atomic   = F.mish(bilinear(emb_c, fmag_c))
+
         # MLP compression -> (N,M,Q,1) -> Squeeze to (N,M,Q)
         contribs = F.softplus(mlp(atomic)).squeeze(-1)
-        
-        # Squeeze form factors and mask down to (N,M,Q) and (N,M,1)
-        fmc = fmag_c.squeeze(-1)
-        
-        # return intensity value (N,M,Q)
-        return (contribs * fmc**2 * mask_c).sum(dim=1)
+
+        # Debye weighting + atom-sum forced to fp32 (autocast disabled): fmc**2 is the
+        # SQUARED form factor (up to ~1e4 for heavy atoms) and this reduces over M atoms,
+        # so in fp16 (amp) the sum and its GradScaler-amplified backward overflow 65504 -
+        # a second large-magnitude atom-sum alongside MessagePass's aggregation. It's a
+        # cheap elementwise + reduce, so fp32 here is ~free; the bilinear + mlp above stay
+        # in fp16. No-op when amp is off.
+        with torch.autocast(device_type=emb_c.device.type, enabled=False):
+            fmc = fmag_c.squeeze(-1).float()                            # (N, Mc, Q)
+            return (contribs.float() * fmc**2 * mask_c.float()).sum(dim=1)   # (N, Q), fp32
         
     @jaxtyped(typechecker=beartype)
     def forward(
@@ -166,8 +170,11 @@ class OutputHead(nn.Module):
         mask       = batch.padding_mask().unsqueeze(-1).to(msg_head.embeds.dtype)  # (N, M, 1)
         
         # accumulate the Debye sum over atom-chunks; chunking avoids materialising
-        # the full (N, M, Q, λ₃) bilinear tensor for large molecules
-        iq_accum   = torch.zeros(N, Q, device=msg_head.embeds.device, dtype=msg_head.embeds.dtype)
+        # the full (N, M, Q, λ₃) bilinear tensor for large molecules. fp32 accumulator:
+        # the running I(q) sum (Σ over atoms of contribs·f²) reaches ~1e5-1e6 for large
+        # molecules and would overflow fp16 if amp made embeds.dtype half; keep it fp32
+        # regardless of autocast (matches the fp32 per-chunk partials above; loss casts).
+        iq_accum   = torch.zeros(N, Q, device=msg_head.embeds.device, dtype=torch.float32)
         
         # 2. Accumulate over chunks
         for mol1 in range(0, M, self._out_chunk):
