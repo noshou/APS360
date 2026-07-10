@@ -680,6 +680,8 @@ Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle
 | `mol_chunk`         | 32      | Molecules per N-chunk. Reduce to lower VRAM on large molecules.                                                                            |
 | `dp_atom_threshold` | 101     | Batches with padded atom count`M` below this **and** molecule count `N >= 2*mol_chunk` route through DP instead of TP                      |
 | `compile`           | False   | torch.compile Embed/MessagePass/OutputHead's checkpointed step functions (fullgraph=True, dynamic=True).                                   |
+| `amp`               | False   | fp16 autocast + GradScaler (CUDA only). Halves activation memory, uses T4 fp16 tensor cores; RFF projection and OutputHead Debye sum kept fp32. |
+| `amp_init_scale`    | 1024    | GradScaler starting loss scale when `amp` is on. Lower than torch's 65536 because activations are ~O(1) after mean-normalization.          |
 | `eps_embd`          | 1e-8    | Numerical floor in Embed (softplus, hypot).                                                                                                |
 | `eps_msgp`          | 1e-3    | Numerical floor in MessagePass (sigma clamp, aggregate denominator).                                                                       |
 | `lr`                | 3e-4    | Adam learning rate.                                                                                                                        |
@@ -693,6 +695,19 @@ Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle
 | `profiler`          | False   | Diagnostic run: per-rank torch.profiler + per-section wall-clock timers, then stop. Traces written per rank to`./profiler_trace/rank<r>/`. |
 | `prof_warmup`       | 1       | Profiler warmup batches (profiled, discarded).                                                                                             |
 | `prof_active`       | 3       | Profiler active batches (recorded). Loop runs`1 + prof_warmup + prof_active` batches; raise `prof_active` for more representative stats.   |
+
+### Validated 2xT4 config
+
+The mixed-precision config trained and validated on 2x T4 (16 GiB each), fp16 loss falling cleanly from ~85 with peak ~11.4 GiB:
+
+```python
+lambda_2 = 3, lambda_5 = 64,          # message-passing rounds / RFF count (cut from 5 / 128 for speed)
+atm_chunk = 1024, mol_chunk = 512,    # only fit because amp halves activations; OOMs in fp32
+compile = True, amp = True,           # amp_init_scale defaults to 1024
+dp_atom_threshold = 101,
+```
+
+fp16 (`amp=True`) is what makes the large chunks fit; the same chunks OOM in fp32. `lambda_2`/`lambda_5` are the speed/capacity dials (`lambda_2` is linear in wall-clock).
 
 ---
 
@@ -721,6 +736,7 @@ Batch
        └─ [per round]
             └─ _pass_1: accumulate features (Nc,Q,λ₅), chem_env (Nc,Q,λ₅,λ₁)
             └─ _AllReduce (features, chem_env)
+            └─ mean-normalise features/chem_env by per-molecule atom count (fp16 safety)
             └─ _pass_2: locality, weights, agg, MishGLU gate -> new embeds
                         bilinear + tanhshrink + softplus      -> new sigmas
        └─ LayerHead: embeds (N,M,Q,λ₁), sigmas updated, f_mags unchanged
@@ -814,7 +830,9 @@ Or load the `.pt.trace.json` file directly at `chrome://tracing`.
 
 ## Appendix
 
-All runs on 2x T4, λ₁=λ₅=128, λ₂=5.
+> **Superseded (fp32 era).** The sweeps below predate the fp16 migration: run without `amp`, at `λ₂=5, λ₅=128`, before mean-normalization and the NoTrilinBilin swap. Their peaks and per-batch times do **not** reflect the current fp16 path (validated config in §10: `λ₂=3, λ₅=64, atm_chunk=1024, mol_chunk=512, amp=True`, peak ~11.4G, ~1.15 batch/s). In particular, A1's OOM rows are fp32-only: `atm_chunk=1024 / mol_chunk=512` OOMs in fp32 but fits under `amp`. Kept for the profiling methodology and the `dp_atom_threshold` safe-band reasoning, which still hold.
+
+All runs on 2x T4, λ₁=λ₅=128, λ₂=5, fp32 (no amp).
 
 ---
 
