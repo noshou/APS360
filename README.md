@@ -135,7 +135,7 @@ The file is opened and closed per call. With `num_workers > 0`, each DataLoader 
 
 Two-part form factor: `_f0f1` and `_f2` are separate linear layers for real and imaginary parts, mirroring Cromer-Mann notation (`f = (f0+f1) + i*f2`). Only the magnitude `|f(q)|` is used downstream, consistent with powder-averaged X-ray scattering where phases average out over random orientations.
 
-Bilinear sigma: `nn.Bilinear(λ₁, Q, Q)` captures the interaction between identity (embed) and scattering strength (f_mag). A linear layer over concatenation misses cross-terms; bilinear is the minimal model that captures multiplicative coupling.
+Bilinear sigma: `NoTrilinBilin(λ₁, Q, Q)` (an `nn.Bilinear`-equivalent that avoids the `aten::_trilinear` kernel and its `torch.compile` graph break - see [§5](#5-messagepass)) captures the interaction between identity (embed) and scattering strength (f_mag). A linear layer over concatenation misses cross-terms; bilinear is the minimal model that captures multiplicative coupling.
 
 PReLU: channel-wise PReLU allows each embedding channel to independently learn its negative slope, giving more expressivity in the first non-linearity than a fixed activation.
 

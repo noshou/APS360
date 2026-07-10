@@ -9,6 +9,7 @@ from beartype.typing import Tuple
 from ..batching      import Batch
 from Preprocess      import VOCAB
 from .layer_head     import LayerHead
+from ..utils.no_trilin_bilin import NoTrilinBilin
 
 class Embed(nn.Module):
     
@@ -25,7 +26,7 @@ class Embed(nn.Module):
     _f0f1:   nn.Linear    # approximate real form factor at each q
     _f2:     nn.Linear    # approximate imaginary form factor at each q
     _prelu:  nn.PReLU     # prelu activation function
-    _sigma:  nn.Bilinear  # computes positional scaling factor based on embed and  f_mag
+    _sigma:  NoTrilinBilin  # computes positional scaling factor based on embed and f_mag
     _fwd_fn: Callable     # torch.compiled or plain _forward_fn, per the compile flag
 
     def __init__(self, lambda_1: int, qPoints: int, compile: bool = False) -> None:
@@ -51,7 +52,14 @@ class Embed(nn.Module):
         self._f0f1   = nn.Linear(lambda_1, qPoints)
         self._f2     = nn.Linear(lambda_1, qPoints)
         self._prelu  = nn.PReLU(lambda_1)
-        self._sigma  = nn.Bilinear(lambda_1, qPoints, qPoints)
+        # NoTrilinBilin, not nn.Bilinear: the F.bilinear op dispatches to aten::_trilinear,
+        # which profiled as a top CUDA op here (741ms / 12 calls) and forces a torch.compile
+        # graph break. NoTrilinBilin is mathematically identical (verified to fp32 rounding)
+        # with the same init, routing through GEMM + elementwise instead. NOTE: this is the
+        # (out=Q, in2=Q) "both moderate" case the NoTrilinBilin docstring flags - it
+        # materializes a (N, M, Q, Q) temp nn.Bilinear never allocates, so confirm the net
+        # win on the profiler rather than assuming it.
+        self._sigma  = NoTrilinBilin(lambda_1, qPoints, qPoints)
         self._fwd_fn = torch.compile(self._forward_fn, dynamic=True, fullgraph=True) if compile else self._forward_fn 
     
     @staticmethod
@@ -60,7 +68,7 @@ class Embed(nn.Module):
         mbd:    nn.Embedding,
         f0f1:   nn.Linear,
         f2:     nn.Linear,
-        sigma:  nn.Bilinear,
+        sigma:  NoTrilinBilin,
         vocabs: torch.Tensor,
         mask:   torch.Tensor,
         eps:    float
@@ -79,9 +87,9 @@ class Embed(nn.Module):
         f2 : torch.nn.Linear
             Linear layer approximating the imaginary part of the form
             factor.
-        sigma : torch.nn.Bilinear
-            Bilinear layer computing the positional scaling factor from
-            the embedding and form factor magnitude.
+        sigma : NoTrilinBilin
+            Bilinear layer (nn.Bilinear-equivalent) computing the positional
+            scaling factor from the embedding and form factor magnitude.
         vocabs : torch.Tensor
             Atom vocabulary indices, shape (N, M).
         mask : torch.Tensor
