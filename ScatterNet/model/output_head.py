@@ -1,16 +1,16 @@
 import torch
 import torch.nn.functional as F
 
-from torch           import nn
-from jaxtyping       import Float, jaxtyped
-from beartype        import beartype
-from beartype.typing import Tuple
-from ..batching      import Batch
-from .layer_head     import LayerHead
+from torch                   import nn
+from jaxtyping               import Float, jaxtyped
+from beartype                import beartype
+from beartype.typing         import Tuple
+from ..batching              import Batch
+from .layer_head             import LayerHead
 from ..utils.no_trilin_bilin import NoTrilinBilin
-from collections     import OrderedDict
-from numpy           import log2, floor
-from typing          import Callable
+from collections             import OrderedDict
+from numpy                   import log2, floor
+from typing                  import Callable
 
 class OutputHead(nn.Module):
 

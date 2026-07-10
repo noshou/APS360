@@ -3,14 +3,14 @@ import torch.nn.functional as F
 import torch.distributed   as dist
 import numpy               as np
 
-from torch                  import cos, nn
-from torch.utils.checkpoint import checkpoint
-from ..batching             import Batch
-from jaxtyping              import jaxtyped, Float, Bool
-from beartype               import beartype
-from .layer_head            import LayerHead
+from torch                   import cos, nn
+from torch.utils.checkpoint  import checkpoint
+from ..batching              import Batch
+from jaxtyping               import jaxtyped, Float, Bool
+from beartype                import beartype
+from .layer_head             import LayerHead
 from ..utils.no_trilin_bilin import NoTrilinBilin
-from typing                 import NamedTuple, Callable
+from typing                  import NamedTuple, Callable
 
 class MessagePass(nn.Module):
 

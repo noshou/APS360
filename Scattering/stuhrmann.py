@@ -1,7 +1,7 @@
 import os
+import torch
 import numpy        as np
 import numpy.typing as npt
-import torch
 
 from beartype         import beartype
 from .spherical_funcs import sphHarm, sphBess

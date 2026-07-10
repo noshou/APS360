@@ -1,14 +1,14 @@
 import torch
 import torch.nn.functional as F
 
-from torch           import nn
-from typing          import Callable
-from jaxtyping       import jaxtyped
-from beartype        import beartype
-from beartype.typing import Tuple
-from ..batching      import Batch
-from Preprocess      import VOCAB
-from .layer_head     import LayerHead
+from torch                   import nn
+from typing                  import Callable
+from jaxtyping               import jaxtyped
+from beartype                import beartype
+from beartype.typing         import Tuple
+from ..batching              import Batch
+from Preprocess              import VOCAB
+from .layer_head             import LayerHead
 from ..utils.no_trilin_bilin import NoTrilinBilin
 
 class Embed(nn.Module):

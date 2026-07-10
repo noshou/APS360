@@ -1,0 +1,43 @@
+# Synthetic-data CPU smoke test for Baselines/metrics.py. Not real training data --
+# purely to check that every baseline runs end-to-end and every plot in
+# run_all_plots() renders without error before spending Kaggle GPU time.
+# Run: python Baselines/smoke_tests/baselines_smoke_test.py --config Baselines/smoke_tests/baselines_smoke_test.yaml
+
+seed: 0
+
+# molecule counts -- kept tiny so the whole thing runs in seconds on a CPU laptop
+n_train: 12
+n_test:  12
+
+atom_count_min: 4
+atom_count_max: 40
+
+# a coarse q-grid is enough to sanity-check the plots; real runs use Q=51 (see
+# Preprocess/README.md)
+q_min: 0.0
+q_max: 0.5
+q_points: 21
+energy: 12500.0
+
+# small, valid VOCAB ion symbols (see Preprocess/vocab.py) spanning light/heavy
+# elements so composition-dependent baselines see some variation
+ions: [h, c, n, o, s, fe]
+
+# ground truth is generated from BinnedDebyeBaseline (the most detailed physics
+# baseline) plus multiplicative log-normal noise, so synthetic curves are
+# physically shaped rather than pure noise -- see smoke_test.py for details
+noise_log_std: 0.05
+
+# baselines to run. "mlp" here is Baselines/learned-benchmarks/mlp.py (sklearn
+# MLPRegressor), not kaggle_baselines.ipynb's TorchMlp -- on CPU sklearn's
+# vectorized BLAS/LBFGS beats a hand-rolled small-minibatch PyTorch loop, whose
+# overhead is mostly Python dispatch rather than compute. TorchMlp is GPU-only
+# territory (Baselines/learned-benchmarks/hdbscan.py is legacy/unused, excluded).
+baselines: [rg, guinier_porod, atom_count, binned_debye, mlp, linear_svm, nearest_neighbour]
+
+# learned-baseline hyperparameters, cut down for smoke-test speed (not accuracy)
+mlp_hidden: [16, 16]
+mlp_max_iter: 200
+linsvm_n_components: 20
+
+out_dir: Baselines/smoke_tests/smoke_test_out

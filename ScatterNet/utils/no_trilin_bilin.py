@@ -3,7 +3,6 @@ import math
 
 from torch import nn
 
-
 class NoTrilinBilin(nn.Module):
 
     """Drop-in replacement for ``nn.Bilinear`` that avoids the `_trilinear` kernel.
@@ -83,7 +82,11 @@ class NoTrilinBilin(nn.Module):
         self.in1_features = in1_features
         self.in2_features = in2_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in1_features, in2_features))
+        self.weight = nn.Parameter(torch.empty(
+            out_features, 
+            in1_features, 
+            in2_features
+            ))
         self.bias   = nn.Parameter(torch.empty(out_features)) if bias else None
         self.reset_parameters()
 
@@ -130,7 +133,10 @@ class NoTrilinBilin(nn.Module):
         # thing whenever in2_features > 1 (masked when in2_features == 1,
         # where permuting a size-1 axis is a no-op - caught via parity test
         # against nn.Bilinear on the out_features=1 case, not the in2=1 case).
-        W = self.weight.permute(0, 2, 1).reshape(self.out_features * self.in2_features, self.in1_features)
+        W = self.weight.permute(0, 2, 1).reshape(
+            self.out_features * self.in2_features, 
+            self.in1_features
+            )
 
         # (..., in1) @ (in1, out*in2) -> (..., out*in2) -> (..., out, in2)
         temp = (x1 @ W.T).reshape(*x1.shape[:-1], self.out_features, self.in2_features)

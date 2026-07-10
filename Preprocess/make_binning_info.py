@@ -1,7 +1,8 @@
 """Regenerate Preprocess/binning_info/ from the encoding DB.
 
-Usage:
-    python make_binning_info.py [--n-bins N]
+Usage (run from the repo root -- all paths below are relative to cwd, not
+this file's location):
+    python Preprocess/make_binning_info.py [--n-bins N]
 
 Reads atom counts from Preprocess/iq_train_set-ENCODING.sqlite3, computes
 N equal-molecule-count bins, writes all_counts.npy + four plots +

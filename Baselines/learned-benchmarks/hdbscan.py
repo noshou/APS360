@@ -55,7 +55,7 @@ class Hdbscan(Baseline):
         self._fmag_table       = build_fmag_table(qgrid, energy)
         self._min_cluster_size = min_cluster_size
         self._min_samples      = min_samples
-
+    
     @jaxtyped(typechecker=beartype)
     def __call__(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:
         
