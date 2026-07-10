@@ -5,7 +5,6 @@ from beartype            import beartype
 from ScatterNet.batching import Batch
 from Baselines.baseline  import Baseline, build_fmag_table
 
-
 @jaxtyped(typechecker=beartype)
 def _guinier_stats(
     batch:  Batch,

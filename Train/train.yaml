@@ -12,6 +12,14 @@ ckpt_best:   scatternet_best.pt
 ckpt_resume: scatternet_resume.pt
 metrics:     scatternet_metrics.json
 
+# per-epoch baseline-style diagnostic plots (per-q R2, per-q percent error, Kratky
+# overlay, residual histogram, error-vs-atom-count) written to
+# {plots_dir}/epoch_{N:03d}/, evaluated on the test set. Reuses Baselines/metrics.py
+# unmodified (see Train/eval_plots.py) so these are directly comparable to
+# Baselines/kaggle_baselines.ipynb's plots. Off by default (needs the same LaTeX/
+# JuliaMono toolchain Baselines/kaggle_baselines.ipynb installs) - uncomment to enable.
+# plots_dir: scatternet_plots
+
 # model architecture
 lambda_1: 128
 lambda_2: 5

@@ -6,7 +6,6 @@ from beartype            import beartype
 from ScatterNet.batching import Batch
 from Baselines.baseline  import Baseline
 
-
 class AtomCountBaseline(Baseline):
     """
     Zero-order baseline: predict the training mean I(q) bucketed by atom count M.

@@ -345,6 +345,7 @@ def _parse_args():
     p.add_argument("--profiler",       action="store_const", const=True, default=None)
     p.add_argument("--prof_warmup",    type=int,   default=None)
     p.add_argument("--prof_active",    type=int,   default=None)
+    p.add_argument("--plots_dir",      default=None, help="write per-epoch baseline-style diagnostic plots here")
 
     return p.parse_args()
 
@@ -352,9 +353,19 @@ def _parse_args():
 def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
     """Run one pass over `loader` without gradients and return (mean_loss, R2).
 
-    Both ranks call this with identical loaders (same seed, no shuffle), so
-    the TP all_reduce/gather inside the model works correctly. Only rank 0
-    uses the returned values for logging and checkpointing.
+    Both ranks call this with identical loaders (same seed, no shuffle). Each
+    bucket routes to TP or DP by the same M/N/dp_atom_threshold rule as
+    training (ScatterNet.forward no longer forces TP for eval - matching
+    train's routing means eval doesn't feed the compiled step functions
+    shapes they've never seen, which used to trigger a recompile storm the
+    first time evaluate() ran each session). Under TP, `local_batch` returned
+    by the model equals the full `batch` and both ranks already hold
+    identical whole-bucket outputs, so per-rank accumulation is exact as-is.
+    Under DP, each rank only sees its own molecule shard, so the six running
+    accumulators are all_reduced (SUM) across ranks before being folded in -
+    otherwise a DP-routed bucket would silently undercount every rank's
+    contribution to the other's molecules. Only rank 0 uses the returned
+    values for logging and checkpointing.
 
     Parameters
     ----------
@@ -376,29 +387,49 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
         log1p space.
     """
     model.eval()
-    amp = bool(cfg.amp) and device.startswith("cuda")
+    amp     = bool(cfg.amp) and device.startswith("cuda")
+    dist_on = dist.is_available() and dist.is_initialized()
     total_loss = 0.0
-    total_mols = 0
+    total_mols = 0.0
     ss_res = 0.0
     sum_y  = 0.0
     sum_y2 = 0.0
-    n_elem = 0
+    n_elem = 0.0
     with torch.no_grad():
         for batch in loader:
             batch             = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
-                iq, fmags, sigmas, _, _ = model(batch)  # eval always TP-routes (model.eval()); local_batch==batch, loss_scale==1.0
-                loss              = criterion.loss(iq, fmags, sigmas, batch, cfg.lambda_6, cfg.lambda_7)
+                iq, fmags, sigmas, local_batch, _ = model(batch)
+                loss              = criterion.loss(iq, fmags, sigmas, local_batch, cfg.lambda_6, cfg.lambda_7)
             iq = iq.float()   # R2/metrics accumulate in fp32 regardless of AMP
-            n = batch.iqval.shape[0]
-            total_loss += loss.item() * n
-            total_mols += n
+            n          = local_batch.iqval.shape[0]
+            b_loss     = loss.item() * n
+            b_mols     = float(n)
             log_pred   = torch.log1p(iq)
-            log_target = torch.log1p(batch.iqval)
-            ss_res += ((log_pred - log_target) ** 2).sum().item()
-            sum_y  += log_target.sum().item()
-            sum_y2 += (log_target ** 2).sum().item()
-            n_elem += log_target.numel()
+            log_target = torch.log1p(local_batch.iqval)
+            b_ss_res   = ((log_pred - log_target) ** 2).sum().item()
+            b_sum_y    = log_target.sum().item()
+            b_sum_y2   = (log_target ** 2).sum().item()
+            b_n_elem   = float(log_target.numel())
+
+            # DP gives each rank a disjoint molecule shard (unlike TP, where the
+            # model's internal all-reduce/gather already leaves both ranks holding
+            # the whole bucket) - sum the six scalars across ranks so this bucket's
+            # contribution is counted once globally, not once per rank locally.
+            if dist_on and local_batch.vocab.shape[0] != batch.vocab.shape[0]:
+                stats = torch.tensor(
+                    [b_loss, b_mols, b_ss_res, b_sum_y, b_sum_y2, b_n_elem],
+                    dtype=torch.float64, device=device,
+                )
+                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                b_loss, b_mols, b_ss_res, b_sum_y, b_sum_y2, b_n_elem = stats.tolist()
+
+            total_loss += b_loss
+            total_mols += b_mols
+            ss_res     += b_ss_res
+            sum_y      += b_sum_y
+            sum_y2     += b_sum_y2
+            n_elem     += b_n_elem
             del iq, fmags, sigmas, loss, log_pred, log_target
     mean_loss = total_loss / total_mols
     ss_tot    = sum_y2 - sum_y ** 2 / n_elem
@@ -967,6 +998,16 @@ def _worker(rank: int, cfg: RunConfig):
         test_loss, test_r2 = evaluate(test_loader, model, criterion, cfg, device)
         torch.cuda.empty_cache()
 
+        # Baseline-style diagnostic plots (per-q R2, per-q percent error, Kratky
+        # overlay, residual histogram, error-vs-atom-count), reusing Baselines/
+        # metrics.py so this is directly comparable to Baselines/kaggle_baselines.ipynb.
+        # Runs on every rank (TP-forced forward needs all ranks' participation);
+        # save_epoch_plots itself gates file-writing to rank 0.
+        if cfg.plots_dir:
+            from Train.eval_plots import save_epoch_plots
+            save_epoch_plots(model, test_loader, q_grid, cfg.amp, device, cfg.plots_dir, epoch, rank)
+            torch.cuda.empty_cache()
+
         if rank == 0:
             print(
                 f"epoch {epoch:3d}"
@@ -1066,6 +1107,7 @@ def main(cfg: RunConfig | None = None):
             profiler       = A.profiler,
             prof_warmup    = A.prof_warmup,
             prof_active    = A.prof_active,
+            plots_dir      = A.plots_dir,
         )
 
     assert cfg is not None

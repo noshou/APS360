@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - demo/index.html
+      - _docs_demo/demo/index.html
   workflow_dispatch:
 
 permissions:
@@ -29,7 +29,7 @@ jobs:
 
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: demo/
+          path: _docs_demo/demo/
 
       - id: deployment
         uses: actions/deploy-pages@v4

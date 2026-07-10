@@ -146,6 +146,15 @@ class RunConfig:
     ckpt_rclone_dest: rclone destination to copy checkpoints to after each save (e.g.
                     "gdrive:APS360/ckpts/"). None = no off-box copy. Needed on Kaggle, where
                     /kaggle/working is not reliably persisted through a session timeout.
+    plots_dir:      If set, write per-epoch diagnostic plots (per-q R2, per-q percent error,
+                    Kratky overlay, residual histogram, error-vs-atom-count, summary bar chart)
+                    to `{plots_dir}/epoch_{N:03d}/`, evaluated on the test set. Reuses
+                    Baselines/metrics.py's evaluate()/run_all_plots() unmodified (see
+                    Train/eval_plots.py), so these are directly comparable to the plots
+                    Baselines/kaggle_baselines.ipynb produces for the physics/learned
+                    baselines. None (default) = disabled. Requires the same LaTeX/JuliaMono
+                    toolchain Baselines/kaggle_baselines.ipynb installs (matplotlib's "pgf"
+                    backend via xelatex).
     verbosity:      Logging level. "epoch" = one line per epoch only. "batch" = also print a
                     running-average loss every 50 batches. "diagnostic" = per-batch NaN/Inf check
                     with full tensor stats on the first 10 batches (use for debugging).
@@ -209,6 +218,7 @@ class RunConfig:
     max_batches:    Optional[int]  = None
     ckpt_interval_sec: float       = 600.0     # mid-epoch checkpoint cadence (crash safety)
     ckpt_rclone_dest:  Optional[str] = None    # rclone dest for off-box checkpoint copies (None = off)
+    plots_dir:      Optional[str]  = None      # per-epoch baseline-style diagnostic plots dir (None = off)
     verbosity:      str            = "epoch"   # "epoch" | "batch" | "diagnostic"
     profiler:       bool           = False     # diagnostic mode: per-rank torch.profiler + section timers; trace saved to ./profiler_trace/
     prof_warmup:    int            = 1         # profiler schedule warmup batches (profiled, discarded)

@@ -155,8 +155,15 @@ class ScatterNet(nn.Module):
     `dp_atom_threshold`:
 
     Tensor-parallel (TP) - the default; used whenever DP's conditions (below)
-    aren't met, or dp_atom_threshold <= 0, or not self.training (eval always
-    uses this path):
+    aren't met, or dp_atom_threshold <= 0. Applies in both train and eval -
+    routing is keyed on M/N/dp_atom_threshold only, not self.training, so a
+    given bucket takes the same path (and therefore the same compiled shapes)
+    in both modes. Forcing eval onto TP unconditionally used to introduce
+    fresh dynamic shapes into the compiled Embed/MessagePass/OutputHead
+    functions the first time evaluate() ran each session - a compile storm at
+    the first epoch boundary. eval() correctly aggregates DP's per-rank
+    molecule shards (see evaluate() in train.py), so there's no correctness
+    reason to force TP there anymore:
         1. Embed runs on the full batch on every rank (cheap, per-atom lookup).
         2. Each rank slices its atom shard from embed_head.
         3. MessagePass runs on the shard; an all-reduce inside MessagePass
@@ -324,8 +331,7 @@ class ScatterNet(nn.Module):
         M = embed_head.embeds.shape[1]
         N = batch.vocab.shape[0]
         route_dp = (
-            self.training
-            and self._dp_atom_threshold > 0
+            self._dp_atom_threshold > 0
             and M < self._dp_atom_threshold
             # DP halves the N-chunk loop but does NOT halve M (unlike TP, which
             # shards M before MessagePass's own atm_chunk-loop runs on it), so a
