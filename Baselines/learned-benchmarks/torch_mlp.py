@@ -4,14 +4,10 @@ import torch.nn as nn
 from Preprocess          import VOCAB
 from Baselines.baseline  import Baseline
 
-
 class TorchMlp(Baseline):
     """GPU-accelerated MLP, used by kaggle_baselines.ipynb (targets Kaggle P100/T4).
 
-    Falls back to CPU automatically when no CUDA device is available. On CPU,
-    Baselines/smoke_tests/baselines_smoke_test.py uses sklearn's MLPRegressor
-    (mlp.py) instead -- vectorized BLAS/LBFGS beats this class's small-minibatch
-    loop when there's no GPU to amortize the Python dispatch overhead.
+    Falls back to CPU automatically when no CUDA device is available.
     """
 
     def __init__(

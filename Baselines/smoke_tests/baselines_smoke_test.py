@@ -32,16 +32,18 @@ from atom_count          import AtomCountBaseline                          # noq
 from pair_peak           import BinnedDebyeBaseline                        # noqa: E402
 from linsvm              import Linsvm                                     # noqa: E402
 from nearest_neighbour   import NNBaseline                                 # noqa: E402
-from mlp                 import Mlp                                        # noqa: E402
+from torch_mlp           import TorchMlp                                  # noqa: E402
+from hdbscan             import Hdbscan                                   # noqa: E402
 
 _BASELINE_FACTORIES = {
     "rg":                lambda cfg, q, e, train: RgBaseline(q, e),
     "guinier_porod":     lambda cfg, q, e, train: GuinierPorodBaseline(q, e),
     "atom_count":        lambda cfg, q, e, train: AtomCountBaseline().fit(train),
     "binned_debye":      lambda cfg, q, e, train: BinnedDebyeBaseline(q, e),
-    "mlp":               lambda cfg, q, e, train: Mlp(hidden_layer_sizes=tuple(cfg["mlp_hidden"]), max_iter=cfg["mlp_max_iter"],).fit(train),
+    "mlp":               lambda cfg, q, e, train: TorchMlp(hidden=tuple(cfg["mlp_hidden"]), epochs=cfg["mlp_epochs"]).fit(train),
     "linear_svm":        lambda cfg, q, e, train: Linsvm(n_components=cfg["linsvm_n_components"]).fit(train),
     "nearest_neighbour": lambda cfg, q, e, train: NNBaseline(q, e).fit(train),
+    "hdbscan":           lambda cfg, q, e, train: Hdbscan(q, e),
 }
 
 _DISPLAY_NAMES = {
@@ -52,6 +54,7 @@ _DISPLAY_NAMES = {
     "mlp":               "MLP",
     "linear_svm":        "Linear SVM",
     "nearest_neighbour": "Nearest Neighbour",
+    "hdbscan":           "HDBSCAN",
 }
 
 

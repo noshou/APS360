@@ -28,16 +28,15 @@ ions: [h, c, n, o, s, fe]
 # physically shaped rather than pure noise -- see smoke_test.py for details
 noise_log_std: 0.05
 
-# baselines to run. "mlp" here is Baselines/learned-benchmarks/mlp.py (sklearn
-# MLPRegressor), not kaggle_baselines.ipynb's TorchMlp -- on CPU sklearn's
-# vectorized BLAS/LBFGS beats a hand-rolled small-minibatch PyTorch loop, whose
-# overhead is mostly Python dispatch rather than compute. TorchMlp is GPU-only
-# territory (Baselines/learned-benchmarks/hdbscan.py is legacy/unused, excluded).
-baselines: [rg, guinier_porod, atom_count, binned_debye, mlp, linear_svm, nearest_neighbour]
+# baselines to run. "mlp" here is Baselines/learned-benchmarks/torch_mlp.py's
+# TorchMlp, same class kaggle_baselines.ipynb uses -- it falls back to CPU
+# automatically, and this synthetic set is tiny enough that a few epochs are
+# instant either way.
+baselines: [rg, guinier_porod, atom_count, binned_debye, mlp, linear_svm, nearest_neighbour, hdbscan]
 
 # learned-baseline hyperparameters, cut down for smoke-test speed (not accuracy)
 mlp_hidden: [16, 16]
-mlp_max_iter: 200
+mlp_epochs: 20
 linsvm_n_components: 20
 
 out_dir: Baselines/smoke_tests/smoke_test_out

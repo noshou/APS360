@@ -749,18 +749,16 @@ def _worker(rank: int, cfg: RunConfig):
         torch.profiler.tensorboard_trace_handler(f"./profiler_trace/rank{rank}")(p)
 
     _prof = None
-    if cfg.profiler:
-        # CUDA activity tracing (CUPTI) is dropped under multi-rank NCCL runs: CUPTI's
-        # interception of CUDA driver calls races with NCCL's own event/stream pool and
-        # reliably crashes the first all_reduce with "invalid resource handle" (observed
-        # on Kaggle's dual-T4 NCCL 2.27.5). Single-GPU runs keep the kernel-level trace;
-        # multi-rank runs fall back to _LoopProfiler's section timers, which already cover
+    if cfg.profiler and not is_dist:
+        # torch.profiler is dropped entirely under multi-rank NCCL runs: even with CUDA
+        # activity tracing removed, kineto/CUPTI's initialization still races with NCCL's
+        # own event/stream pool and reliably crashes the first all_reduce with "invalid
+        # resource handle" (observed on Kaggle's dual-T4 NCCL 2.27.5, reproduced even with
+        # activities=[CPU] only). Single-GPU runs keep the kernel-level trace; multi-rank
+        # runs rely solely on _LoopProfiler's section timers, which already cover
         # grad_allreduce skew.
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if not is_dist:
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
         _prof = torch.profiler.profile(
-            activities=activities,
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             schedule=torch.profiler.schedule(wait=1, warmup=prof_warmup, active=tb_active, repeat=1),
             on_trace_ready=_on_trace_ready,
             record_shapes=True,
@@ -768,7 +766,14 @@ def _worker(rank: int, cfg: RunConfig):
             with_stack=False,       # huge per-event RAM at export → OOM kill; keep off
         )
         _prof.start()
-        if rank == 0:
+    if cfg.profiler and rank == 0:
+        if is_dist:
+            print(
+                f"[profiler] started on all ranks - section timers over 1+{prof_warmup}+{prof_active} "
+                f"batches; torch trace disabled under multi-rank (see _LoopProfiler)",
+                flush=True,
+            )
+        else:
             print(
                 f"[profiler] started on all ranks - section timers over 1+{prof_warmup}+{prof_active} "
                 f"batches, torch trace over 1+{prof_warmup}+{tb_active}; traces -> ./profiler_trace/rank<r>/",
