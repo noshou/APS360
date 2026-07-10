@@ -188,12 +188,15 @@ class Loss(nn.Module):
         torch.Tensor
             Scalar total loss.
         """
+        # .contiguous(): output_head/f_mag_pred/sigma_pred/mask come from upstream
+        # concatenation/squeeze ops whose stride can vary run to run, and torch.compile
+        # guards on stride() in addition to shape - causing avoidable recompiles.
         return self._fwd_fn(
             self._fmag_table,
             self._q_weights_,
-            output_head,
-            f_mag_pred,
-            sigma_pred,
+            output_head.contiguous(),
+            f_mag_pred.contiguous(),
+            sigma_pred.contiguous(),
             batch.iqval,
             batch.vocab,
             batch.padding_mask(),

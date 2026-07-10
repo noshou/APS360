@@ -406,11 +406,16 @@ class MessagePass(nn.Module):
         for m0 in range(0, cont.M, cont.Mchnk):
             m1 = min(m0 + cont.Mchnk, cont.M)
             
-            emb_slice = cont.emb_n[:, m0:m1]
-            crd_slice = cont.crd_n[:, m0:m1]
-            sig_slice = cont.sig_n[:, m0:m1]
-            msk_slice = cont.msk_n[:, m0:m1]
-            
+            # .contiguous(): these are views into cont.*_n, so their stride/storage_offset
+            # depend on m0 (which chunk) and the batch's own padding. torch.compile guards
+            # on stride()/storage_offset() as well as shape, so distinct views recompile
+            # even at the same chunk-tier shape. Materializing a canonical contiguous
+            # layout collapses that to one guard set per tier.
+            emb_slice = cont.emb_n[:, m0:m1].contiguous()
+            crd_slice = cont.crd_n[:, m0:m1].contiguous()
+            sig_slice = cont.sig_n[:, m0:m1].contiguous()
+            msk_slice = cont.msk_n[:, m0:m1].contiguous()
+
             args = (emb_slice, crd_slice, sig_slice, msk_slice, eps)
 
             step_feat, step_chem = checkpoint(self._step1_fn, *args, use_reentrant=False)  # type: ignore[misc]
@@ -548,11 +553,14 @@ class MessagePass(nn.Module):
         for m0 in range(0, cont.M, cont.Mchnk):
             m1 = min(m0 + cont.Mchnk, cont.M)
             
-            emb_slice = cont.emb_n[:, m0:m1]
-            ffs_slice = cont.ffs_n[:, m0:m1]
-            sig_slice = cont.sig_n[:, m0:m1]
-            crd_slice = cont.crd_n[:, m0:m1]
-            msk_slice = cont.msk_n[:, m0:m1]
+            # .contiguous(): see the matching comment in _pass_1 - these views' stride/
+            # storage_offset vary by m0 and trigger extra torch.compile recompiles beyond
+            # the intended chunk-tier shape guard.
+            emb_slice = cont.emb_n[:, m0:m1].contiguous()
+            ffs_slice = cont.ffs_n[:, m0:m1].contiguous()
+            sig_slice = cont.sig_n[:, m0:m1].contiguous()
+            crd_slice = cont.crd_n[:, m0:m1].contiguous()
+            msk_slice = cont.msk_n[:, m0:m1].contiguous()
             cont_feat = cont.features
             cont_chnv = cont.chem_env
 

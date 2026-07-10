@@ -179,12 +179,15 @@ class OutputHead(nn.Module):
         # 2. Accumulate over chunks
         for mol1 in range(0, M, self._out_chunk):
             mol2 = min(mol1 + self._out_chunk, M)
+            # .contiguous(): these views' stride/storage_offset vary by mol1 (which
+            # chunk), and torch.compile guards on stride()/storage_offset() in addition
+            # to shape - causing extra recompiles beyond the intended chunk-size guard.
             iq_accum += self._fwd_fn(
                 self._bilinear,
                 self._mlp,
-                msg_head.embeds[:, mol1:mol2],
-                msg_head.f_mags[:, mol1:mol2],
-                mask[:, mol1:mol2]
+                msg_head.embeds[:, mol1:mol2].contiguous(),
+                msg_head.f_mags[:, mol1:mol2].contiguous(),
+                mask[:, mol1:mol2].contiguous()
             )
 
         # 3. return output head
