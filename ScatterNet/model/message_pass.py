@@ -494,7 +494,13 @@ class MessagePass(nn.Module):
         weights = torch.einsum('nmqd, nqd -> nmq', zrff, features).abs() # (Nc, mc, Q)
 
         # normalised aggregate: kernel-weighted average of neighbour embeddings
-        agg = self._rms_norm(locality / weights.unsqueeze(-1).clamp(min=epsilon_)) # (Nc, mc, Q, λ₁)
+        # fp32 (autocast disabled) so RMSNorm's fp32 weight matches its input and
+        # dispatches to the fused kernel - under fp16 autocast the input arrives
+        # fp16 against the fp32 weight, which falls back to a slow unfused path.
+        pre_norm = locality / weights.unsqueeze(-1).clamp(min=epsilon_) # (Nc, mc, Q, λ₁)
+        with torch.autocast(device_type=pre_norm.device.type, enabled=False):
+            agg = self._rms_norm(pre_norm.float())
+        agg = agg.to(locality.dtype)
 
         # MishGLU gate: one linear projects to 2λ₁, split into value p1 and gate p2.
         # gate = p1 · Mish(p2) selectively passes neighbourhood signal into the residual stream.
