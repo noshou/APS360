@@ -50,6 +50,32 @@ class Encoding:
     _initialized = False
     _instance = None
 
+    @staticmethod
+    def _connect_ro(path: str, **kwargs) -> sqlite3.Connection:
+        """Open `path` read-only via a `file:` URI.
+
+        Kaggle mounts dataset inputs (`/kaggle/input/...`) read-only. A plain
+        `sqlite3.connect(path)` still needs to create a `-journal`/`-wal`
+        sidecar file (or take a POSIX lock) in the database's directory even
+        for a pure read, which fails on a read-only mount with "unable to
+        open database file". `mode=ro` skips that; `immutable=1`
+        additionally skips SQLite's own change-detection stat calls, safe
+        here since this file is a static snapshot for the process's lifetime.
+
+        Parameters
+        ----------
+        path : str
+            Filesystem path to the SQLite database file.
+        **kwargs
+            Forwarded to `sqlite3.connect` (e.g. `detect_types`).
+
+        Returns
+        -------
+        sqlite3.Connection
+            A read-only connection to `path`.
+        """
+        return sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True, **kwargs)
+
     def __new__(cls, *args, **kwargs):
         """Return the shared singleton instance, creating it on first call.
 
@@ -249,7 +275,7 @@ class Encoding:
             WHERE atoms BETWEEN ? AND ?
             ORDER BY atoms ASC
         """
-        conn = sqlite3.connect(self._path)
+        conn = self._connect_ro(self._path)
         try:
             cursor = conn.cursor()
             cursor.execute(_QUERY, (min_atoms, max_atoms))
@@ -282,7 +308,7 @@ class Encoding:
             return {}
 
         sqlite3.register_converter("BLOB", self._convert_array)
-        conn = sqlite3.connect(self._path, detect_types=sqlite3.PARSE_DECLTYPES)
+        conn = self._connect_ro(self._path, detect_types=sqlite3.PARSE_DECLTYPES)
         try:
             cursor = conn.cursor()
             placeholders = ",".join("(?,?)" for _ in keys)
@@ -307,7 +333,7 @@ class Encoding:
         """
         if hasattr(self, "_max") and self._max is not None:
             return self._max
-        conn = sqlite3.connect(self._path)
+        conn = self._connect_ro(self._path)
         try:
             row = conn.execute("SELECT MAX(atoms) FROM items").fetchone()
             self._max = row[0] if row[0] is not None else 0
@@ -323,7 +349,7 @@ class Encoding:
         int
             Row count of the ``items`` table.
         """
-        conn = sqlite3.connect(self._path)
+        conn = self._connect_ro(self._path)
         try:
             return conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
         finally:
