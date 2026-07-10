@@ -87,7 +87,7 @@ Atom indices are 1-based. Index 0 is reserved as the padding sentinel (`batch.vo
 
 The training dataset (`noshou/iq_train_set` on HuggingFace) contains 1,044,583 molecules with precomputed I(q) curves. Full schema, file descriptions, download instructions, and group statistics are in `[Preprocess/README.md](Preprocess/README.md)`.
 
-`Preprocess/iq_train_set-ENCODING.sqlite3` (tracked via Git LFS, ~860 MB) ships with the repo and is the primary training index. It maps every molecule to its atom count and VOCAB indices so the data pipeline never needs to scan the 66 GB HDF5 file during training.
+`iq_train_set-ENCODING.sqlite3` (~860 MB) is the primary training index. It maps every molecule to its atom count and VOCAB indices so the data pipeline never needs to scan the 66 GB HDF5 file during training. It is hosted alongside the HDF5 file on HuggingFace and Kaggle (not tracked in this git repo) -- see [Preprocess/README.md](Preprocess/README.md) for download instructions.
 
 ## 2. Data Pipeline
 

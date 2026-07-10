@@ -25,7 +25,7 @@ class Encoding:
     Examples
     --------
     >>> from Preprocess import Encoding
-    >>> Encoding("my_dataset", "I(q)@L=50.h5")
+    >>> Encoding("my_dataset-ENCODING.sqlite3", "I(q)@L=50.h5")
     # writes my_dataset-ENCODING.sqlite3
     """
 
@@ -70,18 +70,19 @@ class Encoding:
         return cls._instance
 
     @beartype
-    def __init__(self, db_name: str, hdf5_path: str):
+    def __init__(self, db_path: str, hdf5_path: str):
         """Build or reuse the encoding database.
 
         Parameters
         ----------
-        db_name : str
-            Base name for the output file; produces ``<db_name>-ENCODING.sqlite3``.
+        db_path : str
+            Path to the SQLite encoding database file (e.g. ``my_dataset-ENCODING.sqlite3``).
+            Built at this path if it does not already exist.
         hdf5_path : str
             Path to the source HDF5 file produced by the preprocessing pipeline.
         """
 
-        _DBPATH = f"{db_name}-ENCODING.sqlite3"
+        _DBPATH = db_path
 
         if os.path.exists(_DBPATH):
             print(f"Found existing database: '{_DBPATH}'. Skipping HDF5 parsing loop.")

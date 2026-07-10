@@ -73,8 +73,9 @@ class RunConfig:
 
     Paths
     -----
-    hdf5:           Path to the raw HDF5 dataset containing I(q) curves and coordinates.
-    db:             Stem path for the SQLite encoding database (Preprocess writes <db>-ENCODING.sqlite3).
+    hdf5:                    Path to the raw HDF5 dataset containing I(q) curves and coordinates.
+    encodings_sqlite3_path:  Path to the SQLite encoding database file. Built at this path
+                             (via Preprocess) if it does not already exist.
     ckpt_best:      Where to save the checkpoint with the lowest validation loss.
     ckpt_resume:    Where to save the latest checkpoint for run resumption.
     metrics:        JSON file that accumulates per-epoch train/val/test loss and R2.
@@ -171,8 +172,8 @@ class RunConfig:
     """
 
     # paths
-    hdf5:           str            = "Preprocess/I(q)@L=50.h5"
-    db:             str            = "Preprocess/scatternet"
+    hdf5:                    str   = "Preprocess/I(q)@L=50.h5"
+    encodings_sqlite3_path:  str   = "Preprocess/scatternet-ENCODING.sqlite3"
     ckpt_best:      str            = "scatternet_best.pt"
     ckpt_resume:    str            = "scatternet_resume.pt"
     metrics:        str            = "scatternet_metrics.json"

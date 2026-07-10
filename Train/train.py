@@ -307,7 +307,7 @@ def _parse_args():
 
     # paths
     p.add_argument("--hdf5",           default=None)
-    p.add_argument("--db",             default=None)
+    p.add_argument("--encodings_sqlite3_path", default=None)
     p.add_argument("--ckpt_best",      default=None)
     p.add_argument("--ckpt_resume",    default=None)
     p.add_argument("--metrics",        default=None)
@@ -466,7 +466,7 @@ def _worker(rank: int, cfg: RunConfig):
     energy   = 12_500.0
     q_points = len(q_grid)
 
-    enc = Encoding(cfg.db, cfg.hdf5)
+    enc = Encoding(cfg.encodings_sqlite3_path, cfg.hdf5)
 
     batcher = Batcher(
         hdf5_db        = cfg.hdf5,
@@ -1033,8 +1033,8 @@ def main(cfg: RunConfig | None = None):
         A = _parse_args()
         cfg = load_config(
             A.config,
-            hdf5           = A.hdf5,
-            db             = A.db,
+            hdf5                    = A.hdf5,
+            encodings_sqlite3_path  = A.encodings_sqlite3_path,
             ckpt_best      = A.ckpt_best,
             ckpt_resume    = A.ckpt_resume,
             metrics        = A.metrics,
@@ -1073,11 +1073,11 @@ def main(cfg: RunConfig | None = None):
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1:
         # build the encoding DB once here, before spawning workers -- each worker
-        # process also constructs Encoding(cfg.db, cfg.hdf5), and if the sqlite3
-        # file doesn't exist yet they'd race to create it concurrently and hit
+        # process also constructs Encoding(cfg.encodings_sqlite3_path, cfg.hdf5), and if
+        # the sqlite3 file doesn't exist yet they'd race to create it concurrently and hit
         # "database is locked". Pre-building means every worker takes the
         # fast, lock-free "found existing database" path instead.
-        Encoding(cfg.db, cfg.hdf5)
+        Encoding(cfg.encodings_sqlite3_path, cfg.hdf5)
         mp_spawn(_worker, args=(cfg,), nprocs=n_gpus, join=True)
     else:
         _worker(0, cfg)

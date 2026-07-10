@@ -17,17 +17,18 @@
 | File | Size | Description |
 |------|------|-------------|
 | `I(q)@L=50.h5` | ~66 GB | HDF5 database of I(q) curves and molecular data |
+| `iq_train_set-ENCODING.sqlite3` | ~860 MB | Encoding index: maps every molecule to its atom count and VOCAB indices, so the data pipeline never needs to scan the 66 GB HDF5 file during training |
 | `xyz_coordinate_files.7z` | ~6.5 GB | Source XYZ geometry files for all molecule groups (LZMA2, max compression). Only needed to re-run the build pipeline from scratch. |
 
 ## Retrieving the dataset
 
 The HDF5 files are hosted on **[HuggingFace (noshou/iq_train_set)](https://huggingface.co/datasets/noshou/iq_train_set)** and **[Kaggle (noso0s0n/iql50)](https://www.kaggle.com/datasets/noso0s0n/iql50)**. The training code (ScatterNet model, preprocessing pipeline, baselines) lives in the **[noshou/APS360](https://github.com/noshou/APS360)** GitHub repository; the `Preprocess/` directory contains the encoding and data pipeline code.
 
-Download with the HuggingFace CLI (recommended - resumes interrupted downloads):
+Download both the HDF5 file and the encoding DB with the HuggingFace CLI (recommended - resumes interrupted downloads):
 
 ```bash
 pip install huggingface_hub
-huggingface-cli download noshou/iq_train_set "I(q)@L=50.h5" \
+hf download noshou/iq_train_set "I(q)@L=50.h5" "iq_train_set-ENCODING.sqlite3" \
     --repo-type dataset --local-dir Preprocess/
 ```
 
@@ -35,15 +36,18 @@ Or in Python:
 
 ```python
 from huggingface_hub import hf_hub_download
-hf_hub_download(
-    repo_id   = "noshou/iq_train_set",
-    filename  = "I(q)@L=50.h5",
-    repo_type = "dataset",
-    local_dir = "Preprocess/",
-)
+for filename in ["I(q)@L=50.h5", "iq_train_set-ENCODING.sqlite3"]:
+    hf_hub_download(
+        repo_id   = "noshou/iq_train_set",
+        filename  = filename,
+        repo_type = "dataset",
+        local_dir = "Preprocess/",
+    )
 ```
 
-Place the downloaded file at `Preprocess/I(q)@L=50.h5` (the path all pipeline scripts expect).
+Both files are also available on the **[Kaggle dataset](https://www.kaggle.com/datasets/noso0s0n/iql50)** and are mounted directly as notebook inputs when using `kaggle_train.ipynb` / `kaggle_baselines.ipynb` -- no download step needed there.
+
+Place the downloaded files at `Preprocess/I(q)@L=50.h5` and `Preprocess/iq_train_set-ENCODING.sqlite3` (the paths all pipeline scripts expect).
 
 ## Running training
 
@@ -58,13 +62,13 @@ python Train/train.py --config Train/train.yaml
 Key paths in `train.yaml`:
 
 ```yaml
-hdf5: Preprocess/I(q)@L=50.h5          # downloaded above
-db:   Preprocess/iq_train_set           # -> iq_train_set-ENCODING.sqlite3 (LFS)
+hdf5:                    Preprocess/I(q)@L=50.h5                          # downloaded above
+encodings_sqlite3_path:  Preprocess/iq_train_set-ENCODING.sqlite3         # downloaded above
 ```
 
 ### Kaggle (notebook)
 
-Open `Baselines/kaggle_baselines.ipynb`. Set `NOTEBOOK_NAME` to your Kaggle notebook slug at the top of the setup cell. The notebook clones the repo, installs dependencies, builds the encoding DB, and runs all baselines. The encoding DB build takes roughly 30 minutes on Kaggle hardware the first time; subsequent runs skip it automatically.
+Open `Baselines/kaggle_baselines.ipynb`. Set `NOTEBOOK_NAME` to your Kaggle notebook slug at the top of the setup cell, and attach the [`noso0s0n/iql50`](https://www.kaggle.com/datasets/noso0s0n/iql50) dataset as a notebook input -- it provides both `I(q)@L=50.h5` and `iq_train_set-ENCODING.sqlite3` pre-mounted under `/kaggle/input/datasets/noso0s0n/iql50/`, no download or build step needed. The notebook clones the repo, installs dependencies, and runs all baselines.
 
 ---
 

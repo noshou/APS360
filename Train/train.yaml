@@ -3,9 +3,11 @@
 # read this file; that notebook is the source of truth. Keep the knobs below in sync
 # with it. Missing keys fall back to RunConfig dataclass defaults; CLI flags override.
 
-# paths - local defaults; override on the CLI for other environments
-hdf5:        Preprocess/I(q)@L=50.h5
-db:          Preprocess/iq_train_set
+# paths - local defaults; override on the CLI for other environments.
+# hdf5 and encodings_sqlite3_path are downloaded from HuggingFace (noshou/iq_train_set)
+# or Kaggle (noso0s0n/iql50); see Preprocess/README.md.
+hdf5:                    Preprocess/I(q)@L=50.h5
+encodings_sqlite3_path:  Preprocess/iq_train_set-ENCODING.sqlite3
 ckpt_best:   scatternet_best.pt
 ckpt_resume: scatternet_resume.pt
 metrics:     scatternet_metrics.json
