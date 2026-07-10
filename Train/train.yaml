@@ -18,9 +18,14 @@ lambda_4: 4
 lambda_5: 64
 msg_seed: 42
 
-# chunking (peak-memory vs launch-count tradeoff; see README Appendix)
-atm_chunk: 1024
-mol_chunk: 512
+# chunking (peak-memory vs launch-count tradeoff; see README Appendix A1). 1024/512
+# OOM'd on 2xT4 (12.13/14.56G already in use, +3.19G alloc). 800/400 was also tried
+# (post RMSNorm-autocast + .contiguous() recompile fixes) and rejected: same ~880ms/batch
+# steady-state as 512/256 but ~55% more peak memory (8.9G vs 5.8G) and bigger compile
+# stalls - compute is invariant to chunk size, so bigger chunks bought nothing here.
+# 512/256 chosen as the best measured point.
+atm_chunk: 512
+mol_chunk: 256
 
 # parallelism routing (multi-GPU only; see README ScatterNet section 7)
 dp_atom_threshold: 101   # calibrated for 2x T4: 1.8x faster, peak 13.55G. 0 = always TP.

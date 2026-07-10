@@ -676,8 +676,8 @@ Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle
 | `lambda_6`          | 0.1     | Form-factor penalty weight.                                                                                                                     |
 | `lambda_7`          | 0.1     | Sigma L2 penalty weight. Primary blowup prevention mechanism.                                                                                   |
 | `msg_seed`          | 42      | Seed for fixed RFF frequency matrix Ω.                                                                                                          |
-| `atm_chunk`         | 1024    | Atoms per M-chunk. Reduce to lower VRAM.                                                                                                        |
-| `mol_chunk`         | 512     | Molecules per N-chunk. Reduce to lower VRAM on large molecules.                                                                                 |
+| `atm_chunk`         | 512     | Atoms per M-chunk. Reduce to lower VRAM.                                                                                                        |
+| `mol_chunk`         | 256     | Molecules per N-chunk. Reduce to lower VRAM on large molecules.                                                                                 |
 | `dp_atom_threshold` | 101     | Batches with padded atom count`M` below this **and** molecule count `N >= 2*mol_chunk` route through DP instead of TP                           |
 | `compile`           | False   | torch.compile Embed/MessagePass/OutputHead's checkpointed step functions (fullgraph=True, dynamic=True).                                        |
 | `amp`               | False   | fp16 autocast + GradScaler (CUDA only). Halves activation memory, uses T4 fp16 tensor cores; RFF projection and OutputHead Debye sum kept fp32. |
@@ -698,16 +698,16 @@ Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle
 
 ### Validated 2xT4 config
 
-The mixed-precision config trained and validated on 2x T4 (16 GiB each), fp16 loss falling cleanly from ~85 with peak ~11.4 GiB:
+The mixed-precision config trained and validated on 2x T4 (16 GiB each), fp16 loss falling cleanly from ~85 with peak ~5.8 GiB:
 
 ```python
 lambda_2 = 3, lambda_5 = 64,          # message-passing rounds / RFF count (cut from 5 / 128 for speed)
-atm_chunk = 1024, mol_chunk = 512,    # only fit because amp halves activations; OOMs in fp32
+atm_chunk = 512, mol_chunk = 256,     # see Appendix A1 - 1024/512 OOM'd in real training on 2xT4
 compile = True, amp = True,           # amp_init_scale defaults to 1024
 dp_atom_threshold = 101,
 ```
 
-fp16 (`amp=True`) is what makes the large chunks fit; the same chunks OOM in fp32. `lambda_2`/`lambda_5` are the speed/capacity dials (`lambda_2` is linear in wall-clock).
+`atm_chunk=1024, mol_chunk=512` was tried first and OOM'd on real hardware (GPU already at 12.13/14.56G, +3.19G alloc failed) - see Appendix A1 for the full chunk-size sweep and why bigger chunks don't help. `lambda_2`/`lambda_5` are the speed/capacity dials (`lambda_2` is linear in wall-clock).
 
 ---
 
@@ -821,8 +821,8 @@ Or load the `.pt.trace.json` file directly at `chrome://tracing`.
 | ------------- | ---------------------------------------------------- |
 | `num_workers` | 2-4 (0 = serial, >4 = diminishing returns)           |
 | `pin_memory`  | True (already set in train.py for GPU)               |
-| `atm_chunk`   | Start at 1024; raise to 2048 if GPU is underutilised |
-| `mol_chunk`   | Start at 16; drop to 8 if OOM on large molecules     |
+| `atm_chunk`   | Start at 512; raising it buys no steady-state speed (compute is chunk-invariant, Appendix A1) and only costs memory + bigger torch.compile stalls |
+| `mol_chunk`   | Start at 256; drop to 128 if OOM on large molecules   |
 | `verbosity`   | `"batch"` for loss + memory stats every 20 batches   |
 | `max_batches` | Set to 20 for a quick smoke test before a full run   |
 
@@ -830,24 +830,36 @@ Or load the `.pt.trace.json` file directly at `chrome://tracing`.
 
 ## Appendix
 
-> **Superseded (fp32 era).** The sweeps below predate the fp16 migration: run without `amp`, at `λ₂=5, λ₅=128`, before mean-normalization and the NoTrilinBilin swap. Their peaks and per-batch times do **not** reflect the current fp16 path (validated config in §10: `λ₂=3, λ₅=64, atm_chunk=1024, mol_chunk=512, amp=True`, peak ~11.4G, ~1.15 batch/s). In particular, A1's OOM rows are fp32-only: `atm_chunk=1024 / mol_chunk=512` OOMs in fp32 but fits under `amp`. Kept for the profiling methodology and the `dp_atom_threshold` safe-band reasoning, which still hold.
-
-All runs on 2x T4, λ₁=λ₅=128, λ₂=5, fp32 (no amp).
+> **Superseded (fp32 era, pre-2026-07-10).** Older sweep methodology notes below A1/A2's current tables predate the fp16 migration and the current profiler's `heavy_nm`/`heavy_m`/`median` stratification; treat those as historical context for the profiling approach, not comparable numbers. A1's current table (below) is the up-to-date fp16-path sweep: validated config is `λ₂=3, λ₅=64, atm_chunk=512, mol_chunk=256, amp=True`, peak ~5.8G.
 
 ---
 
 ### A1. mol_chunk and atm_chunk optimizations
 
-Takeaway: compute is roughly invariant to chunk shape; the choice trades kernel-launch count against peak memory. `56 x 100` was chosen for the fewest launches. The true worst-bucket peak under the current profiler is 15.12G on a 16G T4, which the old shuffle-window sampler understated at 14.98G.
+**Current sweep (2026-07-10, fp16 path)**: 2x T4, `λ₁=128, λ₂=3, λ₃=128, λ₄=4, λ₅=64`, `amp=True`, `compile=True`, `dp_atom_threshold=101`, profiler over 54 stratified batches (1 heaviest-`N*M_shard` + 2 more heavy-data/heavy-compute groups, see §12). "Steady-state" excludes the handful of torch.compile recompile-stall batches (see notes) to isolate actual per-batch compute; "profiled total" is the raw 54-batch sum including those stalls.
 
-Note: this predates the current profiler and is **not directly comparable to the table above**. It was taken with the older shuffle-window sampler (no `heavy_nm`/`heavy_m`/`median` stratification, so the true worst bucket was usually missed and peaks are understated), and before the conditional-checkpointing episode. Treat these as within-table comparisons only.
+| `atm_chunk` | `mol_chunk` | result | peak CUDA mem | steady-state ms/batch | profiled total (54 batches) | notes |
+| ----------- | ----------- | ------ | -------------- | ---------------------- | ---------------------------- | ----- |
+| 1024        | 512         | **OOM (real training run)** | n/a | n/a | n/a | GPU already at 12.13/14.56G in use, +3.19G alloc failed. Not a profiler run - this crashed a real (non-profiler) training run and is what started this investigation. |
+| **512**     | **256**     | **ok (chosen)** | **~5.8G** | **~880** | **~78.7s (r1) / ~72.9s (r0)** | Profiled before the `.contiguous()` recompile fix (see below), so its compile-stall batches include extra stride/storage_offset-driven recompiles on top of the legitimate chunk-tier ones. |
+| 800         | 400         | ok, but worse | ~8.9G | ~880 | ~130.8s (r1) / ~125.0s (r0) | Profiled after the `.contiguous()` fix - only 4 clean recompiles/rank (vs. ~14 noisy ones at 512/256), but the fewer stalls each compile a bigger graph and take longer overall (47.4s/22.0s/16.5s per rank vs. 512/256's 20.5s/6.9s/6.4s). Steady-state is unchanged from 512/256. |
+
+Takeaway: **steady-state compute is invariant to chunk size** (~880 ms/batch at both 512/256 and 800/400) - this reconfirms the same finding from the older fp32-era sweeps below. Raising chunk size only buys fewer torch.compile recompiles at the cost of each one being slower to compile (bigger graph) and more peak memory - a net loss here, not a win. `512/256` is chosen: same steady-state speed as `800/400`, ~40% less peak memory, and a smaller worst-case compile stall. Don't raise further without re-profiling; don't lower without a memory-pressure reason, since it buys nothing on speed either.
+
+Two separate bugs were found and fixed in the course of this sweep (both in `ScatterNet/model/message_pass.py` and related files, see git history for exact diffs):
+- **RMSNorm/autocast dtype mismatch**: `MessagePass._rms_norm` ran under fp16 autocast against its fp32 weight, forcing an unfused fallback kernel (PyTorch warning: `Mismatch dtype ... Cannot dispatch to fused implementation`). Fixed by forcing that call to fp32 (matching the weight) via `torch.autocast(..., enabled=False)`, same pattern already used for the nearby RFF block.
+- **Non-contiguous chunk-slice views causing extra torch.compile recompiles**: `crd_slice`/`sig_slice`/`emb_slice`/`msk_slice`/`ffs_slice` (MessagePass), `embeds`/`f_mags`/`mask` chunks (OutputHead), and `output_head`/`f_mag_pred`/`sigma_pred` (Loss) are all views into larger padded tensors; their stride/storage_offset vary by chunk index, and torch.compile guards on that independently of shape - multiplying recompiles well past the intended `_CHUNK_TIERS` axis. Fixed by adding `.contiguous()` at each of these call sites. Confirmed via `TORCH_LOGS=recompiles`: dropped from ~14 distinct guard failures/rank (mostly stride/storage_offset noise) to 4 clean ones (2 legitimate chunk-tier shape growths, 1 Inductor fusion-size heuristic, 1 `None`-vs-tensor branch in the loss).
+
+---
+
+**Older fp32-era sweep** (predates the fp16 migration, mean-normalization, and the NoTrilinBilin swap; kept for historical profiling-methodology context only - not comparable to the table above). All runs on 2x T4, λ₁=λ₅=128, λ₂=5, fp32 (no amp). Also predates the current profiler's stratified sampling (used an older shuffle-window sampler that usually missed the true worst bucket, understating peaks).
 
 | `mol_chunk` | `atm_chunk` | product | result          | notes                                                       |
 | ----------- | ----------- | ------- | --------------- | ----------------------------------------------------------- |
 | 64          | 64          | 4096    | ok (baseline)   | ~15.3 / 18.2 s/batch (r0/r1)                                |
 | 128         | 16          | 2048    | ok              | atm too small, weak matmul contraction                      |
 | 104         | 46          | 4784    | ok              | more launches (69,507)                                      |
-| **56**      | **100**     | 5600    | **ok (chosen)** | fewest launches (58,889), balanced; atm_chunk reduced to 80 |
+| 56          | 100         | 5600    | ok              | fewest launches (58,889), balanced; atm_chunk reduced to 80 |
 | 32          | 200         | 6400    | ok, at ceiling  | peak 14.98G; ~14.5 / 17.3 s/batch                           |
 | 64          | 128         | 8192    | OOM             |                                                             |
 | 32          | 512         | 16384   | OOM             | looked stable in the profiler window, OOM'd mid-run         |

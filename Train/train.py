@@ -9,6 +9,7 @@ import torch.distributed as dist
 from contextlib                  import contextmanager
 from time                        import perf_counter
 from torch.multiprocessing.spawn import spawn as mp_spawn  # type: ignore[attr-defined]
+from torch._utils                import _flatten_dense_tensors, _unflatten_dense_tensors
 from dataclasses                 import replace as dc_replace
 from torch.utils.data            import DataLoader, Subset
 from Preprocess                  import Encoding
@@ -874,9 +875,17 @@ def _worker(rank: int, cfg: RunConfig):
             # peer - that's the skew to hunt with the per-rank section report.
             if is_dist:
                 with loop_prof.section("grad_allreduce", rec):
-                    for param in model.parameters():
-                        if param.grad is not None:
-                            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                    # Flattened into one all_reduce instead of one call per parameter:
+                    # same SUM semantics (see comment above), but a single collective
+                    # instead of a serial Python-loop of N tiny ones. All params are
+                    # fp32 (only activations run in fp16 under autocast), so flattening
+                    # is dtype-safe across the whole model.
+                    grads = [p.grad for p in model.parameters() if p.grad is not None]
+                    if grads:
+                        flat = _flatten_dense_tensors(grads)
+                        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+                        for g, synced in zip(grads, _unflatten_dense_tensors(flat, grads)):
+                            g.copy_(synced)
 
             with loop_prof.section("clip", rec):
                 # unscale BEFORE clip so the norm acts on true gradients; done AFTER the
