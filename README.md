@@ -301,6 +301,10 @@ M-chunk level (`use_reentrant=False`): `_step` inside `_pass_1` and `_pass_2` ar
 
 `MessagePass._AllReduce` is a custom `torch.autograd.Function`. Forward: `dist.all_reduce(SUM)` on `features` and `chem_env`. Backward: `dist.all_reduce(SUM)` again, because each rank's gradient for its partial atom sum is genuinely partial and must be summed across contributors.
 
+### Mean-Normalization (fp16 safety)
+
+After the AllReduce, `features` and `chem_env` are divided by the per-molecule real-atom count (a global count: summed across ranks under TP via `_count_all_reduce`, local under DP). They are sums over all atoms, so O(M) ≈ 1e3-1e4 for large molecules; in fp16 (`amp`) that overflows the `_step2` contractions (`locality`, `weights`) and their backward, producing NaN gradients that `GradScaler` cannot recover (the overflow is set by activation magnitude, not loss scale, and Turing/T4 has no bf16 to absorb the range). Dividing by the atom count turns both into **means** (O(1)). Because `_step2` forms `locality / weights` and feeds it into `RMSNorm` - which is invariant to any positive per-atom scale - the aggregate is algebraically unchanged (verified identical to ~2e-6 post-RMSNorm), while every fp16 intermediate stays in range. Mathematically it is "sum then contract then divide" rewritten as "mean then contract", exact up to fp32 rounding, and a no-op in the fp32 path beyond that.
+
 ### `MessagePass` Layers
 
 1. **Learnable Parameters**

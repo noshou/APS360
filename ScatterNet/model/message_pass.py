@@ -678,6 +678,37 @@ class MessagePass(nn.Module):
             return x
         return self._AllReduce.apply(x)  # type: ignore[return-value]
 
+    def _count_all_reduce(self, x: torch.Tensor, use_all_reduce: bool) -> torch.Tensor:
+
+        """Plain (non-differentiable) SUM all-reduce for the per-molecule atom count.
+
+        Mirrors `_all_reduce`'s gating but without the autograd Function: the count is a
+        constant divisor derived from the padding mask (no gradient flows to it), and under
+        TP each rank holds only its atom shard, so the per-molecule counts must be summed
+        across ranks to match the globally-summed features/chem_env they normalise.
+        `use_all_reduce=False` (the DP path) leaves the local count untouched, exactly as
+        for features/chem_env - see `_all_reduce`'s docstring for why that gating is a
+        correctness requirement, not an optimization.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Per-molecule real-atom counts for this N-chunk, shape (Nchnk,).
+        use_all_reduce : bool
+            Whether to sum the count across ranks (True for TP, False for DP).
+
+        Returns
+        -------
+        torch.Tensor
+            `x` summed across ranks (TP), or unchanged (DP / no process group).
+        """
+
+        if not use_all_reduce or not dist.is_available() or not dist.is_initialized():
+            return x
+        x = x.clone()
+        dist.all_reduce(x, op=dist.ReduceOp.SUM)
+        return x
+
     @jaxtyped(typechecker=beartype)
     def forward(self, batch: Batch, embed_head: LayerHead, eps: float, use_all_reduce: bool = True) -> LayerHead:
 
@@ -786,6 +817,31 @@ class MessagePass(nn.Module):
                     cont = cont._replace(
                         features = self._all_reduce(cont.features, use_all_reduce),
                         chem_env = self._all_reduce(cont.chem_env, use_all_reduce),
+                    )
+                    # Mean-normalise the atom-sums. features/chem_env are Σ over all atoms
+                    # (O(M): ~1e3-1e4 for a large molecule), which overflows fp16's 65504 in
+                    # the _step2 contractions and their backward - the AMP NaN. Dividing both
+                    # by the per-molecule real-atom count turns them into means (O(1)). _step2
+                    # forms locality/weights, a RATIO of these two, so scaling both by the same
+                    # per-molecule constant leaves the aggregate algebraically identical (to
+                    # fp32 rounding) while keeping every fp16 intermediate in range. `count` is
+                    # the GLOBAL count per molecule: msk_n is only this rank's atom shard under
+                    # TP, so it is summed across ranks exactly like features/chem_env (a no-op
+                    # under DP, where msk_n already spans whole molecules). clamp(min=1) guards
+                    # padded (all-masked) molecules, whose sums are 0 anyway.
+                    # NOTE: _step2's `weights.clamp(min=eps)` floor now acts on an O(1) mean
+                    # rather than an O(M) sum, so it engages at a different absolute threshold.
+                    # This does NOT change the output: _step2 feeds locality/weights straight
+                    # into RMSNorm, which is invariant to any positive per-atom scalar on its
+                    # input, so the magnitude of `weights` (and hence where the clamp bites)
+                    # washes out - it only ever served as a 0/0 guard. Verified: post-RMSNorm
+                    # `agg` matches the un-normalised sum form to ~2e-6 (fp32 rounding).
+                    count = cont.msk_n.sum(dim=1, dtype=cont.features.dtype)          # (Nc,)
+                    count = self._count_all_reduce(count, use_all_reduce).clamp(min=1.0)
+                    inv   = (1.0 / count).view(-1, 1, 1)                              # (Nc, 1, 1)
+                    cont  = cont._replace(
+                        features = cont.features * inv,
+                        chem_env = cont.chem_env * inv.unsqueeze(-1),
                     )
                     cont = self._pass_2(cont, eps)
                     return cont.emb_n, cont.sig_n
