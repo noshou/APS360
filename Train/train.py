@@ -750,11 +750,17 @@ def _worker(rank: int, cfg: RunConfig):
 
     _prof = None
     if cfg.profiler:
+        # CUDA activity tracing (CUPTI) is dropped under multi-rank NCCL runs: CUPTI's
+        # interception of CUDA driver calls races with NCCL's own event/stream pool and
+        # reliably crashes the first all_reduce with "invalid resource handle" (observed
+        # on Kaggle's dual-T4 NCCL 2.27.5). Single-GPU runs keep the kernel-level trace;
+        # multi-rank runs fall back to _LoopProfiler's section timers, which already cover
+        # grad_allreduce skew.
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if not is_dist:
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
         _prof = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+            activities=activities,
             schedule=torch.profiler.schedule(wait=1, warmup=prof_warmup, active=tb_active, repeat=1),
             on_trace_ready=_on_trace_ready,
             record_shapes=True,
