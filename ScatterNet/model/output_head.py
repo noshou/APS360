@@ -89,9 +89,7 @@ class OutputHead(nn.Module):
             if i < len(dims) - 2:
                 ldicts[f"activation_{i}"] = nn.Mish()
         self._mlp = nn.Sequential(ldicts)
-        # mode="reduce-overhead": see the matching comment in MessagePass - launch-bound
-        # profile (Self CPU >> Self CUDA), CUDA graphs cut per-kernel dispatch overhead.
-        self._fwd_fn = torch.compile(self._forward_fn, dynamic=True, fullgraph=True, mode="reduce-overhead") if compile else self._forward_fn
+        self._fwd_fn = torch.compile(self._forward_fn, dynamic=True, fullgraph=True) if compile else self._forward_fn
         
     @staticmethod
     def _forward_fn(bilinear, mlp, emb_c, fmag_c, mask_c):

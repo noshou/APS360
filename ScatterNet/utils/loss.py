@@ -83,9 +83,7 @@ class Loss(nn.Module):
 
         self.register_buffer('_fmag_table', fmag_table)
         self.register_buffer('_q_weights_', (1 + qgrid**2).unsqueeze(0))
-        # mode="reduce-overhead": see the matching comment in MessagePass - launch-bound
-        # profile (Self CPU >> Self CUDA), CUDA graphs cut per-kernel dispatch overhead.
-        self._fwd_fn = torch.compile(self._loss_fn, dynamic=True, fullgraph=True, mode="reduce-overhead") if compile else self._loss_fn
+        self._fwd_fn = torch.compile(self._loss_fn, dynamic=True, fullgraph=True) if compile else self._loss_fn
 
     @staticmethod
     def _loss_fn(

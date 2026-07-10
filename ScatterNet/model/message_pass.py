@@ -300,15 +300,8 @@ class MessagePass(nn.Module):
             torch._dynamo.config.cache_size_limit = max(
                 torch._dynamo.config.cache_size_limit, 2 * (len(self._CHUNK_TIERS) + 1) ** 2
             )
-        # mode="reduce-overhead": profiling showed this launch-bound (Self CPU >> Self
-        # CUDA - many small kernels per chunk round). CUDA graphs replay a captured
-        # kernel sequence instead of re-dispatching each op, cutting that launch
-        # overhead. One graph gets captured per distinct chunk-tier shape (same axis
-        # _CHUNK_TIERS already bounds), so this compounds with, not against, the
-        # existing shape-tiering. Unproven yet under non-reentrant checkpoint recompute
-        # + DDP-style grad all-reduce - watch for silent cudagraph fallback warnings.
-        self._step1_fn = torch.compile(self._step1, fullgraph=True, mode="reduce-overhead") if compile else self._step1
-        self._step2_fn = torch.compile(self._step2, fullgraph=True, mode="reduce-overhead") if compile else self._step2
+        self._step1_fn = torch.compile(self._step1, fullgraph=True) if compile else self._step1
+        self._step2_fn = torch.compile(self._step2, fullgraph=True) if compile else self._step2
 
     def _step1(
         self,
