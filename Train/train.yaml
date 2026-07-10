@@ -15,12 +15,12 @@ lambda_1: 128
 lambda_2: 5
 lambda_3: 128
 lambda_4: 4
-lambda_5: 128
+lambda_5: 64
 msg_seed: 42
 
 # chunking (peak-memory vs launch-count tradeoff; see README Appendix)
-atm_chunk: 100
-mol_chunk: 56
+atm_chunk: 1024
+mol_chunk: 512
 
 # parallelism routing (multi-GPU only; see README ScatterNet section 7)
 dp_atom_threshold: 101   # calibrated for 2x T4: 1.8x faster, peak 13.55G. 0 = always TP.

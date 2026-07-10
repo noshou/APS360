@@ -46,10 +46,10 @@ GNN that predicts X-ray powder scattering curves I(q) from atomic coordinates an
 | M      | atoms per molecule (padded to the longest in the batch)  |
 | Q      | number of q-points in the scattering grid                |
 | λ₁     | atom embedding dimension (`lambda_1`, default 128)       |
-| λ₂     | message-passing rounds (`lambda_2`, default 5)           |
+| λ₂     | message-passing rounds (`lambda_2`, default 3)           |
 | λ₃     | OutputHead MLP starting width (`lambda_3`, default 128)  |
 | λ₄     | OutputHead MLP halving steps (`lambda_4`, default 4)     |
-| λ₅     | Random Fourier Features count (`lambda_5`, default 256)  |
+| λ₅     | Random Fourier Features count (`lambda_5`, default 64)   |
 | λ₆     | form-factor penalty weight (`lambda_6`, default 0.1)     |
 | λ₇     | sigma L2 penalty weight (`lambda_7`, default 0.1)        |
 | Nc     | molecules per N-chunk (`mol_chunk`)                      |
@@ -85,7 +85,7 @@ Atom indices are 1-based. Index 0 is reserved as the padding sentinel (`batch.vo
 
 ## Dataset
 
-The training dataset (`noshou/iq_train_set` on HuggingFace) contains 1,044,583 molecules with precomputed I(q) curves. Full schema, file descriptions, download instructions, and group statistics are in [`Preprocess/README.md`](Preprocess/README.md).
+The training dataset (`noshou/iq_train_set` on HuggingFace) contains 1,044,583 molecules with precomputed I(q) curves. Full schema, file descriptions, download instructions, and group statistics are in `[Preprocess/README.md](Preprocess/README.md)`.
 
 `Preprocess/iq_train_set-ENCODING.sqlite3` (tracked via Git LFS, ~860 MB) ships with the repo and is the primary training index. It maps every molecule to its atom count and VOCAB indices so the data pipeline never needs to scan the 66 GB HDF5 file during training.
 
@@ -201,16 +201,16 @@ Converts each atom's VOCAB index into three tensors that feed the rest of the pi
   | `nn.PReLU(λ₁)`* | After embedding lookup | Learnable per-channel negative slope. Acts on dim=1, hence the double-transpose. |
   | `F.softplus`    | On sigma logits        | `log(1 + exp(x))`, smooth positive-enforcing.                                    |
 
-**Comparison of *`PReLU`*  to other activation functions:*
+**Comparison of `PReLU`  to other activation functions:*
 
-  | Activation | λ₁  | Val loss | Val R² | Test R² |
-  | ---------- | --- | -------- | ------ | ------- |
-  | LeakyReLU  | 64  | 0.77     | 0.71   | 0.69    |
-  | PReLU      | 128 | 0.67     | 0.74   | 0.73    |
-  | PReLU      | 64  | 0.93     | 0.62   | 0.61    |
-  | LeakyReLU  | 128 | NaN      | NaN    | NaN     |
-  | ELU        | 64  | 2.44     | -0.05  | -0.01   |
-  | Mish       | 64  | NaN      | NaN    | NaN     |
+| Activation | λ₁  | Val loss | Val R² | Test R² |
+| ---------- | --- | -------- | ------ | ------- |
+| LeakyReLU  | 64  | 0.77     | 0.71   | 0.69    |
+| PReLU      | 128 | 0.67     | 0.74   | 0.73    |
+| PReLU      | 64  | 0.93     | 0.62   | 0.61    |
+| LeakyReLU  | 128 | NaN      | NaN    | NaN     |
+| ELU        | 64  | 2.44     | -0.05  | -0.01   |
+| Mish       | 64  | NaN      | NaN    | NaN     |
 
 ---
 
@@ -666,35 +666,35 @@ Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle
 
 ## 10. Hyperparameter Reference
 
-| Name                | Default | What it controls                                                                                                                           |
-| ------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `lambda_1`          | 128     | Atom embedding dimension. Width of the per-atom vector throughout MessagePass.                                                             |
-| `lambda_2`          | 5       | Message-passing rounds. Also bounds the maximum cumulative sigma change.                                                                   |
-| `lambda_3`          | 128     | OutputHead MLP starting width. Must satisfy`lambda_3 >= 2^lambda_4`.                                                                       |
-| `lambda_4`          | 4       | OutputHead halving steps. With defaults: 128->64->32->16->8->1.                                                                            |
-| `lambda_5`          | 256     | RFF count. More = tighter kernel approximation, higher memory cost.                                                                        |
-| `lambda_6`          | 0.1     | Form-factor penalty weight.                                                                                                                |
-| `lambda_7`          | 0.1     | Sigma L2 penalty weight. Primary blowup prevention mechanism.                                                                              |
-| `msg_seed`          | 42      | Seed for fixed RFF frequency matrix Ω.                                                                                                     |
-| `atm_chunk`         | 1024    | Atoms per M-chunk. Reduce to lower VRAM.                                                                                                   |
-| `mol_chunk`         | 32      | Molecules per N-chunk. Reduce to lower VRAM on large molecules.                                                                            |
-| `dp_atom_threshold` | 101     | Batches with padded atom count`M` below this **and** molecule count `N >= 2*mol_chunk` route through DP instead of TP                      |
-| `compile`           | False   | torch.compile Embed/MessagePass/OutputHead's checkpointed step functions (fullgraph=True, dynamic=True).                                   |
+| Name                | Default | What it controls                                                                                                                                |
+| ------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lambda_1`          | 128     | Atom embedding dimension. Width of the per-atom vector throughout MessagePass.                                                                  |
+| `lambda_2`          | 3       | Message-passing rounds. Also bounds the maximum cumulative sigma change.                                                                        |
+| `lambda_3`          | 128     | OutputHead MLP starting width. Must satisfy`lambda_3 >= 2^lambda_4`.                                                                            |
+| `lambda_4`          | 4       | OutputHead halving steps. With defaults: 128->64->32->16->8->1.                                                                                 |
+| `lambda_5`          | 256     | RFF count. More = tighter kernel approximation, higher memory cost.                                                                             |
+| `lambda_6`          | 0.1     | Form-factor penalty weight.                                                                                                                     |
+| `lambda_7`          | 0.1     | Sigma L2 penalty weight. Primary blowup prevention mechanism.                                                                                   |
+| `msg_seed`          | 42      | Seed for fixed RFF frequency matrix Ω.                                                                                                          |
+| `atm_chunk`         | 1024    | Atoms per M-chunk. Reduce to lower VRAM.                                                                                                        |
+| `mol_chunk`         | 512     | Molecules per N-chunk. Reduce to lower VRAM on large molecules.                                                                                 |
+| `dp_atom_threshold` | 101     | Batches with padded atom count`M` below this **and** molecule count `N >= 2*mol_chunk` route through DP instead of TP                           |
+| `compile`           | False   | torch.compile Embed/MessagePass/OutputHead's checkpointed step functions (fullgraph=True, dynamic=True).                                        |
 | `amp`               | False   | fp16 autocast + GradScaler (CUDA only). Halves activation memory, uses T4 fp16 tensor cores; RFF projection and OutputHead Debye sum kept fp32. |
-| `amp_init_scale`    | 1024    | GradScaler starting loss scale when `amp` is on. Lower than torch's 65536 because activations are ~O(1) after mean-normalization.          |
-| `eps_embd`          | 1e-8    | Numerical floor in Embed (softplus, hypot).                                                                                                |
-| `eps_msgp`          | 1e-3    | Numerical floor in MessagePass (sigma clamp, aggregate denominator).                                                                       |
-| `lr`                | 3e-4    | Adam learning rate.                                                                                                                        |
-| `weight_decay`      | 1e-5    | Adam L2 weight decay.                                                                                                                      |
-| `grad_clip`         | 1.0     | Max gradient L2 norm before clipping.                                                                                                      |
-| `epochs`            | 50      | Training epochs.                                                                                                                           |
-| `batcher_seed`      | 0       | Seed for train/val/test split and per-epoch shuffle.                                                                                       |
-| `atom_size_ceil`    | -1      | Max total atoms per batch (-1 = 3x largest molecule).                                                                                      |
-| `num_workers`       | 4       | DataLoader worker processes.                                                                                                               |
-| `ckpt_interval_sec` | 600     | Seconds between mid-epoch resume checkpoints.                                                                                              |
-| `profiler`          | False   | Diagnostic run: per-rank torch.profiler + per-section wall-clock timers, then stop. Traces written per rank to`./profiler_trace/rank<r>/`. |
-| `prof_warmup`       | 1       | Profiler warmup batches (profiled, discarded).                                                                                             |
-| `prof_active`       | 3       | Profiler active batches (recorded). Loop runs`1 + prof_warmup + prof_active` batches; raise `prof_active` for more representative stats.   |
+| `amp_init_scale`    | 1024    | GradScaler starting loss scale when `amp` is on. Lower than torch's 65536 because activations are ~O(1) after mean-normalization.               |
+| `eps_embd`          | 1e-8    | Numerical floor in Embed (softplus, hypot).                                                                                                     |
+| `eps_msgp`          | 1e-3    | Numerical floor in MessagePass (sigma clamp, aggregate denominator).                                                                            |
+| `lr`                | 3e-4    | Adam learning rate.                                                                                                                             |
+| `weight_decay`      | 1e-5    | Adam L2 weight decay.                                                                                                                           |
+| `grad_clip`         | 1.0     | Max gradient L2 norm before clipping.                                                                                                           |
+| `epochs`            | 50      | Training epochs.                                                                                                                                |
+| `batcher_seed`      | 0       | Seed for train/val/test split and per-epoch shuffle.                                                                                            |
+| `atom_size_ceil`    | -1      | Max total atoms per batch (-1 = 3x largest molecule).                                                                                           |
+| `num_workers`       | 4       | DataLoader worker processes.                                                                                                                    |
+| `ckpt_interval_sec` | 600     | Seconds between mid-epoch resume checkpoints.                                                                                                   |
+| `profiler`          | False   | Diagnostic run: per-rank torch.profiler + per-section wall-clock timers, then stop. Traces written per rank to`./profiler_trace/rank<r>/`.      |
+| `prof_warmup`       | 1       | Profiler warmup batches (profiled, discarded).                                                                                                  |
+| `prof_active`       | 3       | Profiler active batches (recorded). Loop runs`1 + prof_warmup + prof_active` batches; raise `prof_active` for more representative stats.        |
 
 ### Validated 2xT4 config
 
