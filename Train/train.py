@@ -2,6 +2,7 @@ import argparse
 import h5py
 import json
 import os
+import random
 import subprocess
 import torch
 import torch.distributed as dist
@@ -14,7 +15,7 @@ from dataclasses                 import replace as dc_replace
 from torch.utils.data            import DataLoader, Subset
 from Preprocess                  import Encoding
 from ScatterNet                  import ScatterNet
-from ScatterNet.batching         import Batcher
+from ScatterNet.batching         import Batcher, BatchSet
 from ScatterNet.utils.config     import RunConfig, load_config
 from ScatterNet.utils            import Loss
 
@@ -340,6 +341,7 @@ def _parse_args():
     p.add_argument("--epochs",         type=int,   default=None)
     p.add_argument("--batcher_seed",   type=int,   default=None)
     p.add_argument("--atom_size_ceil", type=int,   default=None)
+    p.add_argument("--dataset_frac",   type=float, default=None, help="fraction of each split's batches to use, (0.0, 1.0]")
     p.add_argument("--num_workers",    type=int,   default=None)
     p.add_argument("--verbosity",      default=None, choices=["epoch", "batch", "diagnostic"])
     p.add_argument("--profiler",       action="store_const", const=True, default=None)
@@ -507,6 +509,37 @@ def _worker(rank: int, cfg: RunConfig):
         atom_size_ceil = cfg.atom_size_ceil,
     )
     train_set, val_set, test_set = batcher.get_sets()
+
+    if cfg.dataset_frac < 1.0:
+        # Fixed for the whole run (not reselected per epoch): a separate Random per split,
+        # seeded off batcher_seed, so train/val/test each get their own deterministic
+        # subsample and reruns with the same seed reproduce it exactly. Rebuilds a BatchSet
+        # (rather than wrapping in torch's generic Subset) so ._batches stays intact - the
+        # profiler branch below reaches into train_set._batches directly.
+        def _subsample(ds: BatchSet, tag: str) -> BatchSet:
+            """Return a new BatchSet holding a deterministic cfg.dataset_frac-sized sample of `ds`.
+
+            Parameters
+            ----------
+            ds : BatchSet
+                Full split dataset to subsample.
+            tag : str
+                Distinguishes this split's RNG stream from the other splits.
+
+            Returns
+            -------
+            BatchSet
+                New BatchSet over the sampled batches, in original order.
+            """
+            n   = len(ds._batches)
+            k   = max(1, round(n * cfg.dataset_frac))
+            idx = sorted(random.Random(f"{cfg.batcher_seed}-{tag}").sample(range(n), k))
+            return BatchSet(ds._db_path, ds._enc, [ds._batches[i] for i in idx])
+        train_set = _subsample(train_set, "train")
+        val_set   = _subsample(val_set,   "val")
+        test_set  = _subsample(test_set,  "test")
+        if rank == 0:
+            print(f"dataset_frac={cfg.dataset_frac}  train={len(train_set)}  val={len(val_set)}  test={len(test_set)}  (batches, of full split sizes)", flush=True)
 
     pin = device != "cpu" and not str(device).startswith("privateuseone")
     pw  = cfg.num_workers > 0
@@ -749,16 +782,12 @@ def _worker(rank: int, cfg: RunConfig):
         torch.profiler.tensorboard_trace_handler(f"./profiler_trace/rank{rank}")(p)
 
     _prof = None
-    if cfg.profiler and not is_dist:
-        # torch.profiler is dropped entirely under multi-rank NCCL runs: even with CUDA
-        # activity tracing removed, kineto/CUPTI's initialization still races with NCCL's
-        # own event/stream pool and reliably crashes the first all_reduce with "invalid
-        # resource handle" (observed on Kaggle's dual-T4 NCCL 2.27.5, reproduced even with
-        # activities=[CPU] only). Single-GPU runs keep the kernel-level trace; multi-rank
-        # runs rely solely on _LoopProfiler's section timers, which already cover
-        # grad_allreduce skew.
+    if cfg.profiler:
         _prof = torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
             schedule=torch.profiler.schedule(wait=1, warmup=prof_warmup, active=tb_active, repeat=1),
             on_trace_ready=_on_trace_ready,
             record_shapes=True,
@@ -766,14 +795,7 @@ def _worker(rank: int, cfg: RunConfig):
             with_stack=False,       # huge per-event RAM at export → OOM kill; keep off
         )
         _prof.start()
-    if cfg.profiler and rank == 0:
-        if is_dist:
-            print(
-                f"[profiler] started on all ranks - section timers over 1+{prof_warmup}+{prof_active} "
-                f"batches; torch trace disabled under multi-rank (see _LoopProfiler)",
-                flush=True,
-            )
-        else:
+        if rank == 0:
             print(
                 f"[profiler] started on all ranks - section timers over 1+{prof_warmup}+{prof_active} "
                 f"batches, torch trace over 1+{prof_warmup}+{tb_active}; traces -> ./profiler_trace/rank<r>/",
@@ -1113,6 +1135,7 @@ def main(cfg: RunConfig | None = None):
             epochs         = A.epochs,
             batcher_seed   = A.batcher_seed,
             atom_size_ceil = A.atom_size_ceil,
+            dataset_frac   = A.dataset_frac,
             num_workers    = A.num_workers,
             verbosity      = A.verbosity,
             profiler       = A.profiler,

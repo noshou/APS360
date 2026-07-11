@@ -139,6 +139,13 @@ class RunConfig:
     batcher_seed:   RNG seed for the train/val/test molecule split (reproducible splits).
     atom_size_ceil: Maximum total atoms per batch; batches exceeding this are split via binary
                     search. -1 = auto (3x the largest molecule in the dataset).
+    dataset_frac:   Fraction of each split's batches to actually use, in (0.0, 1.0]. 1.0 (default)
+                    = use everything. At e.g. 0.1, only 10% of train/val/test's batches are kept -
+                    the rest are dropped before the epoch loop ever sees them, not skipped
+                    per-batch. The kept subset is fixed for the whole run (chosen once via
+                    random.Random(batcher_seed), independently per split), so reruns with the same
+                    seed reproduce the same subsample. For quick iteration/debugging, not for
+                    real training runs.
     num_workers:    DataLoader worker processes (0 = load in main process; use 0 for CPU debugging).
     max_batches:    Cap on batches per epoch (None = no limit; useful for quick sanity checks).
     ckpt_interval_sec: Seconds between mid-epoch resume-checkpoint saves. Crash safety: a session
@@ -214,6 +221,7 @@ class RunConfig:
     epochs:         int            = 50
     batcher_seed:   int            = 0
     atom_size_ceil: int            = -1
+    dataset_frac:   float          = 1.0       # fraction of each split's batches to use, (0.0, 1.0]; deterministic subsample off batcher_seed
     num_workers:    int            = 4
     max_batches:    Optional[int]  = None
     ckpt_interval_sec: float       = 600.0     # mid-epoch checkpoint cadence (crash safety)

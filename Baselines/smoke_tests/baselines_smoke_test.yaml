@@ -36,7 +36,7 @@ baselines: [rg, guinier_porod, atom_count, binned_debye, mlp, linear_svm, neares
 
 # learned-baseline hyperparameters, cut down for smoke-test speed (not accuracy)
 mlp_hidden: [16, 16]
-mlp_epochs: 20
+mlp_epochs: 50
 linsvm_n_components: 20
 
 out_dir: Baselines/smoke_tests/smoke_test_out
