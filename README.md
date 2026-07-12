@@ -662,6 +662,20 @@ Evaluation is done once per epoch for both val and test. Val is used for checkpo
 
 Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle identically, then the loop fast-forwards over `batch_idx` batches via `continue`. Both checkpoints are pushed to a rclone remote (`ckpt_rclone_dest`) for Kaggle session crash durability.
 
+### Diagnostic Plots
+
+When `plots_dir` is set, each epoch writes (via `Train/eval_plots.py`, reusing `Baselines/metrics.py` so they are directly comparable to the baseline notebook):
+
+| File                                | Scope     | Cost                                                     |
+| ----------------------------------- | --------- | ------------------------------------------------------- |
+| `epoch_NNN/` (per-q R², Kratky, …)  | per epoch | full test-set pass (expensive; see note)                |
+| `epoch_NNN/loss_per_batch.png`      | per epoch | free — plotted from losses the train loop already logs  |
+| `loss_per_epoch.png`                | run-level | free — plotted from the per-epoch `history`, redrawn each epoch so it survives a crash |
+
+`epoch_NNN` is the epoch number zero-padded to 3 digits (`epoch_001`, …). If `plots_rclone_dest` is set, the whole `plots_dir` is pushed to that rclone remote after every epoch (incrementally — only new files upload), a sibling of the `ckpts/` remote.
+
+> Note: the `epoch_NNN/` diagnostic plots re-evaluate the entire test set every epoch (on top of the val/test loss passes), which dominates end-of-epoch wall-clock. The two loss curves add no forward passes.
+
 ---
 
 ## 10. Hyperparameter Reference

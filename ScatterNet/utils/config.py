@@ -139,13 +139,17 @@ class RunConfig:
     batcher_seed:   RNG seed for the train/val/test molecule split (reproducible splits).
     atom_size_ceil: Maximum total atoms per batch; batches exceeding this are split via binary
                     search. -1 = auto (3x the largest molecule in the dataset).
-    dataset_frac:   Fraction of each split's batches to actually use, in (0.0, 1.0]. 1.0 (default)
-                    = use everything. At e.g. 0.1, only 10% of train/val/test's batches are kept -
-                    the rest are dropped before the epoch loop ever sees them, not skipped
-                    per-batch. The kept subset is fixed for the whole run (chosen once via
-                    random.Random(batcher_seed), independently per split), so reruns with the same
-                    seed reproduce the same subsample. For quick iteration/debugging, not for
-                    real training runs.
+    dataset_frac:   Fraction of the TRAIN split's batches to actually use, in (0.0, 1.0]. 1.0
+                    (default) = use everything. At e.g. 0.1, only 10% of train's batches are
+                    kept - the rest are dropped before the epoch loop ever sees them, not
+                    skipped per-batch. val/test are always used at full size regardless of this
+                    setting: val drives checkpoint selection and test feeds both the per-epoch
+                    plots and any post-training comparison against
+                    Baselines/kaggle_baselines.ipynb, and thinning either would make those
+                    numbers noisier for no benefit - this knob only exists to cut training
+                    compute. The kept train subset is fixed for the whole run (chosen once via
+                    random.Random(batcher_seed)), so reruns with the same seed reproduce the
+                    same subsample. For quick iteration/debugging, not for real training runs.
     num_workers:    DataLoader worker processes (0 = load in main process; use 0 for CPU debugging).
     max_batches:    Cap on batches per epoch (None = no limit; useful for quick sanity checks).
     ckpt_interval_sec: Seconds between mid-epoch resume-checkpoint saves. Crash safety: a session
@@ -161,7 +165,15 @@ class RunConfig:
                     Baselines/kaggle_baselines.ipynb produces for the physics/learned
                     baselines. None (default) = disabled. Requires the same LaTeX/JuliaMono
                     toolchain Baselines/kaggle_baselines.ipynb installs (matplotlib's "pgf"
-                    backend via xelatex).
+                    backend via xelatex). Also produces a per-epoch per-batch loss curve
+                    ({plots_dir}/epoch_NNN/loss_per_batch.png) and a run-level train/val/test
+                    loss-per-epoch curve ({plots_dir}/loss_per_epoch.png); both are cheap
+                    (plotted from data the loop already collects, no extra forward passes).
+    plots_rclone_dest: rclone destination to copy the whole plots_dir to after each epoch
+                    (e.g. "gdrive:APS360/plots/"). None = keep plots local only. The copy is
+                    incremental (rclone skips files already uploaded), so re-pushing the dir
+                    every epoch only sends the new epoch's plots. Needed on Kaggle for the same
+                    reason as ckpt_rclone_dest: /kaggle/working is not persisted on timeout.
     verbosity:      Logging level. "epoch" = one line per epoch only. "batch" = also print a
                     running-average loss every 50 batches. "diagnostic" = per-batch NaN/Inf check
                     with full tensor stats on the first 10 batches (use for debugging).
@@ -221,12 +233,13 @@ class RunConfig:
     epochs:         int            = 50
     batcher_seed:   int            = 0
     atom_size_ceil: int            = -1
-    dataset_frac:   float          = 1.0       # fraction of each split's batches to use, (0.0, 1.0]; deterministic subsample off batcher_seed
+    dataset_frac:   float          = 1.0       # fraction of TRAIN's batches to use, (0.0, 1.0]; deterministic subsample off batcher_seed; val/test always full
     num_workers:    int            = 4
     max_batches:    Optional[int]  = None
     ckpt_interval_sec: float       = 600.0     # mid-epoch checkpoint cadence (crash safety)
     ckpt_rclone_dest:  Optional[str] = None    # rclone dest for off-box checkpoint copies (None = off)
     plots_dir:      Optional[str]  = None      # per-epoch baseline-style diagnostic plots dir (None = off)
+    plots_rclone_dest: Optional[str] = None    # rclone dest for off-box copies of plots_dir (None = off)
     verbosity:      str            = "epoch"   # "epoch" | "batch" | "diagnostic"
     profiler:       bool           = False     # diagnostic mode: per-rank torch.profiler + section timers; trace saved to ./profiler_trace/
     prof_warmup:    int            = 1         # profiler schedule warmup batches (profiled, discarded)

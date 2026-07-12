@@ -35,16 +35,19 @@ def _first(x):
     return x[0]
 
 def _rclone_push(path: str, dest: str | None):
-    """Copy a checkpoint to a durable rclone remote so it survives a session timeout.
+    """Copy a file or directory to a durable rclone remote so it survives a session timeout.
 
-    /kaggle/working is not reliably persisted on a crash, so checkpoints are
-    also pushed to a remote (e.g. Drive) via rclone. No-op if `dest` is None
-    or the file is missing; never raises into the train loop.
+    /kaggle/working is not reliably persisted on a crash, so checkpoints (and
+    the plots directory) are also pushed to a remote (e.g. Drive) via rclone.
+    `rclone copy` handles both cases: a file is copied into `dest`, a directory
+    has its contents mirrored into `dest` (incrementally - files already present
+    from an earlier push are skipped). No-op if `dest` is None or `path` is
+    missing; never raises into the train loop.
 
     Parameters
     ----------
     path : str
-        Local path of the file to copy.
+        Local path of the file or directory to copy.
     dest : str or None
         rclone remote destination, or None to skip the push.
 
@@ -341,7 +344,7 @@ def _parse_args():
     p.add_argument("--epochs",         type=int,   default=None)
     p.add_argument("--batcher_seed",   type=int,   default=None)
     p.add_argument("--atom_size_ceil", type=int,   default=None)
-    p.add_argument("--dataset_frac",   type=float, default=None, help="fraction of each split's batches to use, (0.0, 1.0]")
+    p.add_argument("--dataset_frac",   type=float, default=None, help="fraction of TRAIN's batches to use, (0.0, 1.0]; val/test always full")
     p.add_argument("--num_workers",    type=int,   default=None)
     p.add_argument("--verbosity",      default=None, choices=["epoch", "batch", "diagnostic"])
     p.add_argument("--profiler",       action="store_const", const=True, default=None)
@@ -511,35 +514,22 @@ def _worker(rank: int, cfg: RunConfig):
     train_set, val_set, test_set = batcher.get_sets()
 
     if cfg.dataset_frac < 1.0:
-        # Fixed for the whole run (not reselected per epoch): a separate Random per split,
-        # seeded off batcher_seed, so train/val/test each get their own deterministic
-        # subsample and reruns with the same seed reproduce it exactly. Rebuilds a BatchSet
-        # (rather than wrapping in torch's generic Subset) so ._batches stays intact - the
-        # profiler branch below reaches into train_set._batches directly.
-        def _subsample(ds: BatchSet, tag: str) -> BatchSet:
-            """Return a new BatchSet holding a deterministic cfg.dataset_frac-sized sample of `ds`.
-
-            Parameters
-            ----------
-            ds : BatchSet
-                Full split dataset to subsample.
-            tag : str
-                Distinguishes this split's RNG stream from the other splits.
-
-            Returns
-            -------
-            BatchSet
-                New BatchSet over the sampled batches, in original order.
-            """
-            n   = len(ds._batches)
-            k   = max(1, round(n * cfg.dataset_frac))
-            idx = sorted(random.Random(f"{cfg.batcher_seed}-{tag}").sample(range(n), k))
-            return BatchSet(ds._db_path, ds._enc, [ds._batches[i] for i in idx])
-        train_set = _subsample(train_set, "train")
-        val_set   = _subsample(val_set,   "val")
-        test_set  = _subsample(test_set,  "test")
+        # train ONLY - val/test stay at full size always. val drives checkpoint selection
+        # and test feeds both the per-epoch plots and any post-training comparison against
+        # Baselines/kaggle_baselines.ipynb (Train/eval_plots.py reuses Baselines/metrics.py's
+        # evaluate() unmodified specifically so those numbers are directly comparable); a
+        # thinned test set would make that comparison noisier for no benefit, since it's the
+        # train loop's per-batch cost this knob is meant to cut, not eval's. Fixed for the
+        # whole run (not reselected per epoch) and deterministic off batcher_seed, so reruns
+        # with the same seed reproduce the same subsample. Rebuilds a BatchSet (rather than
+        # wrapping in torch's generic Subset) so ._batches stays intact - the profiler branch
+        # below reaches into train_set._batches directly.
+        n   = len(train_set._batches)
+        k   = max(1, round(n * cfg.dataset_frac))
+        idx = sorted(random.Random(cfg.batcher_seed).sample(range(n), k))
+        train_set = BatchSet(train_set._db_path, train_set._enc, [train_set._batches[i] for i in idx])
         if rank == 0:
-            print(f"dataset_frac={cfg.dataset_frac}  train={len(train_set)}  val={len(val_set)}  test={len(test_set)}  (batches, of full split sizes)", flush=True)
+            print(f"dataset_frac={cfg.dataset_frac}  train={len(train_set)} batches (of {n} full)  -  val/test unaffected", flush=True)
 
     pin = device != "cpu" and not str(device).startswith("privateuseone")
     pw  = cfg.num_workers > 0
@@ -853,6 +843,7 @@ def _worker(rank: int, cfg: RunConfig):
         train_sum_y    = 0.0
         train_sum_y2   = 0.0
         train_n_elem   = 0
+        batch_losses: list = []   # (batch_idx, loss) for this epoch's per-batch loss plot
 
         torch.cuda.empty_cache()
 
@@ -991,8 +982,10 @@ def _worker(rank: int, cfg: RunConfig):
                 continue                  # skip the metrics/logging tail during profiling
 
             n = local_batch.iqval.shape[0]
-            train_loss_sum += loss.item() * n
+            batch_loss = loss.item()
+            train_loss_sum += batch_loss * n
             train_mols     += n
+            batch_losses.append((_bi, batch_loss))
             with torch.no_grad():
                 log_pred      = torch.log1p(iq)
                 log_target    = torch.log1p(local_batch.iqval)
@@ -1028,17 +1021,27 @@ def _worker(rank: int, cfg: RunConfig):
 
         val_loss,  val_r2  = evaluate(val_loader,  model, criterion, cfg, device)
         torch.cuda.empty_cache()
-        test_loss, test_r2 = evaluate(test_loader, model, criterion, cfg, device)
-        torch.cuda.empty_cache()
 
-        # Baseline-style diagnostic plots (per-q R2, per-q percent error, Kratky
-        # overlay, residual histogram, error-vs-atom-count), reusing Baselines/
-        # metrics.py so this is directly comparable to Baselines/kaggle_baselines.ipynb.
-        # Runs on every rank (TP-forced forward needs all ranks' participation);
-        # save_epoch_plots itself gates file-writing to rank 0.
+        # Test set is walked exactly once per epoch. When diagnostic plots are on,
+        # save_epoch_plots' single (forced-TP) pass ALSO returns the test loss/R2,
+        # so we skip the separate evaluate(test_loader) that used to double the test
+        # cost. Baseline-style diagnostic plots (per-q R2, percent error, Kratky
+        # overlay, residual histogram, error-vs-atom-count) reuse Baselines/metrics.py
+        # so they stay directly comparable to Baselines/kaggle_baselines.ipynb. The
+        # plots pass runs on every rank (TP-forced forward needs all ranks); it gates
+        # file-writing to rank 0 but returns identical loss/R2 on every rank.
         if cfg.plots_dir:
-            from Train.eval_plots import save_epoch_plots
-            save_epoch_plots(model, test_loader, q_grid, cfg.amp, device, cfg.plots_dir, epoch, rank)
+            from Train.eval_plots import save_epoch_plots, save_batch_loss_plot
+            test_loss, test_r2 = save_epoch_plots(
+                model, test_loader, q_grid, cfg.amp, device, cfg.plots_dir, epoch, rank,
+                criterion, cfg.lambda_6, cfg.lambda_7,
+            )
+            torch.cuda.empty_cache()
+            # cheap: uses batch_losses collected during the loop, no forward passes
+            if rank == 0:
+                save_batch_loss_plot(batch_losses, cfg.plots_dir, epoch)
+        else:
+            test_loss, test_r2 = evaluate(test_loader, model, criterion, cfg, device)
             torch.cuda.empty_cache()
 
         if rank == 0:
@@ -1061,6 +1064,15 @@ def _worker(rank: int, cfg: RunConfig):
             with open(cfg.metrics, "w") as fh:
                 json.dump({"epochs": history}, fh, indent=2)
             _rclone_push(cfg.metrics, cfg.ckpt_rclone_dest)
+
+            # Per-epoch loss curve (train/val/test), regenerated each epoch so it
+            # survives a crash, and push the whole plots dir off-box to Drive. Both
+            # cheap: the loss curve reads `history`, the push is incremental (rclone
+            # copy skips files already uploaded from earlier epochs).
+            if cfg.plots_dir:
+                from Train.eval_plots import save_epoch_loss_plot
+                save_epoch_loss_plot(history, cfg.plots_dir)
+                _rclone_push(cfg.plots_dir, cfg.plots_rclone_dest)
 
             # update best BEFORE the resume save so the latter records the current best_val
             if val_loss < best_val:
