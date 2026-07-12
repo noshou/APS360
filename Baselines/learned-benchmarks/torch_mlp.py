@@ -28,6 +28,7 @@ class TorchMlp(Baseline):
         self._net    = None
         self._x_mean = None
         self._x_std  = None
+        self._log_clamp = None  # set in fit(): training target's own max + margin
 
     def _features(self, batch):
         N, M = batch.vocab.shape
@@ -47,6 +48,13 @@ class TorchMlp(Baseline):
             Y_parts.append(torch.log1p(batch.iqval).cpu())
         X = torch.cat(X_parts)
         Y = torch.cat(Y_parts)
+        # +5 margin: comfortable headroom above every log1p(I) value actually seen in
+        # training, so a genuinely well-fit prediction is never clamped, but a NaN/
+        # exploded-weight prediction (see grad clipping below) gets capped near the
+        # real data's own scale instead of at an arbitrary constant. expm1(30) ~ 1e13 --
+        # a single such point dwarfs every other term in a raw-space sum of squares and
+        # makes R²(raw) meaningless (observed: R²(raw) in the -1e8 range on a real run).
+        self._log_clamp = float(Y.max().item()) + 5.0
         self._x_mean = X.mean(0)
         self._x_std  = X.std(0).clamp(min=1e-8)
         X = (X - self._x_mean) / self._x_std
@@ -83,7 +91,7 @@ class TorchMlp(Baseline):
         # safety net: clamp before expm1 so a NaN/exploded weight (despite grad
         # clipping) surfaces as a large finite MSE instead of inf, which would
         # otherwise break evaluate()'s accumulated sums and the summary plot.
-        log_pred = torch.nan_to_num(log_pred, nan=0.0, posinf=30.0, neginf=0.0).clamp(max=30.0)
+        log_pred = torch.nan_to_num(log_pred, nan=0.0, posinf=self._log_clamp, neginf=0.0).clamp(max=self._log_clamp) #type: ignore
         return torch.expm1(log_pred).cpu()
 
     def timed_call(self, batch):
@@ -104,7 +112,7 @@ class TorchMlp(Baseline):
             with torch.no_grad():
                 log_pred = self._net(X) #type: ignore
             elapsed = time.process_time() - t0
-        log_pred = torch.nan_to_num(log_pred, nan=0.0, posinf=30.0, neginf=0.0).clamp(max=30.0)
+        log_pred = torch.nan_to_num(log_pred, nan=0.0, posinf=self._log_clamp, neginf=0.0).clamp(max=self._log_clamp) #type: ignore
         pred    = torch.expm1(log_pred).cpu()
         n_atoms = int(batch.padding_mask().sum().item())
         return pred, elapsed / max(n_atoms, 1)
