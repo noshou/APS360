@@ -500,7 +500,9 @@ With a process group active, each batch picks a strategy from `M` (padded atoms/
 route_dp = model.training and dp_atom_threshold > 0 and M < dp_atom_threshold and N >= 2*mol_chunk
 ```
 
-`dp_atom_threshold = 0` (default) always uses TP - matches pre-DP behaviour exactly. `evaluate()` runs with `model.eval()`, so `model.training` is `False` and eval/test always use TP regardless of the threshold (needed since `evaluate()` assumes both ranks see identical full-batch outputs).
+`dp_atom_threshold = 0` (default) always uses TP - matches pre-DP behaviour exactly.
+
+`forward()` applies the same routing rule in eval as in train (it does **not** branch on `model.training` — feeding the compiled step functions eval-only shapes caused a recompile storm). `evaluate()` all-reduces its six metric accumulators for a DP-routed bucket, so both routings give identical numbers. In practice eval lands on TP for nearly every bucket anyway: a val/test batch holds only ~15% of its bucket's molecules, and that small `N` fails `route_dp`'s `N >= 2*mol_chunk`. The plots pass forces TP outright (`eval_plots._force_tp`), since `Baselines/metrics.py` has no notion of cross-rank shards.
 
 TP shards atoms of the *same* molecules across ranks and needs an all-reduce mid-forward to reconstruct each atom's full neighbourhood (see `MessagePass._AllReduce`). For a bucket with very few atoms per molecule (e.g. `max_atoms=3`), that all-reduce's fixed latency cost dwarfs the tiny amount of per-rank compute it buys - DP routes those buckets by molecule instead, with **no in-model communication at all**.
 
@@ -674,7 +676,9 @@ When `plots_dir` is set, each epoch writes (via `Train/eval_plots.py`, reusing `
 
 `epoch_NNN` is the epoch number zero-padded to 3 digits (`epoch_001`, …). If `plots_rclone_dest` is set, the whole `plots_dir` is pushed to that rclone remote after every epoch (incrementally — only new files upload), a sibling of the `ckpts/` remote.
 
-> Note: the `epoch_NNN/` diagnostic plots re-evaluate the entire test set every epoch (on top of the val/test loss passes), which dominates end-of-epoch wall-clock. The two loss curves add no forward passes.
+> Note: the `epoch_NNN/` diagnostic plots re-evaluate the entire test set every epoch (on top of the val loss pass), which dominates end-of-epoch wall-clock. The two loss curves add no forward passes.
+>
+> **End-of-epoch is more expensive than it looks.** The 70/15/15 split is at the *molecule* level within each bucket, so val and test hold **one batch per bucket, exactly like train** (`len(val_loader) == len(test_loader) == len(train_loader)`). The batches are thinner, but the atom-chunk loop doesn't shrink with molecule count and both passes run essentially all-TP (eval's small `N` fails `route_dp`'s `N >= 2*mol_chunk`; the plots pass forces TP), so neither gets the DP fast path. Val + test can cost on the order of a full training epoch. Under `verbosity="batch"` both print every 20 batches (`[val]`, `[test]`, `[test/plots]`) — otherwise the silence is indistinguishable from a hang.
 
 ---
 
@@ -703,6 +707,7 @@ When `plots_dir` is set, each epoch writes (via `Train/eval_plots.py`, reusing `
 | `grad_clip`         | 1.0     | Max gradient L2 norm before clipping.                                                                                                           |
 | `epochs`            | 50      | Training epochs.                                                                                                                                |
 | `batcher_seed`      | 0       | Seed for train/val/test split and per-epoch shuffle.                                                                                            |
+| `dataset_frac`      | 1.0     | Fraction of each split's batches to use, (0.0, 1.0]. Applies to **train, val and test** - eval costs on the order of a train epoch, so thinning train alone just lets eval dominate. Deterministic off `batcher_seed`, fixed for the run. |
 | `atom_size_ceil`    | -1      | Max total atoms per batch (-1 = 3x largest molecule).                                                                                           |
 | `num_workers`       | 4       | DataLoader worker processes.                                                                                                                    |
 | `ckpt_interval_sec` | 600     | Seconds between mid-epoch resume checkpoints.                                                                                                   |

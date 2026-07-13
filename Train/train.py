@@ -4,6 +4,7 @@ import json
 import os
 import random
 import subprocess
+import time as _time
 import torch
 import torch.distributed as dist
 
@@ -344,7 +345,7 @@ def _parse_args():
     p.add_argument("--epochs",         type=int,   default=None)
     p.add_argument("--batcher_seed",   type=int,   default=None)
     p.add_argument("--atom_size_ceil", type=int,   default=None)
-    p.add_argument("--dataset_frac",   type=float, default=None, help="fraction of TRAIN's batches to use, (0.0, 1.0]; val/test always full")
+    p.add_argument("--dataset_frac",   type=float, default=None, help="fraction of each split's batches to use, (0.0, 1.0]; applies to train, val AND test")
     p.add_argument("--num_workers",    type=int,   default=None)
     p.add_argument("--verbosity",      default=None, choices=["epoch", "batch", "diagnostic"])
     p.add_argument("--profiler",       action="store_const", const=True, default=None)
@@ -355,7 +356,7 @@ def _parse_args():
     return p.parse_args()
 
 # eval helper
-def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
+def evaluate(loader, model, criterion, cfg: RunConfig, device: str, rank: int = 0, label: str = "eval"):
     """Run one pass over `loader` without gradients and return (mean_loss, R2).
 
     Both ranks call this with identical loaders (same seed, no shuffle). Each
@@ -384,6 +385,12 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
         Run configuration, used for `lambda_6` and `lambda_7`.
     device : str
         Torch device to move batch tensors to.
+    rank : int
+        This process's rank; only rank 0 prints progress.
+    label : str
+        Split being walked ("val"/"test"), used in the progress line. Val and test
+        hold one batch per bucket exactly like train, so this pass is thousands of
+        batches long; it reports every 20, same as the train loop.
 
     Returns
     -------
@@ -400,8 +407,11 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
     sum_y  = 0.0
     sum_y2 = 0.0
     n_elem = 0.0
+    verbose = rank == 0 and cfg.verbosity in ("batch", "diagnostic")
+    n_batch = len(loader)
+    t0      = _time.time()
     with torch.no_grad():
-        for batch in loader:
+        for _bi, batch in enumerate(loader):
             batch             = dc_replace(batch, vocab=batch.vocab.to(device), iqval=batch.iqval.to(device), coord=batch.coord.to(device))
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
                 iq, fmags, sigmas, local_batch, _ = model(batch)
@@ -436,6 +446,11 @@ def evaluate(loader, model, criterion, cfg: RunConfig, device: str):
             sum_y2     += b_sum_y2
             n_elem     += b_n_elem
             del iq, fmags, sigmas, loss, log_pred, log_target
+
+            if verbose and (_bi + 1) % 20 == 0:
+                elapsed = _time.time() - t0
+                rate    = (_bi + 1) / elapsed
+                print(f"  [{label}] batch {_bi+1:5d}/{n_batch}  loss {total_loss/max(total_mols,1)}  {rate} batch/s", flush=True)
     mean_loss = total_loss / total_mols
     ss_tot    = sum_y2 - sum_y ** 2 / n_elem
     r2        = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
@@ -514,22 +529,28 @@ def _worker(rank: int, cfg: RunConfig):
     train_set, val_set, test_set = batcher.get_sets()
 
     if cfg.dataset_frac < 1.0:
-        # train ONLY - val/test stay at full size always. val drives checkpoint selection
-        # and test feeds both the per-epoch plots and any post-training comparison against
-        # Baselines/kaggle_baselines.ipynb (Train/eval_plots.py reuses Baselines/metrics.py's
-        # evaluate() unmodified specifically so those numbers are directly comparable); a
-        # thinned test set would make that comparison noisier for no benefit, since it's the
-        # train loop's per-batch cost this knob is meant to cut, not eval's. Fixed for the
-        # whole run (not reselected per epoch) and deterministic off batcher_seed, so reruns
-        # with the same seed reproduce the same subsample. Rebuilds a BatchSet (rather than
-        # wrapping in torch's generic Subset) so ._batches stays intact - the profiler branch
-        # below reaches into train_set._batches directly.
-        n   = len(train_set._batches)
-        k   = max(1, round(n * cfg.dataset_frac))
-        idx = sorted(random.Random(cfg.batcher_seed).sample(range(n), k))
-        train_set = BatchSet(train_set._db_path, train_set._enc, [train_set._batches[i] for i in idx])
+        # Applies to all three splits. Batcher splits each bucket's MOLECULES, so val and
+        # test hold one batch per bucket just like train - thinning train alone let
+        # epoch-end eval dominate the very runs this knob exists to shorten. Each split is
+        # sampled independently (Batcher drops empty per-bucket splits, so the three
+        # ._batches lists don't share an index space), deterministically off batcher_seed
+        # and fixed for the run. Rebuilds a BatchSet rather than wrapping in Subset so
+        # ._batches stays intact - the profiler branch below reaches into it directly.
+        def _thin(bset: BatchSet, salt: int) -> tuple[BatchSet, int]:
+            n   = len(bset._batches)
+            k   = max(1, round(n * cfg.dataset_frac))
+            idx = sorted(random.Random(cfg.batcher_seed + salt).sample(range(n), k))
+            return BatchSet(bset._db_path, bset._enc, [bset._batches[i] for i in idx]), n
+
+        (train_set, n_trn), (val_set, n_val), (test_set, n_tst) = (
+            _thin(train_set, 0), _thin(val_set, 1), _thin(test_set, 2)
+        )
         if rank == 0:
-            print(f"dataset_frac={cfg.dataset_frac}  train={len(train_set)} batches (of {n} full)  -  val/test unaffected", flush=True)
+            print(
+                f"dataset_frac={cfg.dataset_frac}  "
+                f"train={len(train_set)}/{n_trn}  val={len(val_set)}/{n_val}  test={len(test_set)}/{n_tst} batches",
+                flush=True,
+            )
 
     pin = device != "cpu" and not str(device).startswith("privateuseone")
     pw  = cfg.num_workers > 0
@@ -847,7 +868,6 @@ def _worker(rank: int, cfg: RunConfig):
 
         torch.cuda.empty_cache()
 
-        import time as _time
         _t0 = _time.time()
         last_ckpt = _time.time()
 
@@ -1019,7 +1039,7 @@ def _worker(rank: int, cfg: RunConfig):
         train_ss_tot = train_sum_y2 - train_sum_y ** 2 / train_n_elem
         train_r2     = 1.0 - train_ss_res / train_ss_tot if train_ss_tot > 0 else 0.0
 
-        val_loss,  val_r2  = evaluate(val_loader,  model, criterion, cfg, device)
+        val_loss,  val_r2  = evaluate(val_loader,  model, criterion, cfg, device, rank, "val")
         torch.cuda.empty_cache()
 
         # Test set is walked exactly once per epoch. When diagnostic plots are on,
@@ -1035,13 +1055,14 @@ def _worker(rank: int, cfg: RunConfig):
             test_loss, test_r2 = save_epoch_plots(
                 model, test_loader, q_grid, cfg.amp, device, cfg.plots_dir, epoch, rank,
                 criterion, cfg.lambda_6, cfg.lambda_7,
+                verbose=cfg.verbosity in ("batch", "diagnostic"),
             )
             torch.cuda.empty_cache()
             # cheap: uses batch_losses collected during the loop, no forward passes
             if rank == 0:
                 save_batch_loss_plot(batch_losses, cfg.plots_dir, epoch)
         else:
-            test_loss, test_r2 = evaluate(test_loader, model, criterion, cfg, device)
+            test_loss, test_r2 = evaluate(test_loader, model, criterion, cfg, device, rank, "test")
             torch.cuda.empty_cache()
 
         if rank == 0:

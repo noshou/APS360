@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 
 from contextlib          import contextmanager
@@ -36,6 +37,8 @@ class ScatterNetBaseline(Baseline):
         criterion=None,
         lambda_6: float | None = None,
         lambda_7: float | None = None,
+        progress: bool = False,
+        n_batch:  int  = 0,
     ) -> None:
         """Store the model and precision/device settings used at call time.
 
@@ -55,6 +58,13 @@ class ScatterNetBaseline(Baseline):
         lambda_6, lambda_7 : float, optional
             Loss weights forwarded to `criterion.loss`; required when
             `criterion` is given.
+        progress : bool
+            Print a progress line every 20 batches. The counter lives here rather
+            than in the loop because that loop is Baselines.metrics.evaluate(),
+            shared verbatim with the baselines notebook. It calls this class once
+            per batch, so counting calls here counts batches there.
+        n_batch : int
+            Total number of batches, for the "i/N" in the progress line.
 
         Returns
         -------
@@ -66,6 +76,10 @@ class ScatterNetBaseline(Baseline):
         self._criterion = criterion
         self._lambda_6  = lambda_6
         self._lambda_7  = lambda_7
+        self._progress  = progress
+        self._n_batch   = n_batch
+        self._seen      = 0
+        self._t0        = time.time()
         # loss/R2 accumulators (mirrors train.py evaluate(); only used if criterion given)
         self._loss_sum = 0.0
         self._mols     = 0.0
@@ -132,6 +146,11 @@ class ScatterNetBaseline(Baseline):
                 self._sum_y    += log_target.sum().item()
                 self._sum_y2   += (log_target ** 2).sum().item()
                 self._n_elem   += log_target.numel()
+        self._seen += 1
+        if self._progress and self._seen % 20 == 0:
+            rate = self._seen / (time.time() - self._t0)
+            print(f"  [test/plots] batch {self._seen:5d}/{self._n_batch}  {rate} batch/s", flush=True)
+
         # Move the prediction back to CPU: evaluate() combines it with the loop's
         # original (unmoved, CPU) batch.iqval, and accumulates every metric on CPU
         # (see the .cpu() reductions in Baselines/metrics.py). Returning a cuda
@@ -182,6 +201,7 @@ def save_epoch_plots(
     criterion=None,
     lambda_6:  float | None = None,
     lambda_7:  float | None = None,
+    verbose:   bool = False,
  ) -> tuple[float, float]:
 
     """
@@ -231,13 +251,21 @@ def save_epoch_plots(
         return value is (nan, nan) and only plots are produced.
     lambda_6, lambda_7 : float, optional
         Loss weights, required when `criterion` is given.
+    verbose : bool
+        Print a progress line every 20 batches (rank 0 only). This pass walks one
+        batch per bucket - as many as a training epoch - and forced TP denies it the
+        DP fast path, so silence here is indistinguishable from a hang.
 
     Returns
     -------
     tuple of (float, float)
         (test_loss, test_r2) in log1p space, or (nan, nan) if no criterion.
     """
-    baseline = ScatterNetBaseline(model, amp, device, criterion, lambda_6, lambda_7)
+    baseline = ScatterNetBaseline(
+        model, amp, device, criterion, lambda_6, lambda_7,
+        progress = verbose and rank == 0,
+        n_batch  = len(loader),   # type: ignore[arg-type]
+    )
     with _force_tp(model):
         result = _bl_evaluate(baseline, loader, q_grid, "ScatterNet")
     if rank == 0:
