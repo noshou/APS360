@@ -21,10 +21,15 @@ class Loss(nn.Module):
         q-point, shape (V, Q) where V = len(VOCAB) + 1.
     _q_weights_ : torch.Tensor
         Kratky weighting (1 + q^2), shape (1, Q).
+    _s_weights_ : torch.Tensor
+        q-dependent weighting for the sigma penalty, shape (1, Q).
+        Proportional to q^2, normalised to mean 1 over the grid (see
+        __init__).
     """
 
     _fmag_table: Float[torch.Tensor, "V Q"] # V = len(VOCAB) + 1
     _q_weights_: Float[torch.Tensor, "1 Q"] # kratky weighting
+    _s_weights_: Float[torch.Tensor, "1 Q"] # sigma-penalty weighting (~q^2, mean 1)
     _fwd_fn:     Callable # torch.compiled or plain _loss_fn, per the compile flag
 
     def __init__(self, qgrid, energy, compile: bool = False):
@@ -83,12 +88,36 @@ class Loss(nn.Module):
 
         self.register_buffer('_fmag_table', fmag_table)
         self.register_buffer('_q_weights_', (1 + qgrid**2).unsqueeze(0))
+
+        # Sigma-penalty weighting, ~q^2. sigma is the message-passing kernel's real-space
+        # range (MessagePass scales coordinates as r/sigma, so large sigma = long range),
+        # and the real-space distances a scattering vector q is sensitive to go like 1/q.
+        # A FLAT L2 penalty on sigma therefore fights the model everywhere in the same
+        # units, and since low q is exactly where long-range structure lives, it crushes
+        # the kernel range precisely where I(q) needs it most. Weighting by q^2 penalises
+        # (q*sigma)^2 instead: sigma measured against the length scale that q itself
+        # probes, which is dimensionless and scale-free. Long-range sigma stays cheap at
+        # low q and stays regularised at high q.
+        #
+        # At q = 0 the weight is exactly 0 (the grid starts there), i.e. sigma is left
+        # unconstrained at that q-point. That is deliberate and harmless: I(0) is the
+        # forward-scattering limit, where every sin(qr)/(qr) -> 1 and the intensity
+        # reduces to (sum of form factors)^2 - independent of the coordinates, hence of
+        # the kernel range.
+        #
+        # Normalised to mean 1 over the grid so lambda_7 keeps roughly the strength it
+        # had under the flat penalty: this redistributes the penalty across q, it does
+        # not silently scale it up or down.
+        s_weights = qgrid**2
+        s_weights = s_weights / s_weights.mean().clamp(min=1e-12)
+        self.register_buffer('_s_weights_', s_weights.unsqueeze(0))
         self._fwd_fn = torch.compile(self._loss_fn, dynamic=True, fullgraph=True) if compile else self._loss_fn
 
     @staticmethod
     def _loss_fn(
         fmag_table:  torch.Tensor,
         q_weights:   torch.Tensor,
+        s_weights:   torch.Tensor,
         output_head: torch.Tensor,
         f_mag_pred:  torch.Tensor,
         sigma_pred:  torch.Tensor,
@@ -111,6 +140,8 @@ class Loss(nn.Module):
             q-point, shape (V, Q).
         q_weights : torch.Tensor
             Kratky weighting (1 + q^2), shape (1, Q).
+        s_weights : torch.Tensor
+            Sigma-penalty weighting (~q^2, mean 1), shape (1, Q).
         output_head : torch.Tensor
             Predicted I(q), shape (N, Q).
         f_mag_pred : torch.Tensor
@@ -127,7 +158,7 @@ class Loss(nn.Module):
         lambda_6 : float
             Weight on the form-factor penalty term.
         lambda_7 : float
-            Weight on the sigma L2 penalty term.
+            Weight on the sigma L2 penalty term (q-weighted; see __init__).
 
         Returns
         -------
@@ -147,8 +178,12 @@ class Loss(nn.Module):
         f_mag_pred = torch.log1p(f_mag_pred)
         ff_penalty = ((lambda_6 * ((f_mag_pred - f_mag_real) ** 2)) * mask_2d).sum(dim=1) / n_atoms  # (N, Q)
 
-        # sigma L2 penalty, atom-count-normalized
-        sg_penalty = ((lambda_7 * torch.pow(sigma_pred, 2)) * mask_2d).sum(dim=1) / n_atoms  # (N, Q)
+        # sigma L2 penalty, atom-count-normalized, weighted ~q² so the kernel range stays
+        # cheap at low q and regularized at high q (see __init__). Applying s_weights to
+        # the reduced (N, Q) sum rather than inside the (N, M, Q) product: same value, one
+        # fewer full-size elementwise multiply.
+        sg_sum     = (torch.pow(sigma_pred, 2) * mask_2d).sum(dim=1) / n_atoms  # (N, Q)
+        sg_penalty = lambda_7 * s_weights * sg_sum                              # (N, Q)
 
         return (msle_loss + ff_penalty + sg_penalty).mean()
 
@@ -181,7 +216,7 @@ class Loss(nn.Module):
         lambda_6 : float
             Weight on the form-factor penalty term.
         lambda_7 : float
-            Weight on the sigma L2 penalty term.
+            Weight on the sigma L2 penalty term (q-weighted; see __init__).
 
         Returns
         -------
@@ -194,6 +229,7 @@ class Loss(nn.Module):
         return self._fwd_fn(
             self._fmag_table,
             self._q_weights_,
+            self._s_weights_,
             output_head.contiguous(),
             f_mag_pred.contiguous(),
             sigma_pred.contiguous(),

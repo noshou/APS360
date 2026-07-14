@@ -1,3 +1,5 @@
+import glob
+import json
 import os
 import time
 import torch
@@ -195,7 +197,7 @@ def save_epoch_plots(
     q_grid,
     amp:       bool,
     device:    str,
-    plots_dir: str,
+    data_dir: str,
     epoch:     int,
     rank:      int,
     criterion=None,
@@ -239,9 +241,9 @@ def save_epoch_plots(
         Whether to run the forward pass under fp16 autocast.
     device : str
         Torch device string.
-    plots_dir : str
+    data_dir : str
         Root directory; this epoch's plots are written to
-        `{plots_dir}/epoch_{epoch:03d}/`.
+        `{data_dir}/epoch_{epoch:03d}/`.
     epoch : int
         Current epoch number, used to name the per-epoch subdirectory.
     rank : int
@@ -269,13 +271,13 @@ def save_epoch_plots(
     with _force_tp(model):
         result = _bl_evaluate(baseline, loader, q_grid, "ScatterNet")
     if rank == 0:
-        epoch_dir = os.path.join(plots_dir, f"epoch_{epoch:03d}")
+        epoch_dir = os.path.join(data_dir, f"epoch_{epoch:03d}")
         written   = run_all_plots([result], q_grid, epoch_dir)
         print(f"  [plots] wrote {len(written)} file(s) to {epoch_dir}", flush=True)
     return baseline.loss_r2()
 
 
-def save_batch_loss_plot(batch_losses, plots_dir: str, epoch: int) -> None:
+def save_batch_loss_plot(batch_losses, data_dir: str, epoch: int) -> None:
     """Plot this epoch's per-batch training loss into the epoch's plot dir.
 
     Cheap: `batch_losses` is data already collected in the training loop (no
@@ -288,9 +290,9 @@ def save_batch_loss_plot(batch_losses, plots_dir: str, epoch: int) -> None:
     ----------
     batch_losses : list of (int, float)
         (global batch index, training loss) for each batch trained this epoch.
-    plots_dir : str
+    data_dir : str
         Root plots directory; the file is written to
-        `{plots_dir}/epoch_{epoch:03d}/loss_per_batch.png`, alongside the
+        `{data_dir}/epoch_{epoch:03d}/loss_per_batch.png`, alongside the
         epoch's diagnostic plots.
     epoch : int
         Current epoch number.
@@ -304,7 +306,7 @@ def save_batch_loss_plot(batch_losses, plots_dir: str, epoch: int) -> None:
     if not batch_losses:
         return
     _configure_mpl()
-    epoch_dir = os.path.join(plots_dir, f"epoch_{epoch:03d}")
+    epoch_dir = os.path.join(data_dir, f"epoch_{epoch:03d}")
     os.makedirs(epoch_dir, exist_ok=True)
 
     xs = [b for b, _ in batch_losses]
@@ -324,22 +326,88 @@ def save_batch_loss_plot(batch_losses, plots_dir: str, epoch: int) -> None:
     print(f"  [plots] wrote {out_path}", flush=True)
 
 
-def save_epoch_loss_plot(history, plots_dir: str) -> None:
-    """Plot train/val/test loss vs epoch across the run so far.
+def save_epoch_metrics(record: dict, data_dir: str, epoch: int) -> None:
+    """Write one epoch's train/val/test loss and R2 to its own epoch dir.
 
-    Cheap: reads `history` (already accumulated per epoch); no model call.
-    Rank 0 only. Regenerated (overwritten) at every epoch boundary so the curve
-    is always current and survives a mid-run crash - the final call, at the last
-    epoch, is the end-of-training summary. Written to
-    `{plots_dir}/loss_per_epoch.png` (run-level, not inside an epoch subdir).
+    One file per epoch (`{data_dir}/epoch_{epoch:03d}/metrics.json`), so no
+    epoch can clobber another's numbers and a resumed run cannot truncate the
+    record of the epochs that came before it. Concatenate the files afterwards
+    (`load_epoch_history`) to get the whole run. Rank 0 only.
+
+    Parameters
+    ----------
+    record : dict
+        This epoch's metrics: "epoch", "train_loss", "train_r2", "val_loss",
+        "val_r2", "test_loss", "test_r2".
+    data_dir : str
+        Root plots directory.
+    epoch : int
+        Current epoch number, used to name the per-epoch subdirectory.
+
+    Returns
+    -------
+    None
+    """
+    epoch_dir = os.path.join(data_dir, f"epoch_{epoch:03d}")
+    os.makedirs(epoch_dir, exist_ok=True)
+    out_path = os.path.join(epoch_dir, "metrics.json")
+    with open(out_path, "w") as fh:
+        json.dump(record, fh, indent=2)
+    print(f"  [plots] wrote {out_path}", flush=True)
+
+
+def load_epoch_history(data_dir: str) -> list[dict]:
+    """Rebuild the run's per-epoch history by reading every epoch's metrics.json.
+
+    Read off disk rather than kept in memory so the history survives a resume:
+    a resumed process starts with no in-memory record of the epochs it did not
+    run, but their `metrics.json` files are still sitting in `data_dir` (pulled
+    back from Drive with the checkpoint, if the run moved boxes).
+
+    Ordered by the epoch number in each record, so a directory holding epochs
+    from several resumes still yields one monotonic curve.
+
+    Parameters
+    ----------
+    data_dir : str
+        Root plots directory.
+
+    Returns
+    -------
+    list of dict
+        One record per epoch found, ascending by "epoch". Empty if none exist.
+    """
+    history = []
+    for path in glob.glob(os.path.join(data_dir, "epoch_*", "metrics.json")):
+        try:
+            with open(path) as fh:
+                history.append(json.load(fh))
+        except (OSError, ValueError):
+            # A run killed mid-write leaves a truncated json. Skipping it costs
+            # one point on the curve; letting it raise would kill the epoch.
+            print(f"  [plots] skipping unreadable {path}", flush=True)
+    history.sort(key=lambda h: h["epoch"])
+    return history
+
+
+def save_epoch_loss_plot(history, data_dir: str, epoch: int) -> None:
+    """Plot train/val/test loss vs epoch, up to and including `epoch`.
+
+    Cheap: reads `history` (per-epoch records already on disk); no model call.
+    Rank 0 only. Written inside the epoch's own dir
+    (`{data_dir}/epoch_{epoch:03d}/loss_per_epoch.png`), so each epoch keeps its
+    own snapshot of the curve instead of overwriting one run-level file - the
+    last epoch's copy is the end-of-training summary.
 
     Parameters
     ----------
     history : list of dict
         Per-epoch records, each with "epoch", "train_loss", "val_loss",
-        "test_loss".
-    plots_dir : str
+        "test_loss"; typically `load_epoch_history(data_dir)`.
+    data_dir : str
         Root plots directory.
+    epoch : int
+        Current epoch number, used to name the per-epoch subdirectory.
 
     Returns
     -------
@@ -350,7 +418,8 @@ def save_epoch_loss_plot(history, plots_dir: str) -> None:
     if not history:
         return
     _configure_mpl()
-    os.makedirs(plots_dir, exist_ok=True)
+    epoch_dir = os.path.join(data_dir, f"epoch_{epoch:03d}")
+    os.makedirs(epoch_dir, exist_ok=True)
 
     epochs = [h["epoch"] for h in history]
     fig, ax = plt.subplots(figsize=(11, 6))
@@ -362,11 +431,114 @@ def save_epoch_loss_plot(history, plots_dir: str) -> None:
                 color=color, label=label)
     ax.set_xlabel("epoch", color=TEXT_PRIMARY)
     ax.set_ylabel("loss", color=TEXT_PRIMARY)
-    ax.set_title("loss per epoch", color=TEXT_PRIMARY, pad=10)
+    ax.set_title(f"loss per epoch (through epoch {epoch})", color=TEXT_PRIMARY, pad=10)
     _style_axes(ax)
     ax.legend(loc="upper right", frameon=False, labelcolor=TEXT_PRIMARY)
     fig.tight_layout()
-    out_path = os.path.join(plots_dir, "loss_per_epoch.png")
+    out_path = os.path.join(epoch_dir, "loss_per_epoch.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+    print(f"  [plots] wrote {out_path}", flush=True)
+
+
+# Section headings for the config dump, in the order RunConfig declares its
+# fields. Any field NOT listed here still gets dumped, under "Other" - a new
+# RunConfig field must never silently vanish from the record of the run.
+_CFG_SECTIONS: list[tuple[str, tuple[str, ...]]] = [
+    ("Paths",    ("hdf5", "encodings_sqlite3_path", "ckpt_best", "ckpt_resume", "resume")),
+    ("Model",    ("lambda_1", "lambda_2", "lambda_3", "lambda_4", "lambda_5", "msg_seed",
+                  "atm_chunk", "mol_chunk", "dp_atom_threshold", "compile", "amp",
+                  "amp_init_scale", "eps_embd", "eps_msgp")),
+    ("Loss",     ("lambda_6", "lambda_7")),
+    ("Training", ("lr", "weight_decay", "grad_clip", "epochs", "batcher_seed",
+                  "atom_size_ceil", "dataset_frac", "num_workers", "max_batches",
+                  "ckpt_interval_sec", "ckpt_rclone_dest", "data_dir", "data_rclone_dest",
+                  "verbosity", "profiler", "prof_warmup", "prof_active", "prof_molecules")),
+    ("Data",     ("buckets",)),
+]
+
+
+def _rtf_escape(text: str) -> str:
+    r"""Escape a string for inclusion in an RTF body.
+
+    RTF gives `\`, `{` and `}` structural meaning, and is a 7-bit format: a raw
+    non-ASCII byte would be mis-decoded by the reader, so those characters are
+    emitted as `\uN?` escapes (N = the code point, `?` = the ASCII fallback that
+    readers too old to understand `\u` display instead).
+
+    Parameters
+    ----------
+    text : str
+        Raw text.
+
+    Returns
+    -------
+    str
+        RTF-safe text.
+    """
+    out = []
+    for ch in text:
+        if ch in "\\{}":
+            out.append("\\" + ch)
+        elif ord(ch) < 128:
+            out.append(ch)
+        else:
+            out.append(f"\\u{ord(ch)}?")
+    return "".join(out)
+
+
+def save_run_config_rtf(cfg, data_dir: str) -> None:
+    """Dump the run's full RunConfig to `{data_dir}/run_config.rtf`.
+
+    Written once, at the start of training (rank 0 only), so the data dir is
+    self-describing: whoever reads the per-epoch metrics months later can see
+    exactly which hyperparameters produced them without digging up the notebook
+    cell that launched the run. Every field of the dataclass is dumped, grouped
+    by `_CFG_SECTIONS`; a field missing from that table lands under "Other"
+    rather than being dropped.
+
+    Overwriting is intended here (unlike the per-epoch files): a resumed run
+    rewrites this with the config it is ACTUALLY running under, which is the one
+    that matters for the epochs still to come.
+
+    Parameters
+    ----------
+    cfg : RunConfig
+        The config the run was launched with.
+    data_dir : str
+        Root data directory.
+
+    Returns
+    -------
+    None
+    """
+    from dataclasses import fields
+
+    values    = {f.name: getattr(cfg, f.name) for f in fields(cfg)}
+    listed    = {name for _, names in _CFG_SECTIONS for name in names}
+    sections  = _CFG_SECTIONS + [("Other", tuple(n for n in values if n not in listed))]
+    key_width = max(len(n) for n in values) if values else 0
+
+    # \f0 = proportional (headings), \f1 = monospace (the name = value lines, so
+    # the padded keys actually line up). \fs is in half-points.
+    lines = [
+        r"{\rtf1\ansi\ansicpg1252\deff0",
+        r"{\fonttbl{\f0\fswiss Helvetica;}{\f1\fmodern Courier New;}}",
+        r"\f0\fs32\b ScatterNet run configuration\b0\fs20\par",
+        r"\i " + _rtf_escape(time.strftime("%Y-%m-%d %H:%M:%S %Z")) + r"\i0\par",
+    ]
+    for title, names in sections:
+        names = tuple(n for n in names if n in values)
+        if not names:
+            continue
+        lines.append(r"\par\f0\fs24\b " + _rtf_escape(title) + r"\b0\fs20\par")
+        for name in names:
+            row = f"{name.ljust(key_width)} = {values[name]!r}"
+            lines.append(r"{\f1 " + _rtf_escape(row) + r"\par}")
+    lines.append("}")
+
+    os.makedirs(data_dir, exist_ok=True)
+    out_path = os.path.join(data_dir, "run_config.rtf")
+    with open(out_path, "w", encoding="ascii") as fh:
+        fh.write("\n".join(lines))
     print(f"  [plots] wrote {out_path}", flush=True)

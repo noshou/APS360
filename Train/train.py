@@ -1,6 +1,5 @@
 import argparse
 import h5py
-import json
 import os
 import random
 import subprocess
@@ -315,7 +314,6 @@ def _parse_args():
     p.add_argument("--encodings_sqlite3_path", default=None)
     p.add_argument("--ckpt_best",      default=None)
     p.add_argument("--ckpt_resume",    default=None)
-    p.add_argument("--metrics",        default=None)
     p.add_argument("--resume",         default=None,  help="path to resume checkpoint")
 
     # model
@@ -351,7 +349,7 @@ def _parse_args():
     p.add_argument("--profiler",       action="store_const", const=True, default=None)
     p.add_argument("--prof_warmup",    type=int,   default=None)
     p.add_argument("--prof_active",    type=int,   default=None)
-    p.add_argument("--plots_dir",      default=None, help="write per-epoch baseline-style diagnostic plots here")
+    p.add_argument("--data_dir",       default=None, help="write per-epoch metrics + baseline-style diagnostic plots here")
 
     return p.parse_args()
 
@@ -719,7 +717,6 @@ def _worker(rank: int, cfg: RunConfig):
         print(f"mixed precision: fp16 autocast + GradScaler ON (init_scale={cfg.amp_init_scale}, RFF+Debye kept fp32)", flush=True)
 
     start_epoch = 1
-    history: list = []
     best_val = float("inf")
     resume_skip = 0      # batches to skip in the first resumed epoch (exact mid-epoch resume)
 
@@ -851,6 +848,14 @@ def _worker(rank: int, cfg: RunConfig):
             "hparams":   hparams,
         }, cfg.ckpt_resume)
         _rclone_push(cfg.ckpt_resume, cfg.ckpt_rclone_dest)
+
+    # Dump the run's full config at the root of the data dir, so the per-epoch
+    # metrics underneath it are self-describing. Written after the resume block, so
+    # a resumed run records the config it is actually continuing under.
+    if rank == 0 and cfg.data_dir:
+        from Train.eval_plots import save_run_config_rtf
+        save_run_config_rtf(cfg, cfg.data_dir)
+        _rclone_push(cfg.data_dir, cfg.data_rclone_dest)
 
     for epoch in range(start_epoch, start_epoch + cfg.epochs):
 
@@ -1050,17 +1055,17 @@ def _worker(rank: int, cfg: RunConfig):
         # so they stay directly comparable to Baselines/kaggle_baselines.ipynb. The
         # plots pass runs on every rank (TP-forced forward needs all ranks); it gates
         # file-writing to rank 0 but returns identical loss/R2 on every rank.
-        if cfg.plots_dir:
+        if cfg.data_dir:
             from Train.eval_plots import save_epoch_plots, save_batch_loss_plot
             test_loss, test_r2 = save_epoch_plots(
-                model, test_loader, q_grid, cfg.amp, device, cfg.plots_dir, epoch, rank,
+                model, test_loader, q_grid, cfg.amp, device, cfg.data_dir, epoch, rank,
                 criterion, cfg.lambda_6, cfg.lambda_7,
                 verbose=cfg.verbosity in ("batch", "diagnostic"),
             )
             torch.cuda.empty_cache()
             # cheap: uses batch_losses collected during the loop, no forward passes
             if rank == 0:
-                save_batch_loss_plot(batch_losses, cfg.plots_dir, epoch)
+                save_batch_loss_plot(batch_losses, cfg.data_dir, epoch)
         else:
             test_loss, test_r2 = evaluate(test_loader, model, criterion, cfg, device, rank, "test")
             torch.cuda.empty_cache()
@@ -1073,27 +1078,30 @@ def _worker(rank: int, cfg: RunConfig):
                 f"  |  test loss {test_loss:.4f}  r2 {test_r2:.4f}"
             )
 
-            history.append({
-                "epoch":      epoch,
-                "train_loss": train_loss,
-                "train_r2":   train_r2,
-                "val_loss":   val_loss,
-                "val_r2":     val_r2,
-                "test_loss":  test_loss,
-                "test_r2":    test_r2,
-            })
-            with open(cfg.metrics, "w") as fh:
-                json.dump({"epochs": history}, fh, indent=2)
-            _rclone_push(cfg.metrics, cfg.ckpt_rclone_dest)
-
-            # Per-epoch loss curve (train/val/test), regenerated each epoch so it
-            # survives a crash, and push the whole plots dir off-box to Drive. Both
-            # cheap: the loss curve reads `history`, the push is incremental (rclone
-            # copy skips files already uploaded from earlier epochs).
-            if cfg.plots_dir:
-                from Train.eval_plots import save_epoch_loss_plot
-                save_epoch_loss_plot(history, cfg.plots_dir)
-                _rclone_push(cfg.plots_dir, cfg.plots_rclone_dest)
+            # This epoch's numbers go in this epoch's own dir, one json per epoch, and
+            # the loss-vs-epoch curve is then drawn from the jsons READ BACK OFF DISK
+            # (not from an in-memory history list). That is what makes a resume safe:
+            # a resumed process has no memory of the epochs it did not run, so a
+            # single run-level metrics file would be rewritten with only the
+            # post-resume epochs, silently truncating everything before it. Concatenate
+            # the per-epoch jsons after the run for the full history. Both steps are
+            # cheap (no forward passes), as is the off-box push (rclone copy is
+            # incremental: earlier epochs' files are already uploaded and get skipped).
+            if cfg.data_dir:
+                from Train.eval_plots import (
+                    save_epoch_metrics, load_epoch_history, save_epoch_loss_plot,
+                )
+                save_epoch_metrics({
+                    "epoch":      epoch,
+                    "train_loss": train_loss,
+                    "train_r2":   train_r2,
+                    "val_loss":   val_loss,
+                    "val_r2":     val_r2,
+                    "test_loss":  test_loss,
+                    "test_r2":    test_r2,
+                }, cfg.data_dir, epoch)
+                save_epoch_loss_plot(load_epoch_history(cfg.data_dir), cfg.data_dir, epoch)
+                _rclone_push(cfg.data_dir, cfg.data_rclone_dest)
 
             # update best BEFORE the resume save so the latter records the current best_val
             if val_loss < best_val:
@@ -1144,7 +1152,6 @@ def main(cfg: RunConfig | None = None):
             encodings_sqlite3_path  = A.encodings_sqlite3_path,
             ckpt_best      = A.ckpt_best,
             ckpt_resume    = A.ckpt_resume,
-            metrics        = A.metrics,
             resume         = A.resume,
             lambda_1       = A.lambda_1,
             lambda_2       = A.lambda_2,
@@ -1174,7 +1181,7 @@ def main(cfg: RunConfig | None = None):
             profiler       = A.profiler,
             prof_warmup    = A.prof_warmup,
             prof_active    = A.prof_active,
-            plots_dir      = A.plots_dir,
+            data_dir       = A.data_dir,
         )
 
     assert cfg is not None

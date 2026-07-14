@@ -51,7 +51,7 @@ GNN that predicts X-ray powder scattering curves I(q) from atomic coordinates an
 | λ₄     | OutputHead MLP halving steps (`lambda_4`, default 4)     |
 | λ₅     | Random Fourier Features count (`lambda_5`, default 64)   |
 | λ₆     | form-factor penalty weight (`lambda_6`, default 0.1)     |
-| λ₇     | sigma L2 penalty weight (`lambda_7`, default 0.1)        |
+| λ₇     | sigma L2 penalty weight (`lambda_7`, default 0.1; penalty is q²-weighted) |
 | Nc     | molecules per N-chunk (`mol_chunk`)                      |
 | mc     | atoms per M-chunk (`atm_chunk`)                          |
 | V      | VOCAB size = len(VOCAB) + 1 (row 0 is padding)           |
@@ -403,7 +403,7 @@ After the AllReduce, `features` and `chem_env` are divided by the per-molecule r
     σ_new = softplus( σ_old + tanhshrink( bilinear(e_updated, f_mag) ) )
     ```
     `_sigbilin` is `nn.Bilinear(λ₁, Q, 1)`. The bilinear coupling `e^T W f` makes the sigma delta depend on the interaction between the atom's learned representation and its scattering strength.
-    Tanhshrink is unbounded by design: for large bilinear outputs sigma can shift significantly. The sigma L2 penalty in the loss (λ₇ · σ²) is the actual blowup prevention mechanism; its gradient grows with σ and pulls it back down. The two reach equilibrium where the bilinear delta just balances the MSLE gradient against the penalty. The maximum cumulative sigma change is also bounded by λ₂ rounds being small (default 5).
+    Tanhshrink is unbounded by design: for large bilinear outputs sigma can shift significantly. The sigma L2 penalty in the loss (λ₇ · w(q) · σ², w ∝ q² - see [§8](#8-loss)) is the actual blowup prevention mechanism; its gradient grows with σ and pulls it back down. The two reach equilibrium where the bilinear delta just balances the MSLE gradient against the penalty. The maximum cumulative sigma change is also bounded by λ₂ rounds being small (default 5).
     The sticky property near zero (tanhshrink ≈ 0, gradient = `1 - sech²(x)` = 0 at x=0) is a beneficial side effect: early in training when the bilinear has weak outputs, sigmas stay stable rather than wandering, then move more freely as the bilinear gains signal.
     Softplus wraps the whole update to maintain σ > 0, since division by σ in the RFF step cannot encounter zero.
 
@@ -574,7 +574,7 @@ Step 5: Gather
 
 ## 8. `Loss`
 
-`Loss` is an `nn.Module` with two registered buffers and no learnable parameters.
+`Loss` is an `nn.Module` with three registered buffers and no learnable parameters.
 
 ### Buffers
 
@@ -582,6 +582,7 @@ Step 5: Gather
 | ------------- | ------ | ---------------------------------------------------------------------- |
 | `_fmag_table` | (V, Q) | Reference form factor magnitudes from xraydb. Row 0 = zeros (padding). |
 | `_q_weights_` | (1, Q) | Kratky weights`(1 + q²)` per q-point.                                  |
+| `_s_weights_` | (1, Q) | Sigma-penalty weights, `q²` normalised to mean 1 over the grid.        |
 
 Form factor table construction: `q -> s = q/(4π)` converts to crystallographic s (sinθ/λ used by xraydb), then `|f(q)| = hypot(f0 + f1_chantler, f2_chantler)`. Transuranics: f0 only.
 
@@ -603,13 +604,22 @@ L_ff(n, q) = λ₆ * (1/n_atoms) * sum_m mask * (log1p(f_hat_m(q)) - log1p(f_ref
 
 Anchors predicted per-atom form factors to xraydb reference values, preventing the model from learning arbitrary f_mags that fit I(q) via cancellation. Atom-count normalisation makes the penalty size-independent.
 
-**Term 3: Sigma L2 penalty** (`_sg_penalty`):
+**Term 3: q-weighted sigma L2 penalty** (`_sg_penalty`):
 
 ```{Latex}
-L_sigma(n, q) = λ₇ * (1/n_atoms) * sum_m mask * σ_m(q)²
+L_sigma(n, q) = λ₇ * w(q) * (1/n_atoms) * sum_m mask * σ_m(q)²,    w(q) ∝ q², mean_q w = 1
 ```
 
 Primary mechanism preventing sigma blowup. The penalty gradient grows with σ, pulling large bandwidths back down. Combined with tanhshrink's unbounded delta in MessagePass, the system reaches equilibrium where the bilinear delta balances the MSLE gradient against the penalty.
+
+The `w(q) ∝ q²` weighting exists because σ is a *real-space range* (MessagePass scales coordinates by `r/σ`, so large σ = long-range aggregation), while the real-space distances a given q is sensitive to scale as `1/q`. A flat L2 penalty on σ therefore applies the same absolute pressure at every q, which is far too much at low q: low q is exactly where large-scale structure lives, so a flat penalty crushes the kernel range precisely where I(q) needs it. Weighting by q² penalises `(q·σ)²` instead - σ measured against the length scale q itself probes, which is dimensionless and scale-free. Long-range σ stays cheap at low q and stays regularised at high q.
+
+Two consequences worth knowing:
+
+- At `q = 0` the weight is exactly zero (the grid starts there), so σ is unconstrained at that one q-point. This is deliberate and harmless: `I(0)` is the forward-scattering limit, where every `sin(qr)/(qr) → 1` and the intensity collapses to `(Σ_m f_m)²` - independent of the coordinates, and therefore of the kernel range.
+- The weights are normalised to mean 1 over the q-grid, so `λ₇` keeps roughly the strength it had under the old flat penalty. The change **redistributes** the penalty across q rather than scaling it up or down, and λ₇ = 0.1 remains a sensible default. (This matters here because the grid is `q ∈ [0, 0.5] Å⁻¹`: an un-normalised q² weight would have shrunk the whole penalty by ~12x.)
+
+If I(q) is poor at low q but healthy at high q, a σ crushed to the `eps_msgp` floor is the first thing to check - that was the symptom this weighting is designed to fix.
 
 **Total:**
 
@@ -664,17 +674,21 @@ Evaluation is done once per epoch for both val and test. Val is used for checkpo
 
 Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle identically, then the loop fast-forwards over `batch_idx` batches via `continue`. Both checkpoints are pushed to a rclone remote (`ckpt_rclone_dest`) for Kaggle session crash durability.
 
-### Diagnostic Plots
+### Run Data (metrics + diagnostic plots)
 
-When `plots_dir` is set, each epoch writes (via `Train/eval_plots.py`, reusing `Baselines/metrics.py` so they are directly comparable to the baseline notebook):
+When `data_dir` is set, everything the run records lands under it (via `Train/eval_plots.py`, reusing `Baselines/metrics.py` so the plots are directly comparable to the baseline notebook):
 
 | File                                | Scope     | Cost                                                     |
 | ----------------------------------- | --------- | ------------------------------------------------------- |
 | `epoch_NNN/` (per-q R², Kratky, …)  | per epoch | full test-set pass (expensive; see note)                |
+| `epoch_NNN/metrics.json`            | per epoch | free — that epoch's train/val/test loss and R²          |
 | `epoch_NNN/loss_per_batch.png`      | per epoch | free — plotted from losses the train loop already logs  |
-| `loss_per_epoch.png`                | run-level | free — plotted from the per-epoch `history`, redrawn each epoch so it survives a crash |
+| `epoch_NNN/loss_per_epoch.png`      | per epoch | free — train/val/test loss vs epoch, through this epoch; rebuilt by reading every earlier epoch's `metrics.json` off disk |
+| `run_config.rtf`                    | run-level | free — the full `RunConfig`, dumped once when training starts |
 
-`epoch_NNN` is the epoch number zero-padded to 3 digits (`epoch_001`, …). If `plots_rclone_dest` is set, the whole `plots_dir` is pushed to that rclone remote after every epoch (incrementally — only new files upload), a sibling of the `ckpts/` remote.
+`epoch_NNN` is the epoch number zero-padded to 3 digits (`epoch_001`, …). Every metric file is scoped to one epoch on purpose: a single run-level metrics file would be rewritten from the in-memory history at every epoch boundary, and since a resumed process starts with no memory of the epochs it did not run, resuming would silently truncate the record back to the resume point (and push the truncated copy to Drive). Reading the history back off disk instead means a resumed run extends the curve rather than restarting it. Concatenate the per-epoch `metrics.json` files after the run for the whole history.
+
+If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remote after every epoch (incrementally — only new files upload), a sibling of the `ckpts/` remote.
 
 > Note: the `epoch_NNN/` diagnostic plots re-evaluate the entire test set every epoch (on top of the val loss pass), which dominates end-of-epoch wall-clock. The two loss curves add no forward passes.
 >
@@ -692,7 +706,7 @@ When `plots_dir` is set, each epoch writes (via `Train/eval_plots.py`, reusing `
 | `lambda_4`          | 4       | OutputHead halving steps. With defaults: 128->64->32->16->8->1.                                                                                 |
 | `lambda_5`          | 256     | RFF count. More = tighter kernel approximation, higher memory cost.                                                                             |
 | `lambda_6`          | 0.1     | Form-factor penalty weight.                                                                                                                     |
-| `lambda_7`          | 0.1     | Sigma L2 penalty weight. Primary blowup prevention mechanism.                                                                                   |
+| `lambda_7`          | 0.1     | Sigma L2 penalty weight. Primary blowup prevention mechanism. The penalty is q²-weighted (mean 1 over the grid), so σ stays long-range at low q. |
 | `msg_seed`          | 42      | Seed for fixed RFF frequency matrix Ω.                                                                                                          |
 | `atm_chunk`         | 512     | Atoms per M-chunk. Reduce to lower VRAM.                                                                                                        |
 | `mol_chunk`         | 256     | Molecules per N-chunk. Reduce to lower VRAM on large molecules.                                                                                 |
@@ -772,7 +786,7 @@ Batch
 Loss
   └─ _kratky_MSLE:  (1+q²)*(log1p(Î)-log1p(I))²    (N,Q)
   └─ _ff_penalty:   λ₆*(log1p(f̂)-log1p(f_ref))²/n  (N,Q)
-  └─ _sg_penalty:   λ₇*σ²/n_atoms                   (N,Q)
+  └─ _sg_penalty:   λ₇*w(q)*σ²/n_atoms, w ∝ q²      (N,Q)
   └─ .mean() -> scalar
 
 Optimizer: Adam(SUM-reduced grads, clip at grad_clip) -> parameter update

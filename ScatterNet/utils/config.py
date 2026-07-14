@@ -77,7 +77,6 @@ class RunConfig:
                              (via Preprocess) if it does not already exist.
     ckpt_best:      Where to save the checkpoint with the lowest validation loss.
     ckpt_resume:    Where to save the latest checkpoint for run resumption.
-    metrics:        JSON file that accumulates per-epoch train/val/test loss and R2.
     resume:         Path to a checkpoint to resume from (None = train from scratch).
 
     Model
@@ -128,7 +127,10 @@ class RunConfig:
     Loss
     ----
     lambda_6:       Weight on the form-factor penalty term.
-    lambda_7:       Weight on the sigma L2 penalty (prevents RFF bandwidth blowup).
+    lambda_7:       Weight on the sigma L2 penalty (prevents RFF bandwidth blowup). The
+                    penalty is weighted by ~q^2 across the q-grid (normalised to mean 1, so
+                    this value keeps the meaning it had under the old flat penalty), which
+                    leaves the kernel range long where low q needs it. See ScatterNet/utils/loss.py.
 
     Training
     --------
@@ -157,22 +159,31 @@ class RunConfig:
     ckpt_rclone_dest: rclone destination to copy checkpoints to after each save (e.g.
                     "gdrive:APS360/ckpts/"). None = no off-box copy. Needed on Kaggle, where
                     /kaggle/working is not reliably persisted through a session timeout.
-    plots_dir:      If set, write per-epoch diagnostic plots (per-q R2, per-q percent error,
-                    Kratky overlay, residual histogram, error-vs-atom-count, summary bar chart)
-                    to `{plots_dir}/epoch_{N:03d}/`, evaluated on the test set. Reuses
-                    Baselines/metrics.py's evaluate()/run_all_plots() unmodified (see
-                    Train/eval_plots.py), so these are directly comparable to the plots
-                    Baselines/kaggle_baselines.ipynb produces for the physics/learned
-                    baselines. None (default) = disabled. Requires the same LaTeX/JuliaMono
+    data_dir:       If set, write every per-epoch output the run produces under
+                    `{data_dir}/epoch_{N:03d}/` (N zero-padded to 3 digits: epoch_001, ...):
+                      - diagnostic plots on the test set (per-q R2, per-q percent error,
+                        Kratky overlay, residual histogram, error-vs-atom-count, summary
+                        bar chart). Reuses Baselines/metrics.py's evaluate()/run_all_plots()
+                        unmodified (see Train/eval_plots.py), so these are directly comparable
+                        to the plots Baselines/kaggle_baselines.ipynb produces for the
+                        physics/learned baselines.
+                      - metrics.json: that epoch's train/val/test loss and R2.
+                      - loss_per_batch.png: this epoch's per-batch training loss.
+                      - loss_per_epoch.png: train/val/test loss vs epoch, through this epoch
+                        (rebuilt by reading every earlier epoch's metrics.json off disk).
+                    Nothing is written outside an epoch dir except run_config.rtf (the run's
+                    full RunConfig, dumped at `{data_dir}/run_config.rtf` when training starts),
+                    so no epoch can overwrite another's numbers and a resumed run cannot
+                    truncate the record of the epochs that preceded it. Concatenate the
+                    per-epoch metrics.json files after the run for the whole history.
+                    None (default) = disabled. The plots require the same LaTeX/JuliaMono
                     toolchain Baselines/kaggle_baselines.ipynb installs (matplotlib's "pgf"
-                    backend via xelatex). Also produces a per-epoch per-batch loss curve
-                    ({plots_dir}/epoch_NNN/loss_per_batch.png) and a run-level train/val/test
-                    loss-per-epoch curve ({plots_dir}/loss_per_epoch.png); both are cheap
-                    (plotted from data the loop already collects, no extra forward passes).
-    plots_rclone_dest: rclone destination to copy the whole plots_dir to after each epoch
-                    (e.g. "gdrive:APS360/plots/"). None = keep plots local only. The copy is
+                    backend via xelatex); everything else is cheap (written from data the loop
+                    already collects, no extra forward passes).
+    data_rclone_dest: rclone destination to copy the whole data_dir to after each epoch
+                    (e.g. "gdrive:APS360/data/"). None = keep the data local only. The copy is
                     incremental (rclone skips files already uploaded), so re-pushing the dir
-                    every epoch only sends the new epoch's plots. Needed on Kaggle for the same
+                    every epoch only sends the new epoch's files. Needed on Kaggle for the same
                     reason as ckpt_rclone_dest: /kaggle/working is not persisted on timeout.
     verbosity:      Logging level. "epoch" = one line per epoch only. "batch" = also print a
                     running-average loss every 50 batches. "diagnostic" = per-batch NaN/Inf check
@@ -203,7 +214,6 @@ class RunConfig:
     encodings_sqlite3_path:  str   = "Preprocess/scatternet-ENCODING.sqlite3"
     ckpt_best:      str            = "scatternet_best.pt"
     ckpt_resume:    str            = "scatternet_resume.pt"
-    metrics:        str            = "scatternet_metrics.json"
     resume:         Optional[str]  = None
 
     # model
@@ -238,8 +248,8 @@ class RunConfig:
     max_batches:    Optional[int]  = None
     ckpt_interval_sec: float       = 600.0     # mid-epoch checkpoint cadence (crash safety)
     ckpt_rclone_dest:  Optional[str] = None    # rclone dest for off-box checkpoint copies (None = off)
-    plots_dir:      Optional[str]  = None      # per-epoch baseline-style diagnostic plots dir (None = off)
-    plots_rclone_dest: Optional[str] = None    # rclone dest for off-box copies of plots_dir (None = off)
+    data_dir:       Optional[str]  = None      # per-epoch metrics + baseline-style diagnostic plots dir (None = off)
+    data_rclone_dest:  Optional[str] = None    # rclone dest for off-box copies of data_dir (None = off)
     verbosity:      str            = "epoch"   # "epoch" | "batch" | "diagnostic"
     profiler:       bool           = False     # diagnostic mode: per-rank torch.profiler + section timers; trace saved to ./profiler_trace/
     prof_warmup:    int            = 1         # profiler schedule warmup batches (profiled, discarded)
