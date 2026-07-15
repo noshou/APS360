@@ -73,8 +73,8 @@ class BinnedDebyeBaseline(Baseline):
             vocab_n  = batch.vocab[n][mask[n]]
             m = coords_n.shape[0]
 
-            f0  = ftable[vocab_n, 0]            # (m,)
-            diag = (f0 ** 2).sum()
+            f0  = ftable[vocab_n, 0]            # (m,) |f_i(0)| per atom
+            diag = (f0 ** 2).sum()              # i==j self-scattering term
 
             if m < 2:
                 qr   = qgrid * 0.0

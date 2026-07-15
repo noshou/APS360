@@ -4,10 +4,13 @@ import torch.nn as nn
 from Preprocess          import VOCAB
 from Baselines.baseline  import Baseline
 
-class TorchMlp(Baseline):
-    """GPU-accelerated MLP, used by kaggle_baselines.ipynb (targets Kaggle P100/T4).
+class Mlp2Baseline(Baseline):
+    
+    """
+    Learned baseline: 2-hidden-layer MLP over composition + size features.
 
-    Falls back to CPU automatically when no CUDA device is available.
+    Predicts log1p(I(q)) from per-element atom fractions, atom count, and Rg.
+    Default architecture is two hidden layers (``hidden=(64, 64)``).
     """
 
     def __init__(
@@ -31,15 +34,16 @@ class TorchMlp(Baseline):
         self._log_clamp = None  # set in fit(): training target's own max + margin
 
     def _features(self, batch):
+        # pool each molecule to a fixed vector: composition + size (atom count, Rg)
         N, M = batch.vocab.shape
         V = len(VOCAB) + 1
         counts = torch.zeros(N, V).scatter_add_(1, batch.vocab.long(), torch.ones(N, M))
-        counts[:, 0] = 0.0
+        counts[:, 0] = 0.0                                                           # drop the padding token
         n_atoms = counts.sum(dim=1, keepdim=True).clamp(min=1)
         mask = batch.padding_mask().float()
-        r2   = (batch.coord ** 2).sum(dim=-1)
-        rg   = ((r2 * mask).sum(dim=1, keepdim=True) / n_atoms).clamp(min=0).sqrt()
-        return torch.cat([counts / n_atoms, n_atoms, rg], dim=1).cpu()
+        r2   = (batch.coord ** 2).sum(dim=-1)                                        # squared distance per atom
+        rg   = ((r2 * mask).sum(dim=1, keepdim=True) / n_atoms).clamp(min=0).sqrt()  # radius of gyration
+        return torch.cat([counts / n_atoms, n_atoms, rg], dim=1).cpu()               # element fractions ++ size
 
     def fit(self, loader):
         X_parts, Y_parts = [], []
@@ -91,7 +95,12 @@ class TorchMlp(Baseline):
         # safety net: clamp before expm1 so a NaN/exploded weight (despite grad
         # clipping) surfaces as a large finite MSE instead of inf, which would
         # otherwise break evaluate()'s accumulated sums and the summary plot.
-        log_pred = torch.nan_to_num(log_pred, nan=0.0, posinf=self._log_clamp, neginf=0.0).clamp(max=self._log_clamp) #type: ignore
+        log_pred = torch.nan_to_num(
+            log_pred, 
+            nan=0.0, 
+            posinf=self._log_clamp, 
+            neginf=0.0
+        ).clamp(max=self._log_clamp) #type: ignore
         return torch.expm1(log_pred).cpu()
 
     def timed_call(self, batch):
@@ -112,7 +121,12 @@ class TorchMlp(Baseline):
             with torch.no_grad():
                 log_pred = self._net(X) #type: ignore
             elapsed = time.process_time() - t0
-        log_pred = torch.nan_to_num(log_pred, nan=0.0, posinf=self._log_clamp, neginf=0.0).clamp(max=self._log_clamp) #type: ignore
+        log_pred = torch.nan_to_num(
+            log_pred, 
+            nan=0.0, 
+            posinf=self._log_clamp, 
+            neginf=0.0
+        ).clamp(max=self._log_clamp) #type: ignore
         pred    = torch.expm1(log_pred).cpu()
         n_atoms = int(batch.padding_mask().sum().item())
         return pred, elapsed / max(n_atoms, 1)

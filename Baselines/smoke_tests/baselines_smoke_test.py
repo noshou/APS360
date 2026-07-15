@@ -8,6 +8,11 @@ lets every metric and plot be checked for a hard crash or obviously-wrong
 output *before* spending Kaggle GPU/session time on kaggle_baselines.ipynb --
 it is not a check of prediction quality (the "ground truth" is synthetic).
 
+The smoke test only confirms the pipeline RUNS. The subset is tiny (a dozen
+synthetic molecules), so the MSLE / R2 / us-per-atom numbers it prints are
+not statistically meaningful -- do not read them as baseline performance.
+Use kaggle_baselines.ipynb / colab_baselines.ipynb on the real dataset for that.
+
 Usage:
     python Baselines/smoke_tests/baselines_smoke_test.py --config Baselines/smoke_tests/baselines_smoke_test.yaml
 """
@@ -29,11 +34,12 @@ from Preprocess          import VOCAB  # noqa: E402
 from Baselines.metrics   import evaluate, run_all_plots  # noqa: E402
 from rg                  import RgBaseline, GuinierPorodBaseline           # noqa: E402
 from atom_count          import AtomCountBaseline                          # noqa: E402
-from pair_peak           import BinnedDebyeBaseline                        # noqa: E402
-from saxs_est            import SaxsEstBaseline                            # noqa: E402
+from binned_debye        import BinnedDebyeBaseline                        # noqa: E402
+from propo_est           import PropoEstBaseline                          # noqa: E402
+from strat_est           import StratEstBaseline                          # noqa: E402
 from linsvm              import Linsvm                                     # noqa: E402
 from nearest_neighbour   import NNBaseline                                 # noqa: E402
-from torch_mlp           import TorchMlp                                  # noqa: E402
+from mlp_2               import Mlp2Baseline                              # noqa: E402
 from hdbscan             import Hdbscan                                   # noqa: E402
 
 _BASELINE_FACTORIES = {
@@ -41,9 +47,9 @@ _BASELINE_FACTORIES = {
     "guinier_porod":     lambda cfg, q, e, train: GuinierPorodBaseline(q, e),
     "atom_count":        lambda cfg, q, e, train: AtomCountBaseline().fit(train),
     "binned_debye":      lambda cfg, q, e, train: BinnedDebyeBaseline(q, e),
-    "saxs_propo":        lambda cfg, q, e, train: SaxsEstBaseline(q, e, method="propo", e=0.380),
-    "saxs_strat":        lambda cfg, q, e, train: SaxsEstBaseline(q, e, method="strat", a=0.6),
-    "mlp":               lambda cfg, q, e, train: TorchMlp(hidden=tuple(cfg["mlp_hidden"]), epochs=cfg["mlp_epochs"]).fit(train),
+    "propo_est":         lambda cfg, q, e, train: PropoEstBaseline(q, e, e=0.380),
+    "strat_est":         lambda cfg, q, e, train: StratEstBaseline(q, e, a=0.6),
+    "mlp":               lambda cfg, q, e, train: Mlp2Baseline(hidden=tuple(cfg["mlp_hidden"]), epochs=cfg["mlp_epochs"]).fit(train),
     "linear_svm":        lambda cfg, q, e, train: Linsvm(n_components=cfg["linsvm_n_components"]).fit(train),
     "nearest_neighbour": lambda cfg, q, e, train: NNBaseline(q, e).fit(train),
     "hdbscan":           lambda cfg, q, e, train: Hdbscan(q, e),
@@ -54,8 +60,8 @@ _DISPLAY_NAMES = {
     "guinier_porod":     "Guinier-Porod",
     "atom_count":        "Atom Count",
     "binned_debye":      "Binned Debye",
-    "saxs_propo":        "SAXS propoEst",
-    "saxs_strat":        "SAXS stratEst",
+    "propo_est":         "SAXS propoEst",
+    "strat_est":         "SAXS stratEst",
     "mlp":               "MLP",
     "linear_svm":        "Linear SVM",
     "nearest_neighbour": "Nearest Neighbour",
@@ -70,7 +76,7 @@ def _make_synthetic_batch(
     energy: float, 
     gen:    torch.Generator, 
     rng:    random.Random
- ) -> Batch:
+) -> Batch:
     
     """Build n_mols synthetic molecules and derive noisy I(q) from BinnedDebyeBaseline.
 
@@ -116,8 +122,10 @@ def main(config_path: str) -> None:
     q_grid = torch.linspace(cfg["q_min"], cfg["q_max"], cfg["q_points"])
     energy = float(cfg["energy"])
 
-    print(f"Generating {cfg['n_train']} train + {cfg['n_test']} test synthetic molecules "
-          f"({cfg['atom_count_min']}-{cfg['atom_count_max']} atoms, ions={cfg['ions']})...")
+    print(
+        f"Generating {cfg['n_train']} train + {cfg['n_test']} test synthetic molecules "
+        f"({cfg['atom_count_min']}-{cfg['atom_count_max']} atoms, ions={cfg['ions']})..."
+    )
     train_full = _make_synthetic_batch(cfg, cfg["n_train"], q_grid, energy, gen, rng)
     test_full  = _make_synthetic_batch(cfg, cfg["n_test"],  q_grid, energy, gen, rng)
 
@@ -132,8 +140,10 @@ def main(config_path: str) -> None:
         print(f"Running {name}...")
         baseline = _BASELINE_FACTORIES[key](cfg, q_grid, energy, train_batches)
         result = evaluate(baseline, test_batches, q_grid, name)
-        print(f"  {name:<26s}  MSLE={result.msle:.4f}  R²(raw)={result.r2_raw:.4f}  "
-              f"R²(log1p)={result.r2_log1p:.4f}  {result.us_per_atom:.2f} μs/atom")
+        print(
+            f"  {name:<26s}  MSLE={result.msle:.4f}  R²(raw)={result.r2_raw:.4f}  "
+            f"R²(log1p)={result.r2_log1p:.4f}  {result.us_per_atom:.2f} μs/atom"
+        )
         results.append(result)
 
     print(f"\nWriting plots to {cfg['out_dir']}...")

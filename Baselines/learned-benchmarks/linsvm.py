@@ -129,13 +129,13 @@ class Linsvm(Baseline):
         counts   = torch.zeros(N, V).scatter_add_(
             1, batch.vocab.long(), torch.ones(N, M)
         )
-        counts[:, 0] = 0.0
+        counts[:, 0] = 0.0                                    # drop the padding token
         n_atoms      = counts.sum(dim=1, keepdim=True).clamp(min=1)
-        fractions    = counts / n_atoms
+        fractions    = counts / n_atoms                       # per-element composition
 
-        r2  = (batch.coord ** 2).sum(dim=-1)
+        r2  = (batch.coord ** 2).sum(dim=-1)                  # squared distance per atom
         rg2 = (r2 * mask).sum(dim=1, keepdim=True) / n_atoms
-        rg  = rg2.clamp(min=0).sqrt()
+        rg  = rg2.clamp(min=0).sqrt()                         # radius of gyration
 
         feats = torch.cat([fractions, n_atoms, rg], dim=1)
         return feats.cpu().numpy()

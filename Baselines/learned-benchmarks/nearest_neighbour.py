@@ -59,13 +59,11 @@ class NNBaseline(Baseline):
                 m = MAX_M
 
             diff  = coords_n.unsqueeze(0) - coords_n.unsqueeze(1)  # (m, m, 3)
-            dists = diff.norm(dim=-1)                               # (m, m)
-            dists.fill_diagonal_(float('inf'))
-            r_nn  = dists.min(dim=1).values.mean()
-
-            f0  = ftable[vocab_n, 0]
-            i0  = f0.sum() ** 2
-
+            dists = diff.norm(dim=-1)                              # (m, m)
+            dists.fill_diagonal_(float('inf'))                     # exclude self-distance (0)
+            r_nn  = dists.min(dim=1).values.mean()                 # mean nearest-neighbour distance
+            f0  = ftable[vocab_n, 0]                               # |f_i(0)| per atom
+            i0  = f0.sum() ** 2                                    # forward intensity I(0) = (Σ f_i(0))²
             qr   = qgrid * r_nn
             sinc = torch.where(qr.abs() < 1e-8, torch.ones_like(qr), torch.sin(qr) / qr)
             preds.append(i0 * sinc)

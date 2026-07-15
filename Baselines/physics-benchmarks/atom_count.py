@@ -26,7 +26,7 @@ class AtomCountBaseline(Baseline):
         counts: dict[int, int]          = {}
 
         for batch in loader:
-            atom_counts = batch.padding_mask().sum(dim=1)
+            atom_counts = batch.padding_mask().sum(dim=1)   # real atoms per molecule (the bucket key)
             for i, c in enumerate(atom_counts.tolist()):
                 c = int(c)
                 if c not in sums:
@@ -50,7 +50,7 @@ class AtomCountBaseline(Baseline):
         rows: list[torch.Tensor] = []
 
         for c in atom_counts:
-            closest = min(keys, key=lambda k: abs(k - c))
+            closest = min(keys, key=lambda k: abs(k - c))   # nearest seen bucket for unseen counts
             rows.append(self._mean_by_count[closest].to(device))
 
         return torch.stack(rows, dim=0)
