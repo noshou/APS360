@@ -30,6 +30,7 @@ from Baselines.metrics   import evaluate, run_all_plots  # noqa: E402
 from rg                  import RgBaseline, GuinierPorodBaseline           # noqa: E402
 from atom_count          import AtomCountBaseline                          # noqa: E402
 from pair_peak           import BinnedDebyeBaseline                        # noqa: E402
+from saxs_est            import SaxsEstBaseline                            # noqa: E402
 from linsvm              import Linsvm                                     # noqa: E402
 from nearest_neighbour   import NNBaseline                                 # noqa: E402
 from torch_mlp           import TorchMlp                                  # noqa: E402
@@ -40,6 +41,8 @@ _BASELINE_FACTORIES = {
     "guinier_porod":     lambda cfg, q, e, train: GuinierPorodBaseline(q, e),
     "atom_count":        lambda cfg, q, e, train: AtomCountBaseline().fit(train),
     "binned_debye":      lambda cfg, q, e, train: BinnedDebyeBaseline(q, e),
+    "saxs_propo":        lambda cfg, q, e, train: SaxsEstBaseline(q, e, method="propo", e=0.380),
+    "saxs_strat":        lambda cfg, q, e, train: SaxsEstBaseline(q, e, method="strat", a=0.6),
     "mlp":               lambda cfg, q, e, train: TorchMlp(hidden=tuple(cfg["mlp_hidden"]), epochs=cfg["mlp_epochs"]).fit(train),
     "linear_svm":        lambda cfg, q, e, train: Linsvm(n_components=cfg["linsvm_n_components"]).fit(train),
     "nearest_neighbour": lambda cfg, q, e, train: NNBaseline(q, e).fit(train),
@@ -51,6 +54,8 @@ _DISPLAY_NAMES = {
     "guinier_porod":     "Guinier-Porod",
     "atom_count":        "Atom Count",
     "binned_debye":      "Binned Debye",
+    "saxs_propo":        "SAXS propoEst",
+    "saxs_strat":        "SAXS stratEst",
     "mlp":               "MLP",
     "linear_svm":        "Linear SVM",
     "nearest_neighbour": "Nearest Neighbour",

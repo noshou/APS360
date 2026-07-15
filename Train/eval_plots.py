@@ -211,9 +211,14 @@ def save_epoch_plots(
     return the test loss/R2 computed in the same single pass.
 
     Mirrors Baselines/kaggle_baselines.ipynb's own evaluate() + run_all_plots()
-    call (per-q R^2, per-q percent error, Kratky overlay, residual histogram,
-    error-vs-atom-count, and a one-row summary bar chart), so training
-    progress is directly comparable to the baseline notebook's plots.
+    call, so training progress is directly comparable to the baseline notebook's
+    plots. The single shared run_all_plots() drives the whole set: per-q R^2,
+    per-q percent error, the aggregated per-q summary, Kratky overlay, the
+    per-molecule signed-residual histogram (with skew) and per-molecule MSLE
+    distribution, error-vs-atom-count (+ scaling-slope fit) and signed-residual
+    vs atom count, and a one-row summary bar chart. Because evaluate() now
+    collects the per-molecule error distributions too, every new baseline
+    statistic appears in the epoch plots automatically, no change needed here.
 
     When `criterion` is given, this ONE forced-TP pass also accumulates the
     composite loss and log1p R2 (via ScatterNetBaseline), so the caller no
