@@ -147,7 +147,13 @@ def _dist_stats(x: np.ndarray) -> dict:
 
 
 @torch.no_grad()
-def evaluate(baseline: Baseline, loader: Iterable[Batch], q_grid: torch.Tensor, name: str) -> EvalResult:
+def evaluate(
+    baseline: Baseline,
+    loader:   Iterable[Batch],
+    q_grid:   torch.Tensor,
+    name:     str,
+    device:   "torch.device | str | None" = None,
+) -> EvalResult:
     """Evaluate a baseline over every batch in ``loader``, in one streaming pass.
 
     All sums are accumulated globally across the whole evaluation set (not
@@ -166,11 +172,19 @@ def evaluate(baseline: Baseline, loader: Iterable[Batch], q_grid: torch.Tensor, 
         an explicit argument so callers don't have to thread it separately.
     name : str
         Display name for this baseline, used as the plot legend/label.
+    device : torch.device or str, optional
+        Device to run each batch on. Every batch is moved here before the
+        baseline sees it, so a device-following baseline (all of them) runs its
+        pairwise-sinc / matmul work on the GPU. ``None`` (the default) keeps
+        everything on CPU, so ``batch.to("cpu")`` is a no-op and the CPU path is
+        unchanged. The per-baseline scalar/per-q reductions below still land on
+        CPU via the existing ``.cpu()``/``.item()`` calls.
 
     Returns
     -------
     EvalResult
     """
+    device = torch.device(device) if device is not None else torch.device("cpu")
     Q = len(q_grid)
 
     sum_sq_err_log1p, sum_y_log1p, sum_y2_log1p = 0.0, 0.0, 0.0
@@ -194,8 +208,12 @@ def evaluate(baseline: Baseline, loader: Iterable[Batch], q_grid: torch.Tensor, 
     tpa_weighted, total_atoms = 0.0, 0
 
     for batch in loader:
+        batch = batch.to(device)
         pred, tpa = baseline.timed_call(batch)
-        pred = pred.clamp(min=0)
+        # align pred to the batch's device: most baselines already return on it,
+        # but a few (e.g. the MLP) return .cpu(); .to(device) makes the elementwise
+        # ops below safe either way and is a no-op when already there.
+        pred = pred.clamp(min=0).to(device)
         true = batch.iqval.clamp(min=0)
 
         pred_log1p = torch.log1p(pred)

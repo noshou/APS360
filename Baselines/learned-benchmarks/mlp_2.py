@@ -103,30 +103,8 @@ class Mlp2Baseline(Baseline):
         ).clamp(max=self._log_clamp) #type: ignore
         return torch.expm1(log_pred).cpu()
 
-    def timed_call(self, batch):
-        X = (self._features(batch) - self._x_mean) / self._x_std #type: ignore
-        X = X.to(self.device)
-        if self.device.type == "cuda":
-            start = torch.cuda.Event(enable_timing=True)
-            end   = torch.cuda.Event(enable_timing=True)
-            start.record()
-            with torch.no_grad():
-                log_pred = self._net(X) #type: ignore
-            end.record()
-            torch.cuda.synchronize()
-            elapsed = start.elapsed_time(end) / 1000.0
-        else:
-            import time
-            t0 = time.process_time()
-            with torch.no_grad():
-                log_pred = self._net(X) #type: ignore
-            elapsed = time.process_time() - t0
-        log_pred = torch.nan_to_num(
-            log_pred, 
-            nan=0.0, 
-            posinf=self._log_clamp, 
-            neginf=0.0
-        ).clamp(max=self._log_clamp) #type: ignore
-        pred    = torch.expm1(log_pred).cpu()
-        n_atoms = int(batch.padding_mask().sum().item())
-        return pred, elapsed / max(n_atoms, 1)
+    # timed_call is inherited from Baseline: it now measures end-to-end,
+    # CUDA-synchronized wall time (feature build + forward + transfer), the same
+    # definition used for every other baseline. The old override timed only the
+    # net's forward pass with cuda.Event, which is not comparable to the physics
+    # baselines' end-to-end cost, so it was removed for a single coherent metric.

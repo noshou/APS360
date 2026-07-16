@@ -119,11 +119,25 @@ class Baseline(ABC):
         self,
         batch: Batch,
     ) -> tuple[Float[torch.Tensor, "N Q"], float]:
-        """Predict I(q) for a batch while measuring CPU time spent per atom.
+        """Predict I(q) for a batch while measuring wall-clock time per atom.
 
-        Wraps ``__call__`` so every baseline - existing and future, with
-        no changes to the subclass itself - can be compared on cost per
-        atom on equal footing.
+        Wraps ``__call__`` so every baseline - existing and future, with no
+        changes to the subclass itself - can be compared on cost per atom on
+        equal footing.
+
+        The clock is **wall-clock** (``time.perf_counter``), and when CUDA is
+        available the call is bracketed with ``torch.cuda.synchronize()`` so
+        asynchronous GPU work is fully counted. This replaces the old CPU-only
+        ``time.process_time`` clock: once the heavy pairwise-sinc work runs on
+        the GPU, process_time measured almost nothing (it does not see device
+        compute), and a baseline's real cost now spans both host (type
+        sampling, sklearn calls) and device (the O(m^2) sinc sums). Only an
+        end-to-end, synchronized wall clock captures that combined cost.
+
+        Because it is wall-clock, the per-atom figure depends on the machine,
+        the device, and concurrent load, so - as before - only compare
+        ``us_per_atom`` between baselines measured *in the same run on the same
+        hardware*, never across machines or runs.
 
         Parameters
         ----------
@@ -133,19 +147,22 @@ class Baseline(ABC):
         Returns
         -------
         tuple of (torch.Tensor, float)
-            ``(pred, cpu_seconds_per_atom)``. ``pred`` is identical to
-            calling this baseline directly, shape ``(N, Q)``.
-            ``cpu_seconds_per_atom`` is the CPU time spent inside
-            ``__call__`` (measured with ``time.process_time()``, so
-            wall-clock waits and other processes are not counted) divided
-            by the total number of real, non-padding atoms across the
-            batch. 0.0 if the batch has no real atoms.
+            ``(pred, wall_seconds_per_atom)``. ``pred`` is identical to calling
+            this baseline directly, shape ``(N, Q)``. ``wall_seconds_per_atom``
+            is the CUDA-synchronized wall time spent inside ``__call__`` divided
+            by the total number of real, non-padding atoms across the batch.
+            0.0 if the batch has no real atoms.
         """
         n_atoms = int(batch.padding_mask().sum().item())
+        cuda    = torch.cuda.is_available()
 
-        start   = time.process_time()
+        if cuda:
+            torch.cuda.synchronize()
+        start   = time.perf_counter()
         pred    = self(batch)
-        elapsed = time.process_time() - start
+        if cuda:
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
 
-        cpu_seconds_per_atom = elapsed / n_atoms if n_atoms > 0 else 0.0
-        return pred, cpu_seconds_per_atom
+        wall_seconds_per_atom = elapsed / n_atoms if n_atoms > 0 else 0.0
+        return pred, wall_seconds_per_atom

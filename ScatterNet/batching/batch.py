@@ -41,6 +41,30 @@ class Batch:
         """
         return self.vocab != 0
 
+    @jaxtyped(typechecker=beartype)
+    def to(self, device: torch.device) -> "Batch":
+        """Return a copy of this Batch with all tensors moved to ``device``.
+
+        A no-op-cost move when the tensors are already on ``device`` (``Tensor.to``
+        returns the same object). Used to run a whole batch on GPU without
+        mutating this frozen instance.
+
+        Parameters
+        ----------
+        device : torch.device
+            Target device (e.g. ``torch.device("cuda")``).
+
+        Returns
+        -------
+        Batch
+            A new ``Batch`` with ``vocab``/``iqval``/``coord`` on ``device``.
+        """
+        return Batch(
+            vocab=self.vocab.to(device),
+            iqval=self.iqval.to(device),
+            coord=self.coord.to(device),
+        )
+
     @classmethod
     def from_lists(
         cls,
