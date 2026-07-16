@@ -5,6 +5,16 @@ from beartype            import beartype
 from ScatterNet.batching import Batch
 from Baselines.baseline  import Baseline, build_fmag_table
 
+_Q_CHUNK_BUDGET: int = 16_000_000  # target element count for (Qc, m, m) intermediates
+
+
+def _q_chunks(Q: int, m: int):
+    """Yield (a, b) q-index ranges so each (Qc, m, m) block stays ~<= budget."""
+    qc = max(1, _Q_CHUNK_BUDGET // (m * m))
+    for a in range(0, Q, qc):
+        yield a, min(a + qc, Q)
+
+
 class PropoEstBaseline(Baseline):
 
     """
@@ -93,18 +103,21 @@ class PropoEstBaseline(Baseline):
 
             # est(q) = sum_i |f_i|^2 + wEst(q) * sum_i f_i(q) * sum_{j!=i} sinc(q r_ij)
             # (f_i and wEst real, so Re(f_i * wEst) = f_i * wEst)
+            # Vectorized over q in memory-bounded chunks so the (Qc, m, m)
+            # intermediates never exceed the old per-q (m, m) footprint by much.
             est = torch.empty_like(qgrid)
-            for qi in range(qgrid.shape[0]):
-                qd   = qgrid[qi] * dist                                # (m, m)
+            for a, b in _q_chunks(qgrid.shape[0], m):
+                qd   = qgrid[a:b].view(-1, 1, 1) * dist.unsqueeze(0)   # (Qc, m, m)
                 sinc = torch.where(
                     qd.abs() < 1e-8,
                     torch.ones_like(qd),
                     torch.sin(qd) / qd
                 )
                 # sum over j != i  == full row sum minus the j==i term (sinc(0)=1)
-                s_i  = sinc.sum(dim=1) - 1.0                           # (m,)
-                cross = wEst[qi] * (fatom[:, qi] * s_i).sum()
-                est[qi] = diag[qi] + cross
+                s_i   = sinc.sum(dim=2) - 1.0                          # (Qc, m)
+                fq    = fatom[:, a:b].transpose(0, 1)                  # (Qc, m)
+                cross = wEst[a:b] * (fq * s_i).sum(dim=1)              # (Qc,)
+                est[a:b] = diag[a:b] + cross
 
             # unnormalized (I_fortran * N^2 = est * N / s), non-negative
             intensity = (est * (m / s)).clamp_min(0.0)

@@ -5,6 +5,14 @@ from beartype            import beartype
 from ScatterNet.batching import Batch
 from Baselines.baseline  import Baseline, build_fmag_table
 
+_QCHUNK_BUDGET: int = 16_000_000   # target element count for (Qc, S, S) intermediates
+
+def _qchunks(nq: int, s: int):
+    """Yield (a, b) q-index ranges so each (Qc, S, S) block stays ~<= budget elements."""
+    qc = max(1, _QCHUNK_BUDGET // (s * s))
+    for a in range(0, nq, qc):
+        yield a, min(a + qc, nq)
+
 class StratEstBaseline(Baseline):
     
     """
@@ -127,21 +135,26 @@ class StratEstBaseline(Baseline):
             dist  = diff.norm(dim=-1)                        # (S, S)
             inv_hh = 1.0 / hh                                # (S,)
 
+            # g_i(q) = |f_i(q)| / hh_i, so each q's estimate is a quadratic form
+            # in g with the sinc kernel: pair(q) = g^T sinc(q) g, diag(q) = sum_i g_i^2.
+            g   = fsel * inv_hh.unsqueeze(1)                 # (S, Q)
+            S   = dist.shape[0]
+
             est = torch.empty_like(qgrid)
-            for qi in range(qgrid.shape[0]):
-                
-                fq   = fsel[:, qi]                           # (S,)
-                
-                # diagonal: sum_i |f_i|^2 / hh_i^2
-                diag = ((fq ** 2) * (inv_hh ** 2)).sum()
-                qd   = qgrid[qi] * dist
+            # vectorize over q in memory-bounded chunks so the (Qc, S, S) sinc
+            # intermediate never exceeds the old per-q (S, S) footprint by much
+            for a, b in _qchunks(qgrid.shape[0], S):
+
+                gc   = g[:, a:b].transpose(0, 1)                        # (Qc, S)
+                qd   = qgrid[a:b].view(-1, 1, 1) * dist.unsqueeze(0)    # (Qc, S, S)
                 sinc = torch.where(qd.abs() < 1e-8, torch.ones_like(qd), torch.sin(qd) / qd)
-                
-                # off-diagonal (i<j, doubled): 2 f_i f_j sinc / (hh_i hh_j)
-                w    = (fq * inv_hh).unsqueeze(0) * (fq * inv_hh).unsqueeze(1)   # (S,S)
-                pair = (w * sinc).sum()
-                off  = pair - diag                          # remove i==j (sinc=1) diagonal
-                est[qi] = diag + off
+
+                # off-diagonal (doubled) + diagonal folded into the full double sum:
+                # pair(q) = sum_ij g_i g_j sinc_ij, diag(q) = sum_i g_i^2 (sinc=1)
+                tmp  = torch.bmm(sinc, gc.unsqueeze(2)).squeeze(2)      # (Qc, S) = sinc @ g
+                pair = (gc * tmp).sum(dim=1)                            # (Qc,)
+                diag = (gc ** 2).sum(dim=1)                             # (Qc,)
+                est[a:b] = diag + (pair - diag)                         # keep original rounding
 
             preds.append(est.clamp_min(0.0))
 
