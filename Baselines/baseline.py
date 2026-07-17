@@ -11,6 +11,20 @@ from beartype            import beartype
 from ScatterNet.batching import Batch
 from Preprocess          import VOCAB
 
+_QCHUNK_BUDGET: int = 16_000_000   # target element count for a (Qc, S, S) intermediate
+
+def q_chunks(nq: int, s: int):
+    """Yield (a, b) q-index ranges so each (Qc, S, S) block stays ~<= budget elements.
+
+    Every pairwise-sinc baseline builds a (q, atom, atom) intermediate, which is
+    what dominates memory: it grows as S^2, so one large molecule (or one fat
+    HDBSCAN cluster) can ask for gigabytes in a single allocation. Chunking over
+    q bounds that intermediate no matter how big S gets.
+    """
+    qc = max(1, _QCHUNK_BUDGET // (s * s))
+    for a in range(0, nq, qc):
+        yield a, min(a + qc, nq)
+
 @jaxtyped(typechecker=beartype)
 def build_fmag_table(
     qgrid:  Float[torch.Tensor, "Q"],

@@ -3,15 +3,7 @@ import torch
 from jaxtyping           import Float, jaxtyped
 from beartype            import beartype
 from ScatterNet.batching import Batch
-from Baselines.baseline  import Baseline, build_fmag_table
-
-_QCHUNK_BUDGET: int = 16_000_000   # target element count for (Qc, S, S) intermediates
-
-def _qchunks(nq: int, s: int):
-    """Yield (a, b) q-index ranges so each (Qc, S, S) block stays ~<= budget elements."""
-    qc = max(1, _QCHUNK_BUDGET // (s * s))
-    for a in range(0, nq, qc):
-        yield a, min(a + qc, nq)
+from Baselines.baseline  import Baseline, build_fmag_table, q_chunks
 
 class StratEstBaseline(Baseline):
     
@@ -146,7 +138,7 @@ class StratEstBaseline(Baseline):
             est = torch.empty_like(qgrid)
             # vectorize over q in memory-bounded chunks so the (Qc, S, S) sinc
             # intermediate never exceeds the old per-q (S, S) footprint by much
-            for a, b in _qchunks(qgrid.shape[0], S):
+            for a, b in q_chunks(qgrid.shape[0], S):
 
                 gc   = g[:, a:b].transpose(0, 1)                        # (Qc, S)
                 qd   = qgrid[a:b].view(-1, 1, 1) * dist.unsqueeze(0)    # (Qc, S, S)

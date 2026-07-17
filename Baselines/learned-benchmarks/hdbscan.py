@@ -4,7 +4,7 @@ import numpy as np
 from jaxtyping           import Float, jaxtyped
 from beartype            import beartype
 from ScatterNet.batching import Batch
-from Baselines.baseline  import Baseline, build_fmag_table
+from Baselines.baseline  import Baseline, build_fmag_table, q_chunks
 from sklearn.cluster     import HDBSCAN # type: ignore
 
 class Hdbscan(Baseline):
@@ -119,11 +119,19 @@ class Hdbscan(Baseline):
 
                 diff  = coords_c.unsqueeze(0) - coords_c.unsqueeze(1)  # (mc, mc, 3)
                 dists = diff.norm(dim=-1)                               # (mc, mc)
-                qr    = qgrid.unsqueeze(0).unsqueeze(0) * dists.unsqueeze(-1)  # (mc, mc, Q)
-                sinc  = torch.where(qr.abs() < 1e-8, torch.ones_like(qr), torch.sin(qr) / qr)
+                mc    = coords_c.shape[0]
 
-                pair_amp = f_c.unsqueeze(1) * f_c.unsqueeze(0)  # (mc, mc, Q)
-                i_q += (pair_amp * sinc).sum(dim=(0, 1))
+                # sum_ij f_i(q) f_j(q) sinc(q d_ij) is a quadratic form in f at each
+                # q, so evaluate it as f^T sinc(q) f in memory-bounded q-chunks: the
+                # (Qc, mc, mc) sinc block stays ~<= budget instead of scaling with Q
+                for a, b in q_chunks(qgrid.shape[0], mc):
+
+                    fc   = f_c[:, a:b].transpose(0, 1)                     # (Qc, mc)
+                    qr   = qgrid[a:b].view(-1, 1, 1) * dists.unsqueeze(0)  # (Qc, mc, mc)
+                    sinc = torch.where(qr.abs() < 1e-8, torch.ones_like(qr), torch.sin(qr) / qr)
+
+                    tmp  = torch.bmm(sinc, fc.unsqueeze(2)).squeeze(2)     # (Qc, mc) = sinc @ f
+                    i_q[a:b] += (fc * tmp).sum(dim=1)                      # full double sum, i == j included
 
                 centroids.append(coords_c.mean(dim=0))
                 cluster_amps.append(f_c.sum(dim=0))  # (Q,) — Σf_i(q) for this cluster
@@ -134,12 +142,21 @@ class Hdbscan(Baseline):
             if n_clusters > 1:
                 cdiff  = centroids.unsqueeze(0) - centroids.unsqueeze(1)  # (C, C, 3)
                 cdists = cdiff.norm(dim=-1)                                # (C, C)
-                cqr    = qgrid.unsqueeze(0).unsqueeze(0) * cdists.unsqueeze(-1)  # (C, C, Q)
-                csinc  = torch.where(cqr.abs() < 1e-8, torch.ones_like(cqr), torch.sin(cqr) / cqr)
 
-                cross_amp = cluster_amps.unsqueeze(1) * cluster_amps.unsqueeze(0)  # (C, C, Q)
-                off_diag  = 1.0 - torch.eye(n_clusters, device=device).unsqueeze(-1)
-                i_q += (cross_amp * csinc * off_diag).sum(dim=(0, 1))
+                # same quadratic form over cluster centroids, but excluding c == c.
+                # zero the sinc diagonal rather than subtracting the diagonal terms
+                # afterwards: the cross terms oscillate and can cancel to much less
+                # than the diagonal, so the subtraction would lose precision to
+                # catastrophic cancellation. masking keeps it exact, as before
+                for a, b in q_chunks(qgrid.shape[0], n_clusters):
+
+                    ac    = cluster_amps[:, a:b].transpose(0, 1)             # (Qc, C)
+                    cqr   = qgrid[a:b].view(-1, 1, 1) * cdists.unsqueeze(0)  # (Qc, C, C)
+                    csinc = torch.where(cqr.abs() < 1e-8, torch.ones_like(cqr), torch.sin(cqr) / cqr)
+                    csinc.diagonal(dim1=1, dim2=2).zero_()                   # drop the c == c terms
+
+                    tmp   = torch.bmm(csinc, ac.unsqueeze(2)).squeeze(2)     # (Qc, C) = csinc @ amp
+                    i_q[a:b] += (ac * tmp).sum(dim=1)                        # off-diagonal only
 
             preds.append(i_q)
 
