@@ -17,9 +17,9 @@ def q_chunks(nq: int, s: int):
     """Yield (a, b) q-index ranges so each (Qc, S, S) block stays ~<= budget elements.
 
     Every pairwise-sinc baseline builds a (q, atom, atom) intermediate, which is
-    what dominates memory: it grows as S^2, so one large molecule (or one fat
-    HDBSCAN cluster) can ask for gigabytes in a single allocation. Chunking over
-    q bounds that intermediate no matter how big S gets.
+    what dominates memory: it grows as S^2, so a single large molecule can ask
+    for gigabytes in one allocation. Chunking over q bounds that intermediate no
+    matter how big S gets.
     """
     qc = max(1, _QCHUNK_BUDGET // (s * s))
     for a in range(0, nq, qc):

@@ -40,7 +40,6 @@ from strat_est           import StratEstBaseline                          # noqa
 from linsvm              import Linsvm                                     # noqa: E402
 from nearest_neighbour   import NNBaseline                                 # noqa: E402
 from mlp_2               import Mlp2Baseline                              # noqa: E402
-from hdbscan             import Hdbscan                                   # noqa: E402
 
 _BASELINE_FACTORIES = {
     "rg":                lambda cfg, q, e, train: RgBaseline(q, e),
@@ -52,7 +51,6 @@ _BASELINE_FACTORIES = {
     "mlp":               lambda cfg, q, e, train: Mlp2Baseline(hidden=tuple(cfg["mlp_hidden"]), epochs=cfg["mlp_epochs"]).fit(train),
     "linear_svm":        lambda cfg, q, e, train: Linsvm(n_components=cfg["linsvm_n_components"]).fit(train),
     "nearest_neighbour": lambda cfg, q, e, train: NNBaseline(q, e).fit(train),
-    "hdbscan":           lambda cfg, q, e, train: Hdbscan(q, e),
 }
 
 _DISPLAY_NAMES = {
@@ -65,7 +63,6 @@ _DISPLAY_NAMES = {
     "mlp":               "MLP",
     "linear_svm":        "Linear SVM",
     "nearest_neighbour": "Nearest Neighbour",
-    "hdbscan":           "HDBSCAN",
 }
 
 

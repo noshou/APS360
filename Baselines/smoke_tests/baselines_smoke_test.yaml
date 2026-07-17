@@ -32,7 +32,7 @@ noise_log_std: 0.05
 # Mlp2Baseline, same class kaggle_baselines.ipynb uses -- it falls back to CPU
 # automatically, and this synthetic set is tiny enough that a few epochs are
 # instant either way.
-baselines: [rg, guinier_porod, atom_count, binned_debye, propo_est, strat_est, mlp, linear_svm, nearest_neighbour, hdbscan]
+baselines: [rg, guinier_porod, atom_count, binned_debye, propo_est, strat_est, mlp, linear_svm, nearest_neighbour]
 
 # learned-baseline hyperparameters, cut down for smoke-test speed (not accuracy)
 mlp_hidden: [16, 16]

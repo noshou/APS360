@@ -64,8 +64,10 @@ class Linsvm(Baseline):
     Learned baseline: per-q LinearSVR over Nystroem-approximated RBF features.
 
     Pools each molecule down to a fixed feature vector (per-element
-    composition fractions, atom count, and radius of gyration), standardizes
-    it, then maps it through a Nystroem approximation of the RBF kernel so a
+    composition fractions, plus log1p atom count and log1p radius of
+    gyration), standardizes the two size columns -- the bounded [0, 1]
+    fractions are deliberately left alone, see ``_scale`` -- then maps it
+    through a Nystroem approximation of the RBF kernel so a
     fast linear model can still capture nonlinear structure without ever
     building the O(n^2) kernel matrix a plain kernel SVR would need on a
     900,000-molecule training set. A separate LinearSVR head is trained per
@@ -138,8 +140,43 @@ class Linsvm(Baseline):
         rg2 = (r2 * mask).sum(dim=1, keepdim=True) / n_atoms
         rg  = rg2.clamp(min=0).sqrt()                         # radius of gyration
 
-        feats = torch.cat([fractions, n_atoms, rg], dim=1)
+        # log1p the size pair: atom counts span 1..6046 and I(0) grows ~n^2, so the
+        # log1p(I) target is ~linear in log(n). On the raw scale a handful of huge
+        # molecules sit orders of magnitude from the rest and dominate the pairwise
+        # distances the RBF kernel is built from.
+        size  = torch.log1p(torch.cat([n_atoms, rg], dim=1))
+        feats = torch.cat([fractions, size], dim=1)
         return feats.cpu().numpy()
+
+    def _scale(self, X: np.ndarray) -> np.ndarray:
+        """Standardize the two trailing size columns only, leaving fractions untouched.
+
+        The leading block is per-element composition *fractions*: already bounded
+        to [0, 1] and comparable column-to-column, so they need no rescaling.
+        Standardizing them is actively harmful here. A rare ion appears in only a
+        few molecules, so its column's std is ~1e-3, and dividing by that turns a
+        fraction of 0.25 into a value of ~80. Those inflated columns then dominate
+        the pairwise distances ``_median_heuristic_gamma`` measures, so the gamma
+        it returns is fitted to an artifact of the scaling rather than to real
+        composition structure (measured: gamma 0.11 with the fractions scaled vs
+        0.47 without, i.e. a kernel roughly 4x too wide, which underfits). Unlike
+        the MLP the RBF kernel is bounded, so this shows up as a quietly mediocre
+        fit rather than an explosion: MSLE 0.359 -> 0.104 and R^2(log1p) 0.951 ->
+        0.986 on the same data once the fractions are left alone.
+
+        Parameters
+        ----------
+        X : numpy.ndarray
+            Raw feature matrix from ``_molecule_features``, shape ``(N, V + 2)``.
+
+        Returns
+        -------
+        numpy.ndarray
+            Same shape, with only the trailing ``n_atoms``/``rg`` columns scaled.
+        """
+        Z = X.copy()
+        Z[:, -2:] = self._scaler.transform(X[:, -2:])   # type: ignore
+        return Z
 
     def fit(self, loader: Iterable[Batch]) -> "Linsvm":
         """Fit the scaler, Nystroem transform, and one LinearSVR per q-point.
@@ -172,8 +209,10 @@ class Linsvm(Baseline):
         X = np.concatenate(X_parts, axis=0)
         Y = np.concatenate(Y_parts, axis=0)  # (n_samples, Q)
 
-        self._scaler = StandardScaler().fit(X)
-        X_scaled     = self._scaler.transform(X)
+        # fit the scaler on the size pair only -- see _scale for why the fraction
+        # block is deliberately left unscaled
+        self._scaler = StandardScaler().fit(X[:, -2:])
+        X_scaled     = self._scale(X)
 
         gamma = (
             self._gamma if self._gamma is not None
@@ -225,7 +264,7 @@ class Linsvm(Baseline):
 
         device = batch.vocab.device
         X             = self._molecule_features(batch)
-        X_scaled      = self._scaler.transform(X)
+        X_scaled      = self._scale(X)
         X_transformed = self._nystroem.transform(X_scaled)
 
         log_preds = np.stack(

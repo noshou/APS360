@@ -9,7 +9,9 @@ class Mlp2Baseline(Baseline):
     """
     Learned baseline: 2-hidden-layer MLP over composition + size features.
 
-    Predicts log1p(I(q)) from per-element atom fractions, atom count, and Rg.
+    Predicts log1p(I(q)) from per-element atom fractions plus log1p atom count
+    and log1p Rg. Only the two size features are standardized; the bounded
+    [0, 1] fractions are deliberately left as-is (see ``_normalise``).
     Default architecture is two hidden layers (``hidden=(64, 64)``).
     """
 
@@ -44,7 +46,34 @@ class Mlp2Baseline(Baseline):
         mask = batch.padding_mask().float()
         r2   = (batch.coord ** 2).sum(dim=-1)                                        # squared distance per atom
         rg   = ((r2 * mask).sum(dim=1, keepdim=True) / n_atoms).clamp(min=0).sqrt()  # radius of gyration
-        return torch.cat([counts / n_atoms, n_atoms, rg], dim=1).cpu()               # element fractions ++ size
+        # log1p the size pair: atom counts span 1..6046, and I(0) ~ (sum f_i)^2 grows
+        # ~n^2, so the target log1p(I) is ~linear in log(n) but strongly curved in raw
+        # n. Feeding raw n forces a small ReLU net to approximate a logarithm with
+        # piecewise-linear segments across four orders of magnitude, which it fits
+        # badly; log1p makes that relationship straight and the fit near-exact.
+        size = torch.log1p(torch.cat([n_atoms, rg], dim=1))
+        return torch.cat([counts / n_atoms, size], dim=1).cpu()                      # element fractions ++ size
+
+    def _normalise(self, X):
+        """Standardize the two trailing size columns only, leaving fractions untouched.
+
+        The leading block is per-element composition *fractions*: already bounded
+        to [0, 1] and directly comparable column-to-column, so they need no
+        rescaling. Standardizing them is actively harmful -- a rare ion occurs in
+        a handful of molecules, so its column's std is ~1e-3, and dividing by that
+        amplifies a fraction of 0.25 into a z-score of ~80. That is far outside the
+        range the net saw while training, so at predict time it extrapolates
+        linearly and emits log-space values around 60 for a target whose true max
+        is ~17 -- capped by ``_log_clamp`` into a huge over-prediction that makes
+        R^2(raw) meaningless (measured: R^2(raw) ~ -8.5e4, MSLE 4.08; leaving the
+        fractions alone gives R^2(raw) 0.996, MSLE 0.078 on the same data).
+
+        Only ``n_atoms``/``rg`` genuinely need standardizing: they are unbounded
+        and on their own scales.
+        """
+        Z = X.clone()
+        Z[:, -2:] = (X[:, -2:] - self._x_mean) / self._x_std   # type: ignore
+        return Z
 
     def fit(self, loader):
         X_parts, Y_parts = [], []
@@ -60,9 +89,14 @@ class Mlp2Baseline(Baseline):
         # a single such point dwarfs every other term in a raw-space sum of squares and
         # makes R²(raw) meaningless (observed: R²(raw) in the -1e8 range on a real run).
         self._log_clamp = float(Y.max().item()) + 5.0
-        self._x_mean = X.mean(0)
-        self._x_std  = X.std(0).clamp(min=1e-8)
-        X = (X - self._x_mean) / self._x_std
+        # stats for the size pair only -- see _normalise for why the fraction block
+        # is deliberately left unscaled. A zero-variance size column (a single-size
+        # training set) falls back to 1.0 rather than a tiny floor, so the column
+        # collapses to a constant instead of being amplified by 1/eps.
+        size_std     = X[:, -2:].std(0)
+        self._x_mean = X[:, -2:].mean(0)
+        self._x_std  = torch.where(size_std > 1e-6, size_std, torch.ones_like(size_std))
+        X = self._normalise(X)
         in_dim, out_dim = X.shape[1], Y.shape[1]
         layers, prev = [], in_dim
         for h in self.hidden:
@@ -90,7 +124,7 @@ class Mlp2Baseline(Baseline):
         return self
 
     def __call__(self, batch):
-        X = (self._features(batch) - self._x_mean) / self._x_std #type: ignore
+        X = self._normalise(self._features(batch))
         with torch.no_grad():
             log_pred = self._net(X.to(self.device))              #type: ignore
         # safety net: clamp before expm1 so a NaN/exploded weight (despite grad
