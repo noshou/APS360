@@ -125,9 +125,10 @@ class Linsvm(Baseline):
         N, M = batch.vocab.shape
         V    = len(VOCAB) + 1
 
+        dev      = batch.vocab.device
         mask     = batch.padding_mask().float()
-        counts   = torch.zeros(N, V).scatter_add_(
-            1, batch.vocab.long(), torch.ones(N, M)
+        counts   = torch.zeros(N, V, device=dev).scatter_add_(
+            1, batch.vocab.long(), torch.ones(N, M, device=dev)
         )
         counts[:, 0] = 0.0                                    # drop the padding token
         n_atoms      = counts.sum(dim=1, keepdim=True).clamp(min=1)

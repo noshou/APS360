@@ -37,7 +37,8 @@ class Mlp2Baseline(Baseline):
         # pool each molecule to a fixed vector: composition + size (atom count, Rg)
         N, M = batch.vocab.shape
         V = len(VOCAB) + 1
-        counts = torch.zeros(N, V).scatter_add_(1, batch.vocab.long(), torch.ones(N, M))
+        dev = batch.vocab.device   # keep the scatter on the batch's device (CUDA-safe)
+        counts = torch.zeros(N, V, device=dev).scatter_add_(1, batch.vocab.long(), torch.ones(N, M, device=dev))
         counts[:, 0] = 0.0                                                           # drop the padding token
         n_atoms = counts.sum(dim=1, keepdim=True).clamp(min=1)
         mask = batch.padding_mask().float()

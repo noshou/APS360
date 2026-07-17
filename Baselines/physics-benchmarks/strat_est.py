@@ -109,9 +109,12 @@ class StratEstBaseline(Baseline):
                 pop   = int(cnts.sum().item())
                 probs = cnts.to(torch.float64) / float(pop)            # P(select type)
                 
-                # inverse-CDF draw of a type, then a uniform atom of that type
+                # inverse-CDF draw of a type, then a uniform atom of that type.
+                # gen is a CPU generator (for reproducibility), so u is drawn on CPU;
+                # move it onto the working device so searchsorted matches cum, which
+                # is on the batch's device (CUDA when running on GPU).
                 cum   = torch.cumsum(probs, dim=0)
-                u     = torch.rand(n_draw, generator=gen, dtype=torch.float64)
+                u     = torch.rand(n_draw, generator=gen, dtype=torch.float64).to(device)
                 t_sel = torch.searchsorted(cum, u).clamp_max(len(types) - 1)     # (n_draw,)
                 for t in t_sel.tolist():
                     members = idx_pool[inv == t]
