@@ -1,95 +1,313 @@
-# claude stuff
-.claude/
-CLAUDE.md
-
-
-# raw data
-dataloads.py
-build_db.py
-*.h5
-*.sqlite3
-
-# python stuff
-__pycache__/
-*.py[cod]
-*$py.class
-venv/
-.env
-.venv/
-env/
-
-.ipynb_checkpoints
-*/.ipynb_checkpoints/*
-
-.vscode/
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-
-# Claude
-.claude
-
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# debug information files
-*.dwo
-
-# log files
+## ==========================================
+## Core LaTeX / pdflatex Auxiliary Files
+## ==========================================
+*.aux
+*.lof
 *.log
+*.lot
+*.fls
+*.out
+*.toc
+*.fmt
+*.fot
+*.cb
+*.cb2
+.*.lb
 
-# SDKMan!
-.sdkmanrc
+## Intermediate documents:
+*.dvi
+*.xdv
+*-converted-to.*
+# these rules might exclude image files for figures etc.
+# *.ps
+# *.eps
+# *.pdf
 
-# build dir
-_build/
-build/
+## Generated if empty string is given at "Please type another file name for output:"
+.pdf
 
-## OS-SPECIFIC ##
+## ==========================================
+## Bibliography Auxiliary Files (bibtex/biblatex/biber)
+## ==========================================
+*.bbl
+*.bbl-SAVE-ERROR
+*.bcf
+*.bcf-SAVE-ERROR
+*.blg
+*-blx.aux
+*-blx.bib
+*.run.xml
+
+## ==========================================
+## LaTeX Build Tools & Directories
+## ==========================================
+*.fdb_latexmk
+*.synctex
+*.synctex(busy)
+*.synctex.gz
+*.synctex.gz(busy)
+*.pdfsync
+*.rubbercache
+rubber.cache
+latex.out/
+
+## ==========================================
+## Auxiliary / Intermediate Files from Packages
+## ==========================================
+
+# algorithms
+*.alg
+*.loa
+
+# achemso
+acs-*.bib
+
+# amsthm
+*.thm
+
+# attachfile2
+*.atfi
+
+# beamer
+*.nav
+*.pre
+*.snm
+*.vrb
+
+# changes
+*.soc
+*.loc
+
+# comment
+*.cut
+
+# context
+*.tuc
+*.tui
+*.tuo
+
+# cprotect
+*.cpt
+
+# elsarticle (documentclass of Elsevier journals)
+*.spl
+
+# endnotes
+*.ent
+
+# fixme
+*.lox
+
+# feynmf/feynmp
+*.mf
+*.mp
+*.t[1-9]
+*.t[1-9][0-9]
+*.tfm
+
+# (r)(e)ledmac / (r)(e)ledpar
+*.end
+*.?end
+*.[1-9]
+*.[1-9][0-9]
+*.[1-9][0-9][0-9]
+*.[1-9]R
+*.[1-9][0-9]R
+*.[1-9][0-9][0-9]R
+*.eledsec[1-9]
+*.eledsec[1-9]R
+*.eledsec[1-9][0-9]
+*.eledsec[1-9][0-9]R
+*.eledsec[1-9][0-9][0-9]
+*.eledsec[1-9][0-9][0-9]R
+
+# glossaries
+*.acn
+*.acr
+*.glg
+*.glg-abr
+*.glo
+*.glo-abr
+*.gls
+*.gls-abr
+*.glsdefs
+*.lzo
+*.lzs
+*.slg
+*.slo
+*.sls
+# Uncomment this for glossaries-extra (ignores makeindex's style files)
+# *.ist
+
+# gnuplot / gnuplottex
+*.gnuplot
+*.table
+*-gnuplottex-*
+
+# gregoriotex
+*.gaux
+*.glog
+*.gtex
+
+# htlatex
+*.4ct
+*.4tc
+*.idv
+*.lg
+*.trc
+*.xref
+
+# hypdoc / hyperref
+*.hd
+*.brf
+
+# knitr
+*-concordance.tex
+*-tikzDictionary
+# Uncomment if you use knitr and want to ignore its generated tikz files
+# *.tikz
+
+# listings
+*.lol
+
+# luatexja-ruby
+*.ltjruby
+
+# makeidx / Makeindex
+*.idx
+*.ilg
+*.ind
+*.lpz
+
+# minitoc
+*.maf
+*.mlf
+*.mlt
+*.mtc[0-9]*
+*.slf[0-9]*
+*.slt[0-9]*
+*.stc[0-9]*
+
+# minted
+_minted*
+*.data.minted
+*.pyg
+
+# morewrites
+*.mw
+
+# newpax / pax
+*.newpax
+*.pax
+
+# nomencl
+*.nlg
+*.nlo
+*.nls
+
+# pdfpcnotes / pdfcomment
+*.pdfpc
+*.upa
+*.upb
+
+# sagetex
+*.sagetex.sage
+*.sagetex.py
+*.sagetex.scmd
+
+# scrwfile
+*.wrt
+
+# spelling
+*.spell.bad
+*.spell.txt
+
+# svg
+svg-inkscape/
+
+# sympy
+*.sout
+*.sympy
+sympy-plots-for-*.tex/
+
+# pythontex
+*.pytxcode
+pythontex-files-*/
+
+# tcolorbox / thmtools / titletoc
+*.listing
+*.loe
+*.ptc
+
+# TikZ & PGF
+*.dpth
+*.md5
+*.auxlock
+
+# todonotes / easy-todo
+*.tdo
+*.lod
+
+# vhistory
+*.hst
+*.ver
+
+# xcolor / xmpincl / xindy / xypic / xwatermark
+*.xcp
+*.xmpi
+*.xdy
+*.xyc
+*.xyd
+*.xwm
+
+# endfloat
+*.ttt
+*.fff
+
+# expex forward references
+*-tags.tex
+
+# standalone packages
+*.sta
+
+# REVTeX notes file
+#*Notes.bib
+
+## ==========================================
+## Text Editors, IDEs & OS Files
+## ==========================================
+
+# WinEdt & Backup patterns
+*.bak
+*.bak[0-9]*
+*.sav
+*.backup
+*.orig
+*.rej
+
+# Texpad & LyX & Kile & Gummi & KBibTeX & TeXnicCenter
+.texpadtmp
+*.lyx~
+*.backup
+.*.swp
+*~[0-9]*
+*.tps
+TSWLatexianTemp*
+
+# Emacs & Vim
+./auto/*
+*.el
+*.swo
+*.swp
+*.kate-swp
+*.~lock*
+*~
+.#*
+
 # macOS
 .DS_Store
 .AppleDouble
 .LSOverride
-
-# Linux
-*~
 
 # Windows
 Thumbs.db
@@ -97,45 +315,107 @@ ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
-## EDITOR / OFFICE FILES ##
-.idea
-# Ignore lock and swap/backup files (LibreOffice, Kate, Vim, etc.)
-*.~lock*
-*.kate-swp
-*.swp
-*.swo
-*~
-.#*
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
 
-# Ignore temporary backup files (LibreOffice autosaves, crash recovery)
-*.bak
+# JetBrains (IntelliJ, PyCharm, WebStorm etc.)
+.idea
+
+## ==========================================
+## AI Tools & Assistants
+## ==========================================
+.claude/
+.claude
+CLAUDE.md
+
+## ==========================================
+## Python & Data Environment
+## ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+.venv/
+dataloads.py
+build_db.py
+*.h5
+*.sqlite3
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+## ==========================================
+## Compiled Code & Build Systems
+## ==========================================
+# Prerequisites
+*.d
+
+# Compiled Objects & Headers
+*.slo
+*.lo
+*.o
+*.obj
+*.gch
+*.pch
+
+# Linker, Debug & Dynamic/Static Libraries
+*.ilk
+*.pdb
+*.dwo
+*.so
+*.dylib
+*.dll
+*.lai
+*.la
+*.a
+*.lib
+
+# Fortran
+*.mod
+*.smod
+
+# Executables
+*.exe
+*.app
+
+# SDKMan!
+.sdkmanrc
+
+# Build directories
+_build/
+build/
+
+## ==========================================
+## Office Documents & Temporary Files
+## ==========================================
 *.tmp
 *.temp
 *.autosave
 
-# Temporary files
+# MS Office Lock/Temporary files
 ~$*.doc*
 ~$*.xls*
 ~$*.ppt*
 
-# AutoRecover files
+# Word
 *.asd
 *.wbk
-*.xar
 
-# Excel backup/cache files
+# Excel
 *.xlk
 *.xar
-*.tmp
 
-# PowerPoint autosave/temporary
+# PowerPoint
 *.ppam
 *.pptx#
 *.pptm#
 
-# Office crash dumps
+# Crash dumps
 *.dmp
-
-# Misc editor
-*.orig
-*.rej

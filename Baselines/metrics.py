@@ -6,6 +6,8 @@ matplotlib.use("pgf")  # must happen before the first `import matplotlib.pyplot`
                         # the process -- lets JuliaMono be used as an arbitrary system font via
                         # fontspec/xelatex, which the default dvipng+latex usetex path can't do
 
+_MPL_CONFIGURED: bool = False   # _configure_mpl() probes the LaTeX toolchain once, then latches
+
 import numpy as np
 import torch
 import math
@@ -393,13 +395,47 @@ def _configure_mpl():
     JuliaMono is an arbitrary system font only reachable via fontspec, which
     dvipng+latex can't load. See the ``matplotlib.use("pgf")`` call at the top
     of this module -- that backend choice is what makes fontspec available.
+
+    Falls back to Agg + mathtext if that toolchain turns out to be unusable, see
+    the probe below.
     """
+    global _MPL_CONFIGURED
+    if _MPL_CONFIGURED:
+        return
+
     import matplotlib.pyplot as plt
     plt.rcParams["pgf.texsystem"] = "xelatex"
     plt.rcParams["text.usetex"] = True
     plt.rcParams["pgf.rcfonts"] = False
     plt.rcParams["pgf.preamble"] = r"\usepackage{fontspec}\setmainfont{JuliaMono}\usepackage{amsmath}"
     plt.rcParams["font.size"] = 14
+
+    # The pgf backend routes every text measurement through one persistent xelatex
+    # process. If that toolchain is unusable -- JuliaMono never installed (the
+    # notebooks' font download is a bare `!curl`, which fails silently), no
+    # texlive, or xelatex OOM-killed after a long run -- the first figure dies with
+    # BrokenPipeError and takes every later figure with it. That throws away the
+    # plots of a multi-hour run over a font. Probe once with a real render and
+    # degrade to Agg + mathtext instead: the plots still come out, just not in
+    # JuliaMono. Loud on purpose, since report figures are expected in JuliaMono.
+    try:
+        fig = plt.figure()
+        fig.text(0.5, 0.5, r"R$^2$ probe")
+        fig.canvas.draw()                      # forces the xelatex round trip
+        plt.close(fig)
+    except Exception as exc:
+        plt.close("all")
+        print(
+            f"WARNING: LaTeX/xelatex rendering unavailable "
+            f"({type(exc).__name__}: {exc}). Falling back to Agg + mathtext, so "
+            f"plots will render but NOT in JuliaMono. To get JuliaMono back, check "
+            f"`which xelatex` and `fc-list | grep -i juliamono` in the notebook."
+        )
+        plt.switch_backend("agg")
+        plt.rcParams["text.usetex"]  = False
+        plt.rcParams["font.family"]  = "sans-serif"
+
+    _MPL_CONFIGURED = True
 
 
 def _style_axes(ax):

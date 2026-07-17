@@ -1,0 +1,93 @@
+@online{gasteiger_dimenet_2020,
+  title = {Directional {{Message Passing}} for {{Molecular Graphs}}},
+  author = {Gasteiger, Johannes and Gro\ss, Janek and G\"unnemann, Stephan},
+  date = {2020},
+  doi = {10.48550/ARXIV.2003.03123},
+  abstract = {Graph neural networks have recently achieved great successes in predicting quantum mechanical properties of molecules. These models represent a molecule as a graph using only the distance between atoms (nodes). They do not, however, consider the spatial direction from one atom to another, despite directional information playing a central role in empirical potentials for molecules, e.g. in angular potentials. To alleviate this limitation we propose directional message passing, in which we embed the messages passed between atoms instead of the atoms themselves. Each message is associated with a direction in coordinate space. These directional message embeddings are rotationally equivariant since the associated directions rotate with the molecule. We propose a message passing scheme analogous to belief propagation, which uses the directional information by transforming messages based on the angle between them. Additionally, we use spherical Bessel functions and spherical harmonics to construct theoretically well-founded, orthogonal representations that achieve better performance than the currently prevalent Gaussian radial basis representations while using fewer than 1/4 of the parameters. We leverage these innovations to construct the directional message passing neural network (DimeNet). DimeNet outperforms previous GNNs on average by 76\% on MD17 and by 31\% on QM9. Our implementation is available online.},
+  pubstate = {prepublished},
+  version = {2},
+  keywords = {Computational Physics (physics.comp-ph),FOS: Computer and information sciences,FOS: Physical sciences,Machine Learning (cs.LG),Machine Learning (stat.ML)}
+}
+
+@article{debye,
+  title = {100 Years of {{Debye}}'s Scattering Equation},
+  author = {Gelisio, Luca and Scardi, Paolo},
+  date = {2016-11-01},
+  journaltitle = {Acta Crystallographica Section A Foundations and Advances},
+  shortjournal = {Acta Crystallogr A Found Adv},
+  volume = {72},
+  number = {6},
+  pages = {608--620},
+  issn = {2053-2733},
+  doi = {10.1107/S2053273316014881},
+  abstract = {Debye's scattering equation (DSE) has spanned a century of scientific development, from the dawn of quantum mechanics and the investigation of the structure of atoms and molecules to the era of nanotechnology, paving the way to               total scattering               methods. The formulation offers the most accurate representation of the intensity scattered by randomly oriented atomic aggregates, constructed by superimposing the signal from each atomic distance in the molecule. The present paper reviews some of the milestone applications, from the interpretation of the intensity curves from gases and vapours, to aggregates of increasing size and more extended order. Important developments, aimed at mitigating the prohibitive computational complexity of the DSE, and state-of-the-art methods for the characterization of static and dynamic displacements are also discussed.}
+}
+
+
+@article{ramakrishnan_qm9_2014,
+  title = {Quantum Chemistry Structures and Properties of 134 Kilo Molecules},
+  author = {Ramakrishnan, Raghunathan and Dral, Pavlo O. and Rupp, Matthias and Von Lilienfeld, O. Anatole},
+  date = {2014-08-05},
+  journaltitle = {Scientific Data},
+  shortjournal = {Sci Data},
+  volume = {1},
+  number = {1},
+  pages = {140022},
+  issn = {2052-4463},
+  doi = {10.1038/sdata.2014.22},
+  langid = {english},
+  file = {C:\Users\Nathan\Zotero\storage\XJXYXYQE\Ramakrishnan et al. - 2014 - Quantum chemistry structures and properties of 134.pdf}
+}
+
+
+@online{Schutt2021,
+  title = {Equivariant Message Passing for the Prediction of Tensorial Properties and Molecular Spectra},
+  author = {Sch\"utt, Kristof T. and Unke, Oliver T. and Gastegger, Michael},
+  date = {2021},
+  doi = {10.48550/ARXIV.2102.03150},
+  abstract = {Message passing neural networks have become a method of choice for learning on graphs, in particular the prediction of chemical properties and the acceleration of molecular dynamics studies. While they readily scale to large training data sets, previous approaches have proven to be less data efficient than kernel methods. We identify limitations of invariant representations as a major reason and extend the message passing formulation to rotationally equivariant representations. On this basis, we propose the polarizable atom interaction neural network (PaiNN) and improve on common molecule benchmarks over previous networks, while reducing model size and inference time. We leverage the equivariant atomwise representations obtained by PaiNN for the prediction of tensorial properties. Finally, we apply this to the simulation of molecular spectra, achieving speedups of 4-5 orders of magnitude compared to the electronic structure reference.},
+  pubstate = {prepublished},
+  version = {4},
+  keywords = {Chemical Physics (physics.chem-ph),FOS: Computer and information sciences,FOS: Physical sciences,Machine Learning (cs.LG)}
+}
+
+@article{schutt_schnet_2018,
+  title = {{{SchNet}} -- {{A}} Deep Learning Architecture for Molecules and Materials},
+  author = {Sch\"utt, K. T. and Sauceda, H. E. and Kindermans, P.-J. and Tkatchenko, A. and M\"uller, K.-R.},
+  date = {2018-06-28},
+  journaltitle = {The Journal of Chemical Physics},
+  volume = {148},
+  number = {24},
+  pages = {241722},
+  issn = {0021-9606, 1089-7690},
+  doi = {10.1063/1.5019779},
+  abstract = {Deep learning has led to a paradigm shift in artificial intelligence, including web, text, and image search, speech recognition, as well as bioinformatics, with growing impact in chemical physics. Machine learning, in general, and deep learning, in particular, are ideally suitable for representing quantum-mechanical interactions, enabling us to model nonlinear potential-energy surfaces or enhancing the exploration of chemical compound space. Here we present the deep learning architecture SchNet that is specifically designed to model atomistic systems by making use of continuous-filter convolutional layers. We demonstrate the capabilities of SchNet by accurately predicting a range of properties across chemical space for molecules and materials, where our model learns chemically plausible embeddings of atom types across the periodic table. Finally, we employ SchNet to predict potential-energy surfaces and energy-conserving force fields for molecular dynamics simulations of small molecules and perform an exemplary study on the quantum-mechanical properties of C20-fullerene that would have been infeasible with regular ab initio molecular dynamics.},
+  langid = {english},
+  file = {C:\Users\Nathan\Zotero\storage\AARZNXSQ\Schütt et al. - 2018 - SchNet – A deep learning architecture for molecule.pdf}
+}
+
+@article{Stuhrmann,
+  title = {Interpretation of Small-Angle Scattering Functions of Dilute Solutions and Gases. {{A}} Representation of the Structures Related to a One-Particle Scattering Function},
+  author = {Stuhrmann, H. B.},
+  date = {1970-05-01},
+  journaltitle = {Acta Crystallographica Section A},
+  shortjournal = {Acta Cryst A},
+  volume = {26},
+  number = {3},
+  pages = {297--306},
+  issn = {0567-7394},
+  doi = {10.1107/S0567739470000748}
+}
+
+@article{svergun_crysol_1995,
+  title = {{{{\emph{CRYSOL}}}} -- a {{Program}} to {{Evaluate X-ray Solution Scattering}} of {{Biological Macromolecules}} from {{Atomic Coordinates}}},
+  author = {Svergun, D. and Barberato, C. and Koch, M. H. J.},
+  date = {1995-12-01},
+  journaltitle = {Journal of Applied Crystallography},
+  shortjournal = {J Appl Crystallogr},
+  volume = {28},
+  number = {6},
+  pages = {768--773},
+  issn = {0021-8898},
+  doi = {10.1107/S0021889895007047}
+}
