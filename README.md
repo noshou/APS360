@@ -46,12 +46,12 @@ GNN that predicts X-ray powder scattering curves I(q) from atomic coordinates an
 | M      | atoms per molecule (padded to the longest in the batch)  |
 | Q      | number of q-points in the scattering grid                |
 | λ₁     | atom embedding dimension (`lambda_1`, default 128)       |
-| λ₂     | message-passing rounds (`lambda_2`, default 3)           |
-| λ₃     | OutputHead MLP starting width (`lambda_3`, default 128)  |
+| λ₂     | message-passing rounds (`lambda_2`, default 4)           |
+| λ₃     | OutputHead MLP starting width (`lambda_3`, default 64)  |
 | λ₄     | OutputHead MLP halving steps (`lambda_4`, default 4)     |
-| λ₅     | Random Fourier Features count (`lambda_5`, default 64)   |
-| λ₆     | form-factor penalty weight (`lambda_6`, default 0.1)     |
-| λ₇     | sigma L2 penalty weight (`lambda_7`, default 0.1; penalty is q²-weighted) |
+| λ₅     | Random Fourier Features count (`lambda_5`, default 128)   |
+| λ₆     | form-factor penalty weight (`lambda_6`, default 1.0)     |
+| λ₇     | sigma L2 penalty weight (`lambda_7`, default 0.5; penalty is q²-weighted) |
 | Nc     | molecules per N-chunk (`mol_chunk`)                      |
 | mc     | atoms per M-chunk (`atm_chunk`)                          |
 | V      | VOCAB size = len(VOCAB) + 1 (row 0 is padding)           |
@@ -424,9 +424,9 @@ Collapses per-atom representations into a predicted I(q) curve per molecule. Eac
   | `_mlp / layer_i.weight` | varies      | MLP linear layers (halving pyramid)                |
   | `_mlp / layer_i.bias`   | varies      |                                                    |
 
-  MLP with `lambda_3=128, lambda_4=4`:
+  MLP with `lambda_3=64, lambda_4=4`:
   ```{rtf}
-  Linear(128->64) -> Mish -> Linear(64->32) -> Mish -> Linear(32->16) -> Mish -> Linear(16->8) -> Mish -> Linear(8->1)
+  Linear(64->32) -> Mish -> Linear(32->16) -> Mish -> Linear(16->8) -> Mish -> Linear(8->4) -> Mish -> Linear(4->1)
   ```
   No Mish after the final linear; `softplus` is applied to the MLP output.
 2. **Forward Pass**
@@ -617,7 +617,7 @@ The `w(q) ∝ q²` weighting exists because σ is a *real-space range* (MessageP
 Two consequences worth knowing:
 
 - At `q = 0` the weight is exactly zero (the grid starts there), so σ is unconstrained at that one q-point. This is deliberate and harmless: `I(0)` is the forward-scattering limit, where every `sin(qr)/(qr) → 1` and the intensity collapses to `(Σ_m f_m)²` - independent of the coordinates, and therefore of the kernel range.
-- The weights are normalised to mean 1 over the q-grid, so `λ₇` keeps roughly the strength it had under the old flat penalty. The change **redistributes** the penalty across q rather than scaling it up or down, and λ₇ = 0.1 remains a sensible default. (This matters here because the grid is `q ∈ [0, 0.5] Å⁻¹`: an un-normalised q² weight would have shrunk the whole penalty by ~12x.)
+- The weights are normalised to mean 1 over the q-grid, so `λ₇` keeps roughly the strength it had under the old flat penalty. The change **redistributes** the penalty across q rather than scaling it up or down, and λ₇ = 0.5 remains a sensible default. (This matters here because the grid is `q ∈ [0, 0.5] Å⁻¹`: an un-normalised q² weight would have shrunk the whole penalty by ~12x.)
 
 If I(q) is poor at low q but healthy at high q, a σ crushed to the `eps_msgp` floor is the first thing to check - that was the symptom this weighting is designed to fix.
 
@@ -701,25 +701,25 @@ If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remo
 | Name                | Default | What it controls                                                                                                                                |
 | ------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | `lambda_1`          | 128     | Atom embedding dimension. Width of the per-atom vector throughout MessagePass.                                                                  |
-| `lambda_2`          | 3       | Message-passing rounds. Also bounds the maximum cumulative sigma change.                                                                        |
-| `lambda_3`          | 128     | OutputHead MLP starting width. Must satisfy`lambda_3 >= 2^lambda_4`.                                                                            |
-| `lambda_4`          | 4       | OutputHead halving steps. With defaults: 128->64->32->16->8->1.                                                                                 |
-| `lambda_5`          | 256     | RFF count. More = tighter kernel approximation, higher memory cost.                                                                             |
-| `lambda_6`          | 0.1     | Form-factor penalty weight.                                                                                                                     |
-| `lambda_7`          | 0.1     | Sigma L2 penalty weight. Primary blowup prevention mechanism. The penalty is q²-weighted (mean 1 over the grid), so σ stays long-range at low q. |
+| `lambda_2`          | 4       | Message-passing rounds. Also bounds the maximum cumulative sigma change.                                                                        |
+| `lambda_3`          | 64      | OutputHead MLP starting width. Must satisfy`lambda_3 >= 2^lambda_4`.                                                                            |
+| `lambda_4`          | 4       | OutputHead halving steps. With defaults: 64->32->16->8->4->1.                                                                                 |
+| `lambda_5`          | 128     | RFF count. More = tighter kernel approximation, higher memory cost.                                                                             |
+| `lambda_6`          | 1.0     | Form-factor penalty weight.                                                                                                                     |
+| `lambda_7`          | 0.5     | Sigma L2 penalty weight. Primary blowup prevention mechanism. The penalty is q²-weighted (mean 1 over the grid), so σ stays long-range at low q. |
 | `msg_seed`          | 42      | Seed for fixed RFF frequency matrix Ω.                                                                                                          |
 | `atm_chunk`         | 512     | Atoms per M-chunk. Reduce to lower VRAM.                                                                                                        |
 | `mol_chunk`         | 256     | Molecules per N-chunk. Reduce to lower VRAM on large molecules.                                                                                 |
 | `dp_atom_threshold` | 101     | Batches with padded atom count`M` below this **and** molecule count `N >= 2*mol_chunk` route through DP instead of TP                           |
-| `compile`           | False   | torch.compile Embed/MessagePass/OutputHead's checkpointed step functions (fullgraph=True, dynamic=True).                                        |
+| `compile`           | True    | torch.compile Embed/MessagePass/OutputHead's checkpointed step functions (fullgraph=True, dynamic=True).                                        |
 | `amp`               | False   | fp16 autocast + GradScaler (CUDA only). Halves activation memory, uses T4 fp16 tensor cores; RFF projection and OutputHead Debye sum kept fp32. |
 | `amp_init_scale`    | 1024    | GradScaler starting loss scale when `amp` is on. Lower than torch's 65536 because activations are ~O(1) after mean-normalization.               |
 | `eps_embd`          | 1e-8    | Numerical floor in Embed (softplus, hypot).                                                                                                     |
 | `eps_msgp`          | 1e-3    | Numerical floor in MessagePass (sigma clamp, aggregate denominator).                                                                            |
-| `lr`                | 3e-4    | Adam learning rate.                                                                                                                             |
-| `weight_decay`      | 1e-5    | Adam L2 weight decay.                                                                                                                           |
+| `lr`                | 1.3e-4  | Adam learning rate.                                                                                                                             |
+| `weight_decay`      | 0.1     | Adam L2 weight decay.                                                                                                                           |
 | `grad_clip`         | 1.0     | Max gradient L2 norm before clipping.                                                                                                           |
-| `epochs`            | 50      | Training epochs.                                                                                                                                |
+| `epochs`            | 20      | Training epochs.                                                                                                                                |
 | `batcher_seed`      | 0       | Seed for train/val/test split and per-epoch shuffle.                                                                                            |
 | `dataset_frac`      | 1.0     | Fraction of each split's batches to use, (0.0, 1.0]. Applies to **train, val and test** - eval costs on the order of a train epoch, so thinning train alone just lets eval dominate. Deterministic off `batcher_seed`, fixed for the run. |
 | `atom_size_ceil`    | -1      | Max total atoms per batch (-1 = 3x largest molecule).                                                                                           |
@@ -734,7 +734,7 @@ If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remo
 The mixed-precision config trained and validated on 2x T4 (16 GiB each), fp16 loss falling cleanly from ~85 with peak ~5.8 GiB:
 
 ```python
-lambda_2 = 3, lambda_5 = 64,          # message-passing rounds / RFF count (cut from 5 / 128 for speed)
+lambda_2 = 4, lambda_5 = 128,         # message-passing rounds / RFF count
 atm_chunk = 512, mol_chunk = 256,     # see Appendix A1 - 1024/512 OOM'd in real training on 2xT4
 compile = True, amp = True,           # amp_init_scale defaults to 1024
 dp_atom_threshold = 101,

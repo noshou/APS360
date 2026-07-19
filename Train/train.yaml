@@ -25,10 +25,10 @@ ckpt_resume: scatternet_resume.pt
 
 # model architecture
 lambda_1: 128
-lambda_2: 5
-lambda_3: 128
+lambda_2: 4
+lambda_3: 64
 lambda_4: 4
-lambda_5: 64
+lambda_5: 128
 msg_seed: 42
 
 # chunking (peak-memory vs launch-count tradeoff; see README Appendix A1). 1024/512
@@ -47,15 +47,16 @@ dp_atom_threshold: 101   # calibrated for 2x T4: 1.8x faster, peak 13.55G. 0 = a
 eps_embd: 1.0e-8
 eps_msgp: 1.0e-3
 
-# loss
-lambda_6: 0.1
-lambda_7: 0.1
+# loss (RunConfig.__post_init__ coerces these to float, so an int like `1` won't
+# crash later inside the beartype-guarded Loss.loss() call -- still write 1.0, not 1)
+lambda_6: 1.0
+lambda_7: 0.5
 
 # optimiser / training loop
-lr:            3.0e-4
-weight_decay:  1.0e-5
+lr:            1.3e-4
+weight_decay:  0.1
 grad_clip:     1.0
-epochs:        50
+epochs:        20
 batcher_seed:  0
 atom_size_ceil: -1   # -1 = auto (3x largest molecule)
 num_workers: 4

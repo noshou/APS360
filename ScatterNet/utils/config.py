@@ -111,7 +111,8 @@ class RunConfig:
                     use TP regardless of this threshold (evaluate() relies on both ranks seeing
                     identical full-batch outputs).
     compile:        If True, torch.compile the checkpointed step functions in Embed, MessagePass,
-                    OutputHead, and Loss (fullgraph=True, dynamic=True). False (default) runs them eager.
+                    OutputHead, and Loss (fullgraph=True, dynamic=True). True (default) compiles them;
+                    set False to run eager.
     amp:            If True, run forward/backward under fp16 autocast + GradScaler (CUDA only;
                     no-op on CPU). Halves activation memory and uses Turing/Ampere fp16 tensor
                     cores. MessagePass's RFF projection is kept in fp32 to avoid overflow.
@@ -218,29 +219,29 @@ class RunConfig:
 
     # model
     lambda_1:       int            = 128
-    lambda_2:       int            = 5
-    lambda_3:       int            = 128
+    lambda_2:       int            = 4
+    lambda_3:       int            = 64
     lambda_4:       int            = 4
-    lambda_5:       int            = 256
+    lambda_5:       int            = 128
     msg_seed:       int            = 42
-    atm_chunk:      int            = 1024
-    mol_chunk:      int            = 32
+    atm_chunk:      int            = 512
+    mol_chunk:      int            = 256
     dp_atom_threshold: int         = 0         # 0 = always TP (old behaviour); see docstring above
-    compile:        bool           = False     # torch.compile Embed/MessagePass/OutputHead/Loss's checkpointed step functions
+    compile:        bool           = True      # torch.compile Embed/MessagePass/OutputHead/Loss's checkpointed step functions
     amp:            bool           = False     # fp16 autocast + GradScaler (CUDA only); RFF projection stays fp32
     amp_init_scale: float          = 1024.0    # GradScaler starting loss scale (amp only); lower than torch's 65536
     eps_embd:       float          = 1e-8
     eps_msgp:       float          = 1e-3
 
     # loss
-    lambda_6:       float          = 0.1
-    lambda_7:       float          = 0.1
+    lambda_6:       float          = 1.0
+    lambda_7:       float          = 0.5
 
     # training
-    lr:             float          = 3e-4
-    weight_decay:   float          = 1e-5
+    lr:             float          = 1.3e-4
+    weight_decay:   float          = 0.1
     grad_clip:      float          = 1.0
-    epochs:         int            = 50
+    epochs:         int            = 20
     batcher_seed:   int            = 0
     atom_size_ceil: int            = -1
     dataset_frac:   float          = 1.0       # fraction of TRAIN's batches to use, (0.0, 1.0]; deterministic subsample off batcher_seed; val/test always full
@@ -258,6 +259,14 @@ class RunConfig:
 
     # data
     buckets: list[tuple[int, int]] = field(default_factory=lambda: DEFAULT_BUCKETS)
+
+    def __post_init__(self) -> None:
+        # dataclasses don't enforce field types at construction time, so an int literal
+        # (e.g. lambda_6=1) silently sails through here and only blows up later inside the
+        # beartype-guarded Loss.loss() call, deep into a training run. Coerce eagerly instead.
+        for name in ("amp_init_scale", "eps_embd", "eps_msgp", "lambda_6", "lambda_7", "lr",
+                     "weight_decay", "grad_clip", "dataset_frac", "ckpt_interval_sec"):
+            setattr(self, name, float(getattr(self, name)))
 
 
 def load_config(config_path: Optional[str] = None, **cli_overrides) -> RunConfig:
