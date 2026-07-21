@@ -3,6 +3,7 @@ import os
 import random
 import subprocess
 import time as _time
+import warnings
 from contextlib import contextmanager
 from dataclasses import replace as dc_replace
 from time import perf_counter
@@ -398,6 +399,7 @@ def _parse_args():
 
     # training
     p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--lr_gamma", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
     p.add_argument("--grad_clip", type=float, default=None)
     p.add_argument("--epochs", type=int, default=None)
@@ -948,6 +950,23 @@ def _worker(rank: int, cfg: RunConfig):
                 f"batch_idx {saved_bi}, val_loss {best_val:.4f})",
                 flush=True,
             )
+
+    # Per-epoch LR decay, keyed off the absolute epoch number rather than a
+    # saved scheduler counter: start_epoch already encodes "epochs completed
+    # so far" correctly across both epoch-boundary and mid-epoch resumes (see
+    # block above), so fast-forwarding by that many step()s reproduces the
+    # right LR immediately with no checkpoint changes needed. A
+    # horizon-based schedule (cosine, etc.) can't do this safely since
+    # cfg.epochs is only this invocation's epoch count, not the run's total.
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer, gamma=cfg.lr_gamma
+    )
+    with warnings.catch_warnings():
+        # step() before any optimizer.step() is exactly what we want here
+        # (fast-forwarding past already-completed epochs, not skipping one).
+        warnings.filterwarnings("ignore", category=UserWarning)
+        for _ in range(start_epoch - 1):
+            scheduler.step()
 
     # profiler - diagnostic mode. Two decoupled layers, both on every rank:
     #
@@ -1532,6 +1551,13 @@ def _worker(rank: int, cfg: RunConfig):
 
             _save_resume(epoch, -1)  # batch_idx=-1 marks the epoch as complete
 
+        # Every rank steps identically (pure function of epoch count, no
+        # rank-dependent state), so the LR stays in lockstep across TP/DP
+        # ranks same as the model weights.
+        scheduler.step()
+        if rank == 0:
+            print(f"  lr -> {scheduler.get_last_lr()[0]:.3g}", flush=True)
+
     if is_dist:
         dist.destroy_process_group()
 
@@ -1584,6 +1610,7 @@ def main(cfg: RunConfig | None = None):
             lambda_6=A.lambda_6,
             lambda_7=A.lambda_7,
             lr=A.lr,
+            lr_gamma=A.lr_gamma,
             weight_decay=A.weight_decay,
             grad_clip=A.grad_clip,
             epochs=A.epochs,

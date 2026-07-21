@@ -166,7 +166,19 @@ class RunConfig:
 
     Training
     lr : float
-        Adam learning rate.
+        Adam learning rate (this is the epoch-1 value; see lr_gamma).
+    lr_gamma : float
+        Per-epoch multiplicative LR decay (ExponentialLR): lr at epoch N
+        (1-indexed) is lr * lr_gamma^(N-1). 1.0 = no decay. Applied once
+        per epoch, keyed off the absolute epoch number (ckpt["epoch"]),
+        not a saved scheduler counter -- so a crash-resume (this run
+        restarts often; see ckpt_interval_sec) lands on the correct LR
+        automatically without needing scheduler state in the checkpoint.
+        cfg.epochs is the epoch count for THIS invocation, not the
+        run's total horizon (a resume runs cfg.epochs MORE epochs from
+        wherever it left off), so a horizon-based schedule (cosine,
+        step-to-a-target) isn't safe here; exponential per-epoch decay
+        needs no known endpoint.
     weight_decay : float
         Adam L2 weight decay coefficient.
     grad_clip : float
@@ -273,6 +285,7 @@ class RunConfig:
 
     # training
     lr: float = 1.3e-4
+    lr_gamma: float = 0.9  # per-epoch ExponentialLR decay factor
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     epochs: int = 20
@@ -322,6 +335,7 @@ class RunConfig:
             "lambda_6",
             "lambda_7",
             "lr",
+            "lr_gamma",
             "weight_decay",
             "grad_clip",
             "dataset_frac",

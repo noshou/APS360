@@ -637,7 +637,13 @@ L_total = mean_{n,q}[ L_kratky(n,q) + L_ff(n,q) + L_sigma(n,q) ]
 
 `torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)`
 
-Standard Adam (not AdamW; weight decay is applied inside the gradient update, not decoupled). Single parameter group, no learning rate schedule.
+Standard Adam (not AdamW; weight decay is applied inside the gradient update, not decoupled). Single parameter group.
+
+### Learning Rate Schedule
+
+`torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=lr_gamma)`, stepped once per epoch (not per batch): `lr` at epoch `N` (1-indexed) is `lr * lr_gamma ** (N - 1)`. `lr_gamma=1.0` disables decay.
+
+Keyed off the absolute epoch number rather than a saved scheduler counter: on resume, the scheduler is constructed fresh and fast-forwarded by `start_epoch - 1` steps, reproducing the exact LR the run would have reached natively. This works because `start_epoch` already correctly encodes epochs-completed-so-far across both epoch-boundary and mid-epoch resumes (see `Train/train.py`'s resume block) - no scheduler state needs to live in the checkpoint. A horizon-based schedule (cosine annealing, etc.) can't do this safely here, since `cfg.epochs` is only the current invocation's epoch count, not the run's total horizon (a resume runs `cfg.epochs` MORE epochs from wherever it left off).
 
 ### Per-Batch Step
 
@@ -716,7 +722,8 @@ If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remo
 | `amp_init_scale`    | 1024    | GradScaler starting loss scale when `amp` is on. Lower than torch's 65536 because activations are ~O(1) after mean-normalization.               |
 | `eps_embd`          | 1e-8    | Numerical floor in Embed (softplus, hypot).                                                                                                     |
 | `eps_msgp`          | 1e-3    | Numerical floor in MessagePass (sigma clamp, aggregate denominator).                                                                            |
-| `lr`                | 1.3e-4  | Adam learning rate.                                                                                                                             |
+| `lr`                | 1.3e-4  | Adam learning rate (epoch-1 value; see `lr_gamma`).                                                                                             |
+| `lr_gamma`          | 0.9     | Per-epoch ExponentialLR decay factor: `lr * lr_gamma ** (epoch - 1)`. 1.0 = no decay.                                                           |
 | `weight_decay`      | 0.1     | Adam L2 weight decay.                                                                                                                           |
 | `grad_clip`         | 1.0     | Max gradient L2 norm before clipping.                                                                                                           |
 | `epochs`            | 20      | Training epochs.                                                                                                                                |

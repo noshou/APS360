@@ -1,9 +1,10 @@
 # I(q)@L=50 Database
 
-## Parameters 
+## Parameters
+
 
 | Parameter | Value            |
-| --------- | ---------------- |
+| ----------- | ------------------ |
 | energy    | 12 500 eV        |
 | qMin      | 0 angstrom^-1    |
 | qMax      | 0.5 angstrom^-1  |
@@ -11,14 +12,14 @@
 | Q         | 51 points        |
 | lMax      | 50               |
 
-
 ## Files
 
-| File | Size | Description |
-|------|------|-------------|
-| `I(q)@L=50.h5` | ~66 GB | HDF5 database of I(q) curves and molecular data |
+
+| File                            | Size    | Description                                                                                                                                           |
+| --------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `I(q)@L=50.h5`                  | ~66 GB  | HDF5 database of I(q) curves and molecular data                                                                                                       |
 | `iq_train_set-ENCODING.sqlite3` | ~860 MB | Encoding index: maps every molecule to its atom count and VOCAB indices, so the data pipeline never needs to scan the 66 GB HDF5 file during training |
-| `xyz_coordinate_files.7z` | ~6.5 GB | Source XYZ geometry files for all molecule groups (LZMA2, max compression). Only needed to re-run the build pipeline from scratch. |
+| `xyz_coordinate_files.7z`       | ~6.5 GB | Source XYZ geometry files for all molecule groups (LZMA2, max compression). Only needed to re-run the build pipeline from scratch.                    |
 
 ## Retrieving the dataset
 
@@ -76,18 +77,20 @@ Produced by `buildDB()` in `load_data.py`. The file is opened in append mode (`'
 
 ## Root attributes
 
+
 | Attribute | Type  | Description                            |
-| --------- | ----- | -------------------------------------- |
+| ----------- | ------- | ---------------------------------------- |
 | `lMax`    | int   | Maximum spherical harmonic degree used |
-| `energy`  | float | X-ray energy in eV (e.g. `12500.0`)    |
+| `energy`  | float | X-ray energy in eV (e.g.`12500.0`)     |
 
 ## Root datasets
 
-| Path           | dtype   | Shape  | Compression          | Description                                             |
-| -------------- | ------- | ------ | -------------------- | ------------------------------------------------------- |
-| `/q_grid`      | float64 | `(Q,)` | ZFP lossless         | Momentum transfer grid in angstrom^-1; `Q = len(qvals)` |
-| `/sources_tsv` | uint8   | `(N,)` | Bitshuffle + Zstd-22 | Raw bytes of provenance TSV (optional)                  |
-| `/makeup_tsv`  | uint8   | `(M,)` | Bitshuffle + Zstd-22 | Raw bytes of ion makeup TSV (optional)                  |
+
+| Path           | dtype   | Shape  | Compression          | Description                                            |
+| ---------------- | --------- | -------- | ---------------------- | -------------------------------------------------------- |
+| `/q_grid`      | float64 | `(Q,)` | ZFP lossless         | Momentum transfer grid in angstrom^-1;`Q = len(qvals)` |
+| `/sources_tsv` | uint8   | `(N,)` | Bitshuffle + Zstd-22 | Raw bytes of provenance TSV (optional)                 |
+| `/makeup_tsv`  | uint8   | `(M,)` | Bitshuffle + Zstd-22 | Raw bytes of ion makeup TSV (optional)                 |
 
 Both TSV datasets are written once and never overwritten on subsequent runs.
 
@@ -106,16 +109,17 @@ Each `.xyz` file produces one HDF5 group nested two levels deep.
         elms     str      (n,)
 ```
 
-| Level     | Key            | Description                                                                                                         |
-| --------- | -------------- | ------------------------------------------------------------------------------------------------------------------- |
-| group     | `<group_name>` | Arbitrary label supplied via the `groups` dict argument                                                             |
-| subgroup  | `<stem>`       | Filename without `.xyz` extension                                                                                   |
-| attribute | `name`         | Molecule name string (from XYZ line 2)                                                                              |
-| dataset   | `I_q`          | Orientationally-averaged scattering intensity, float32 `(Q,)`, ZFP lossless                                         |
-| dataset   | `coords`       | Centroid-subtracted Cartesian coordinates, float64 `(n, 3)`, ZFP lossless                                           |
-| dataset   | `angles`       | Spherical angles, float64 `(n, 2)`: col 0 = theta (polar, 0 to pi), col 1 = phi (azimuthal, 0 to 2pi), ZFP lossless |
-| dataset   | `r`            | Radial distances from centroid in angstroms, float64 `(n,)`, ZFP lossless                                           |
-| dataset   | `elms`         | Element symbol per atom, variable-length UTF-8 string `(n,)`, uncompressed                                          |
+
+| Level     | Key            | Description                                                                                                        |
+| ----------- | ---------------- | -------------------------------------------------------------------------------------------------------------------- |
+| group     | `<group_name>` | Arbitrary label supplied via the`groups` dict argument                                                             |
+| subgroup  | `<stem>`       | Filename without`.xyz` extension                                                                                   |
+| attribute | `name`         | Molecule name string (from XYZ line 2)                                                                             |
+| dataset   | `I_q`          | Orientationally-averaged scattering intensity, float32`(Q,)`, ZFP lossless                                         |
+| dataset   | `coords`       | Centroid-subtracted Cartesian coordinates, float64`(n, 3)`, ZFP lossless                                           |
+| dataset   | `angles`       | Spherical angles, float64`(n, 2)`: col 0 = theta (polar, 0 to pi), col 1 = phi (azimuthal, 0 to 2pi), ZFP lossless |
+| dataset   | `r`            | Radial distances from centroid in angstroms, float64`(n,)`, ZFP lossless                                           |
+| dataset   | `elms`         | Element symbol per atom, variable-length UTF-8 string`(n,)`, uncompressed                                          |
 
 `Q` is the number of points in `/q_grid` and is fixed for the whole file. `n` varies per molecule.
 
@@ -133,27 +137,29 @@ Form factors are **not** stored -- they are recomputed from `xraydb`.
 
 The `groups` argument maps each group name to a directory of `.xyz` files. Every group becomes a top-level HDF5 group containing one subgroup per molecule.
 
-| Group | Molecules | Atom range | Description |
-| ----- | --------: | ---------- | ----------- |
-| COD | 532,302 | 1-6,032 | Crystallography Open Database |
-| QM9 | 133,844 | 3-29 | Small organic molecules |
-| tmQM | 108,541 | 7-569 | Transition metal complexes |
-| rcsb_sml | 96,158 | 28-6,036 | PDB small structures |
-| viro3D | 60,488 | 173-6,046 | Viral protein structures |
-| hydration_shells | 48,571 | 3-147 | Water solvation shells |
-| rcsb_med | 31,749 | 2,996-6,046 | PDB medium structures |
-| mofs | 30,863 | 10-5,760 | Metal-organic frameworks |
-| (Na,Co,Ag,Pb,Mo,Fe)_monoatomic_clusters | 1,282 | 2-380 | Monoatomic clusters |
-| binary_clusters | 371 | 2-1,482 | Binary alloy clusters |
-| si_ge_clusters | 217 | 4-60 | Silicon/germanium clusters |
-| ar_ne_clusters | 127 | 2-55 | Noble gas clusters |
-| (NaCl)_nCl- | 70 | 3-71 | Sodium chloride clusters |
-| **TOTAL** | **1,044,583** | **1-6,046** | |
+
+| Group                                   |     Molecules | Atom range  | Description                   |
+| ----------------------------------------- | --------------: | ------------- | ------------------------------- |
+| COD                                     |       532,302 | 1-6,032     | Crystallography Open Database |
+| QM9                                     |       133,844 | 3-29        | Small organic molecules       |
+| tmQM                                    |       108,541 | 7-569       | Transition metal complexes    |
+| rcsb_sml                                |        96,158 | 28-6,036    | PDB small structures          |
+| viro3D                                  |        60,488 | 173-6,046   | Viral protein structures      |
+| hydration_shells                        |        48,571 | 3-147       | Water solvation shells        |
+| rcsb_med                                |        31,749 | 2,996-6,046 | PDB medium structures         |
+| mofs                                    |        30,863 | 10-5,760    | Metal-organic frameworks      |
+| (Na,Co,Ag,Pb,Mo,Fe)_monoatomic_clusters |         1,282 | 2-380       | Monoatomic clusters           |
+| binary_clusters                         |           371 | 2-1,482     | Binary alloy clusters         |
+| si_ge_clusters                          |           217 | 4-60        | Silicon/germanium clusters    |
+| ar_ne_clusters                          |           127 | 2-55        | Noble gas clusters            |
+| (NaCl)_nCl-                             |            70 | 3-71        | Sodium chloride clusters      |
+| **TOTAL**                               | **1,044,583** | **1-6,046** |                               |
 
 ## Compression codecs
 
+
 | Codec                            | Used for                                 | Notes                            |
-| -------------------------------- | ---------------------------------------- | -------------------------------- |
+| ---------------------------------- | ------------------------------------------ | ---------------------------------- |
 | ZFP lossless (`reversible=True`) | `q_grid`, `I_q`, `coords`, `angles`, `r` | Floating-point; exact round-trip |
 | Bitshuffle + Zstd level 22       | `sources_tsv`, `makeup_tsv`              | uint8 blobs; ZFP incompatible    |
 
@@ -190,4 +196,3 @@ With the recovered 40,000 entries in place, `build_db.py` resumes normally: it o
 ## Crash safety
 
 Entries are written under a temporary name `__tmp__<stem>` and atomically moved to `<stem>` only after shape assertions pass. Any `__tmp__*` keys found at startup are cleaned up before processing resumes.
-
