@@ -428,7 +428,7 @@ def load_epoch_history(data_dir: str) -> list[dict]:
         try:
             with open(path) as fh:
                 history.append(json.load(fh))
-        except OSError, ValueError:
+        except (OSError, ValueError):
             # A run killed mid-write leaves a truncated json. Skipping it costs
             # one point on the curve; letting it raise would kill the epoch.
             print(f"  [plots] skipping unreadable {path}", flush=True)
