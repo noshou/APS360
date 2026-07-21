@@ -1,2 +1,2 @@
-from .vocab import VOCAB
 from .encode import Encoding
+from .vocab import VOCAB

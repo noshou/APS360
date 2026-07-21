@@ -1,11 +1,12 @@
-import torch
 import math
 
+import torch
 from torch import nn
 
-class NoTrilinBilin(nn.Module):
 
-    """Drop-in replacement for ``nn.Bilinear`` that avoids the `_trilinear` kernel.
+class NoTrilinBilin(nn.Module):
+    """Mathematically identical replacement
+    for ``nn.Bilinear`` that avoids the `_trilinear` kernel.
 
     ``nn.Bilinear`` dispatches to a generic `_trilinear` autograd op that
     profiled as one of the two dominant CUDA kernels in this model (tied with
@@ -15,17 +16,7 @@ class NoTrilinBilin(nn.Module):
     matmul (`x1 @ W`) plus an elementwise multiply-and-reduce over
     `in2_features`, routing through the same well-optimized GEMM kernel
     already dominant elsewhere in the model instead of a separate, less
-    launch-efficient op. Mathematically identical to ``nn.Bilinear`` — not an
-    approximation — and uses the same parameter init scheme, so it is a
-    direct substitute at any call site.
-
-    ``nn.Bilinear``'s `F.bilinear` also isn't supported by torch.compile's
-    Inductor backend, so it forces a graph break whenever a compiled function
-    calls it - splitting one fused compiled region into pieces around an
-    eager fallback. This class uses only matmul/reshape/elementwise ops,
-    all of which Inductor fuses natively, so swapping it in also lets
-    torch.compile absorb the whole computation into its surrounding
-    compiled graph instead of breaking around it.
+    launch-efficient op.
 
     When to use it
     ---------------
@@ -49,16 +40,15 @@ class NoTrilinBilin(nn.Module):
     """
 
     weight: nn.Parameter
-    bias:   "nn.Parameter | None"
+    bias: "nn.Parameter | None"
 
     def __init__(
         self,
         in1_features: int,
         in2_features: int,
         out_features: int,
-        bias:         bool = True,
+        bias: bool = True,
     ) -> None:
-
         """Construct the layer and initialize its parameters.
 
         Parameters
@@ -82,16 +72,13 @@ class NoTrilinBilin(nn.Module):
         self.in1_features = in1_features
         self.in2_features = in2_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(
-            out_features, 
-            in1_features, 
-            in2_features
-            ))
-        self.bias   = nn.Parameter(torch.empty(out_features)) if bias else None
+        self.weight = nn.Parameter(
+            torch.empty(out_features, in1_features, in2_features)
+        )
+        self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-
         """Reset `weight` and `bias` in place, matching `nn.Bilinear`'s scheme.
 
         Both tensors are drawn from `Uniform(-bound, bound)` with
@@ -110,8 +97,7 @@ class NoTrilinBilin(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-
-        """Compute the bilinear form `y = x1 @ W @ x2 + bias` without `_trilinear`.
+        """Compute the bilinear form `y = x1 @ W @ x2 + bias`.
 
         Parameters
         ----------
@@ -127,21 +113,19 @@ class NoTrilinBilin(nn.Module):
             Output, shape `(..., out_features)`.
         """
 
-        # Permute (out, in1, in2) -> (out, in2, in1) BEFORE flattening to
-        # (out*in2, in1) - a plain reshape without the permute would chop the
+        # Permute (out, in1, in2) -> (out, in2, in1) before flattening to
+        # (out*in2, in1). A plain reshape without the permute would chop the
         # flat buffer without regrouping by in2, silently computing the wrong
-        # thing whenever in2_features > 1 (masked when in2_features == 1,
-        # where permuting a size-1 axis is a no-op - caught via parity test
-        # against nn.Bilinear on the out_features=1 case, not the in2=1 case).
+        # thing whenever in2_features > 1.
         W = self.weight.permute(0, 2, 1).reshape(
-            self.out_features * self.in2_features, 
-            self.in1_features
-            )
+            self.out_features * self.in2_features, self.in1_features
+        )
 
         # (..., in1) @ (in1, out*in2) -> (..., out*in2) -> (..., out, in2)
-        temp = (x1 @ W.T).reshape(*x1.shape[:-1], self.out_features, self.in2_features)
+        temp = (x1 @ W.T).reshape(
+            *x1.shape[:-1], self.out_features, self.in2_features
+        )
 
-        # Elementwise multiply by x2 (broadcast over out) and reduce over in2 -
-        # the remaining contraction nn.Bilinear's kernel does internally.
+        # Elementwise multiply by x2 (broadcast over out) and reduce over in2
         y = (temp * x2.unsqueeze(-2)).sum(-1)
         return y + self.bias if self.bias is not None else y

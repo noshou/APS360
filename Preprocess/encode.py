@@ -1,15 +1,16 @@
+import os
 import re
 import sqlite3
+
 import h5py
 import hdf5plugin  # noqa: F401
-
-from beartype        import beartype
+from beartype import beartype
 from beartype.typing import List, Tuple
-from .vocab          import VOCAB
-import os
+
+from .vocab import VOCAB
+
 
 class Encoding:
-
     """Singleton that builds and queries the molecule encoding database.
 
     On first construction, reads every molecule from an HDF5 file, maps each
@@ -29,7 +30,7 @@ class Encoding:
     # writes my_dataset-ENCODING.sqlite3
     """
 
-    _CHARGE_RE = re.compile(r'[0-9]*[+\-]+$')
+    _CHARGE_RE = re.compile(r"[0-9]*[+\-]+$")
 
     _ENCODING_SCHEMA = """
     CREATE TABLE IF NOT EXISTS items (
@@ -45,13 +46,13 @@ class Encoding:
 
     _CHUNK = 10_000
     _path: str
-    _max:  int
+    _max: int
 
     _initialized = False
     _instance = None
 
     @staticmethod
-    def _connect_ro(path: str, **kwargs) -> sqlite3.Connection:
+    def _connect_ro(path: str, **kwargs: object) -> sqlite3.Connection:
         """Open `path` read-only via a `file:` URI.
 
         Kaggle mounts dataset inputs (`/kaggle/input/...`) read-only. A plain
@@ -74,9 +75,11 @@ class Encoding:
         sqlite3.Connection
             A read-only connection to `path`.
         """
-        return sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True, **kwargs)
+        return sqlite3.connect(
+            f"file:{path}?mode=ro&immutable=1", uri=True, **kwargs
+        )
 
-    def __new__(cls, *args, **kwargs):
+    def __new__(cls, *args: object, **kwargs: object) -> "Encoding":
         """Return the shared singleton instance, creating it on first call.
 
         Parameters
@@ -102,37 +105,47 @@ class Encoding:
         Parameters
         ----------
         db_path : str
-            Path to the SQLite encoding database file (e.g. ``my_dataset-ENCODING.sqlite3``).
-            Built at this path if it does not already exist.
+            Path to the SQLite encoding database file (e.g.
+            ``my_dataset-ENCODING.sqlite3``). Built at this path if it
+            does not already exist.
         hdf5_path : str
-            Path to the source HDF5 file produced by the preprocessing pipeline.
+            Path to the source HDF5 file produced by the preprocessing
+            pipeline.
         """
 
         _DBPATH = db_path
 
         if os.path.exists(_DBPATH):
-            print(f"Found existing database: '{_DBPATH}'. Skipping HDF5 parsing loop.")
+            print(
+                f"Found existing database: '{_DBPATH}'. "
+                "Skipping HDF5 parsing loop."
+            )
             self._path = _DBPATH
-            self._max  = self.max_atom_count()
+            self._max = self.max_atom_count()
             self._initialized = True
             return
 
         if self._initialized:
             return
 
-        # Build into a temp path and atomically rename to _DBPATH only on full success.
-        # A crash mid-build (e.g. two processes racing to build the same DB, or an
-        # interrupted Kaggle session) must never leave a file at _DBPATH itself --
-        # os.path.exists(_DBPATH) above is the only signal callers have that the DB
-        # is usable, and it can't distinguish "complete" from "partially written".
+        # Build into a temp path and atomically rename to _DBPATH only on
+        # full success. A crash mid-build (e.g. two processes racing to
+        # build the same DB, or an interrupted Kaggle session) must never
+        # leave a file at _DBPATH itself: os.path.exists(_DBPATH) above is
+        # the only signal callers have that the DB is usable, and it can't
+        # distinguish "complete" from "partially written".
         _DBPATH_TMP = f"{_DBPATH}.building-{os.getpid()}"
 
         sqlite3.register_converter("BLOB", self._convert_array)
 
-        conn = sqlite3.connect(_DBPATH_TMP, detect_types=sqlite3.PARSE_DECLTYPES)
+        conn = sqlite3.connect(
+            _DBPATH_TMP, detect_types=sqlite3.PARSE_DECLTYPES
+        )
         try:
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA wal_autocheckpoint=0")  # checkpoint once at close, not every 4 MB
+            conn.execute(
+                "PRAGMA wal_autocheckpoint=0"
+            )  # checkpoint once at close, not every 4 MB
             cursor = conn.cursor()
             cursor.executescript(self._ENCODING_SCHEMA)
 
@@ -147,11 +160,16 @@ class Encoding:
                     if not isinstance(group_obj, h5py.Group):
                         continue
                     for stem, mol_obj in group_obj.items():
-                        if stem.startswith("__tmp__") or not isinstance(mol_obj, h5py.Group):
+                        if stem.startswith("__tmp__") or not isinstance(
+                            mol_obj, h5py.Group
+                        ):
                             continue
                         try:
                             raw = mol_obj["elms"][:].tolist()  # type: ignore
-                            elms = [e.decode() if isinstance(e, bytes) else e for e in raw]
+                            elms = [
+                                e.decode() if isinstance(e, bytes) else e
+                                for e in raw
+                            ]
                             enc = self._encode_ions(elms)
                         except (LookupError, ValueError):
                             continue
@@ -165,7 +183,8 @@ class Encoding:
                     cursor.executemany(_ENCODING_ADD, buf)
                     conn.commit()
 
-            # Build index after all data inserted — single-pass B-tree, no fragmentation
+            # Build index after all data inserted: single-pass B-tree,
+            # no fragmentation
             cursor.executescript(self._INDEX_SCHEMA)
             conn.commit()
 
@@ -181,7 +200,7 @@ class Encoding:
             conn.close()
             os.replace(_DBPATH_TMP, _DBPATH)  # atomic on the same filesystem
 
-        self._max  = build_max
+        self._max = build_max
         self._path = _DBPATH
         self._initialized = True
 
@@ -201,12 +220,12 @@ class Encoding:
             'c'/'si' and any charge suffix removed.
         """
         ion = _ion.strip()
-        if ion.lower() == 'cval':
-            return 'c'
-        elif ion.lower() == 'siva':
-            return 'si'
+        if ion.lower() == "cval":
+            return "c"
+        elif ion.lower() == "siva":
+            return "si"
         else:
-            return self._CHARGE_RE.sub('', ion).lower()
+            return self._CHARGE_RE.sub("", ion).lower()
 
     def _convert_array(self, blob: bytes) -> list:
         return list(blob)
@@ -245,8 +264,11 @@ class Encoding:
         return enc
 
     @beartype
-    def get_in_range(self, min_atoms: int, max_atoms: int) -> List[Tuple[str, str, int]]:
-        """Return metadata for all molecules whose atom count falls in [min_atoms, max_atoms].
+    def get_in_range(
+        self, min_atoms: int, max_atoms: int
+    ) -> List[Tuple[str, str, int]]:
+        """Return metadata for molecules with atom count in
+        [min_atoms, max_atoms].
 
         Omits ``VOCAB_idx`` deliberately: callers that build long-lived,
         whole-dataset row lists (e.g. ``Batcher``) should stay lightweight,
@@ -308,13 +330,16 @@ class Encoding:
             return {}
 
         sqlite3.register_converter("BLOB", self._convert_array)
-        conn = self._connect_ro(self._path, detect_types=sqlite3.PARSE_DECLTYPES)
+        conn = self._connect_ro(
+            self._path, detect_types=sqlite3.PARSE_DECLTYPES
+        )
         try:
             cursor = conn.cursor()
             placeholders = ",".join("(?,?)" for _ in keys)
             params = [v for grp, stem in keys for v in (stem, grp)]
             cursor.execute(
-                f"SELECT grp, stem, VOCAB_idx FROM items WHERE (stem, grp) IN ({placeholders})",
+                "SELECT grp, stem, VOCAB_idx FROM items "
+                f"WHERE (stem, grp) IN ({placeholders})",
                 params,
             )
             rows = cursor.fetchall()
@@ -329,7 +354,8 @@ class Encoding:
         Returns
         -------
         int
-            Maximum value of the ``atoms`` column, cached after first computation.
+            Maximum value of the ``atoms`` column, cached after first
+            computation.
         """
         if hasattr(self, "_max") and self._max is not None:
             return self._max

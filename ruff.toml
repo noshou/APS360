@@ -1,0 +1,16 @@
+line-length  	= 79
+indent-width 	= 4
+target-version 	= "py314"
+exclude = ["*.ipynb", "__init__.py"]
+
+[format]
+indent-style = "space"
+quote-style  = "double"
+
+[lint]
+select = ["E", "F", "W", "I", "ANN"]
+ignore = ["ANN202"]
+
+[lint.flake8-annotations]
+mypy-init-return = true
+suppress-none-returning = true

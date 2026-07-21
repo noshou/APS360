@@ -1,10 +1,12 @@
-import torch
 import h5py
-
+import torch
+from beartype.typing import List
 from torch.utils.data import Dataset
-from .batch           import Batch
-from beartype.typing  import List
-from Preprocess       import Encoding
+
+from Preprocess import Encoding
+
+from .batch import Batch
+
 
 class BatchSet(Dataset):
     """A PyTorch Dataset where each item is a pre-built batch of molecules.
@@ -27,7 +29,7 @@ class BatchSet(Dataset):
             train,
             batch_size=1,
             shuffle=True,
-            collate_fn=lambda x: x[0],   # unwrap the outer list added by DataLoader
+            collate_fn=lambda x: x[0], # unwrap outer list added by DataLoader
         )
 
         for batch in train_loader:        # batch is a Batch, shape (N, ...)
@@ -66,7 +68,7 @@ class BatchSet(Dataset):
             (grp, stem, atoms) rows.
         """
         self._batches = batches
-        self._enc     = enc
+        self._enc = enc
         self._db_path = hdf5_db
 
     def __len__(self) -> int:
@@ -80,7 +82,8 @@ class BatchSet(Dataset):
         return len(self._batches)
 
     def __getitem__(self, i: int) -> Batch:
-        """Load and return sub-batch ``i`` as a typed, shape-validated ``Batch``.
+        """Load and return sub-batch ``i``
+        as a typed, shape-validated ``Batch``.
 
         Parameters
         ----------
@@ -93,8 +96,10 @@ class BatchSet(Dataset):
             The loaded batch, with vocab, I(q) intensities, and coordinates
             read from the HDF5 file and padded via ``Batch.from_lists``.
         """
-        rows  = self._batches[i]
-        vocab_by_key = self._enc.get_vocab_for_keys([(grp, stem) for grp, stem, _ in rows])
+        rows = self._batches[i]
+        vocab_by_key = self._enc.get_vocab_for_keys(
+            [(grp, stem) for grp, stem, _ in rows]
+        )
 
         vocab: List = []
         iqval: List = []
@@ -102,9 +107,9 @@ class BatchSet(Dataset):
 
         with h5py.File(self._db_path, "r") as db:
             for grp, stem, _ in rows:
-                mol = db[grp][stem]									   # type: ignore
+                mol = db[grp][stem]  # type: ignore
                 vocab.append(torch.tensor(vocab_by_key[(grp, stem)]))
-                iqval.append(torch.tensor(mol["I_q"][:]))              # type: ignore
-                coord.append(torch.tensor(mol["coords"][:]))           # type: ignore
+                iqval.append(torch.tensor(mol["I_q"][:]))  # type: ignore
+                coord.append(torch.tensor(mol["coords"][:]))  # type: ignore
 
         return Batch.from_lists(vocab, iqval, coord)

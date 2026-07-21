@@ -1,10 +1,10 @@
-import torch
+from typing import NamedTuple
 
+import torch
 from jaxtyping import Float
-from typing    import NamedTuple
+
 
 class LayerHead(NamedTuple):
-    
     """Immutable container passed between Embed, MessagePass, and OutputHead.
 
     Attributes
@@ -18,7 +18,9 @@ class LayerHead(NamedTuple):
     sigmas : torch.Tensor
         Per-atom RFF kernel bandwidth per q-point, shape (N, M, Q, 1).
     """
-    
-    embeds: Float[torch.Tensor, "N M * λ₁"] # atom embeddings
-    f_mags: Float[torch.Tensor, "N M Q 1"]  # form factor magnitudes
-    sigmas: Float[torch.Tensor, "N M Q 1"]  # per-atom positional scaling factor
+
+    embeds: Float[torch.Tensor, "N M * λ₁"] # atom embeddings        #noqa:F722
+    f_mags: Float[torch.Tensor, "N M Q 1"]  # form factor magnitudes #noqa:F722
+    sigmas: Float[
+        torch.Tensor, "N M Q 1"                                      #noqa:F722
+    ]  # per-atom positional scaling factor

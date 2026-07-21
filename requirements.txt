@@ -24,3 +24,4 @@ pyyaml
 scikit-learn
 threadpoolctl
 joblib
+ruff

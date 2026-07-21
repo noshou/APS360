@@ -1,32 +1,35 @@
 import re
-import numpy        as np
-import numpy.typing as npt
-
-from beartype    import beartype
-from xraydb      import f0, f1_chantler, f2_chantler, chantler_energies
 from dataclasses import dataclass, field
 
+import numpy as np
+import numpy.typing as npt
+from beartype import beartype
+from xraydb import chantler_energies, f0, f1_chantler, f2_chantler
+
 # Strip charge notation to get bare element symbol (e.g. Mn2+ → Mn, Na+ → Na)
-# Used for xraydb functions that don't accept ionic notation (f1/f2, chantler_energies)
-_CHARGE_RE = re.compile(r'[0-9]*[+\-]+$')
+# Used for xraydb functions that don't accept ionic notation
+# (f1/f2, chantler_energies)
+_CHARGE_RE = re.compile(r"[0-9]*[+\-]+$")
+
+
 def _bare(ion: str) -> str:
     """Strip trailing charge notation from an ion symbol.
 
     Parameters
     ----------
     ion : str
-        Ion symbol, possibly with charge notation (e.g. ``'Mn2+'``, ``'Na+'``).
+        Ion symbol, possibly with charge notation.
 
     Returns
     -------
     str
-        Bare element symbol with charge notation removed (e.g. ``'Mn'``, ``'Na'``).
+        Bare element symbol with charge notation removed.
     """
-    return _CHARGE_RE.sub('', ion)
+    return _CHARGE_RE.sub("", ion)
+
 
 @dataclass(frozen=True)
 class FormFactors:
-
     """
     Container for precomputed complex atomic form factors over a q grid.
 
@@ -34,7 +37,7 @@ class FormFactors:
         f(q, E) = f0(s) + f'(E) + i·f''(E)
 
     where s = q/(4π) is the Cromer-Mann variable (sin(θ)/λ, Å⁻¹), f0 is the
-    Thomson scattering term (Waasmaier/Cromer-Mann; equals Z at s=0), and f'/f''
+    Thomson scattering term (Waasmaier/Cromer-Mann equals Z at s=0), and f'/f''
     are the real/imaginary Chantler anomalous corrections (xraydb f1_chantler /
     f2_chantler, which return the anomalous part only, not Z+f').
 
@@ -50,17 +53,18 @@ class FormFactors:
         X-ray energy in eV used to compute the anomalous corrections.
     """
 
-    ions:   list[str]
-    qvals:  npt.NDArray[np.float64]
-    ff:     dict[str, npt.NDArray[np.complex128]]
+    ions: list[str]
+    qvals: npt.NDArray[np.float64]
+    ff: dict[str, npt.NDArray[np.complex128]]
     ionIdx: dict[str, int] = field(init=False)
     energy: float
 
     # Form factor convention (matches xraydb):
     #   f(q, E) = f0(s) + f'(E) + i·f''(E)
-    # where s = q/(4π), f0 is the Cromer-Mann/Waasmaier Thomson term (→Z at s=0),
-    # and f'/f'' are the Chantler anomalous corrections (f1_chantler/f2_chantler).
-    # xraydb.f1_chantler returns f'(E) only - NOT Z+f' - so no subtraction of f0(0).
+    # where s = q/(4π), f0 is the Cromer-Mann/Waasmaier T
+    # homson term (→Z at s=0), and f'/f'' are the Chantler anomalous
+    # corrections (f1_chantler/f2_chantler). xraydb.f1_chantler returns
+    # f'(E) only so no subtraction of f0(0).
 
     def __post_init__(self) -> None:
         """Make the qvals and ff arrays read-only and build the ion index map.
@@ -73,15 +77,13 @@ class FormFactors:
         for arr in self.ff.values():
             arr.flags.writeable = False
         object.__setattr__(
-            self, 
-            'ionIdx', 
-            {ion: i for i, ion in enumerate(self.ions)}
+            self, "ionIdx", {ion: i for i, ion in enumerate(self.ions)}
         )
 
     @staticmethod
     def _validate_energy(ion: str, energy: float) -> None:
-
-        """Validate that energy is within the Chantler tabulation range for an ion.
+        """Validate that energy is within the
+        Chantler tabulation range for an ion.
 
         Parameters
         ----------
@@ -98,12 +100,13 @@ class FormFactors:
         """
 
         elem = _bare(ion)
+        verr = f"No Chantler tabulation found for '{elem}' (from ion '{ion}')."
         try:
             valid = chantler_energies(elem, emin=0, emax=1e9)
         except Exception as exc:
-            raise ValueError(f"No Chantler tabulation found for '{elem}' (from ion '{ion}').") from exc
+            raise ValueError(verr) from exc
         if len(valid) == 0:
-            raise ValueError(f"No Chantler tabulation found for '{elem}' (from ion '{ion}').")
+            raise ValueError(verr)
         emin, emax = min(valid), max(valid)
         if energy < emin or energy > emax:
             raise ValueError(
@@ -118,8 +121,8 @@ class FormFactors:
         energy: float,
         skip_anomalous: bool = False,
     ) -> npt.NDArray[np.complex128]:
-
-        """Compute the complex atomic form factor f(q, E) = f0(s) + f'(E) + i·f''(E).
+        """Compute the complex atomic form factor
+        f(q, E) = f0(s) + f'(E) + i·f''(E).
 
         Parameters
         ----------
@@ -136,12 +139,13 @@ class FormFactors:
         -------
         ndarray of complex128, shape (N,)
         """
-        # f0 (Waasmaier/Cromer-Mann) accepts ionic notation; fall back to bare element.
+        # f0 (Waasmaier/Cromer-Mann) accepts ionic notation;
+        # fall back to bare element.
         # f'/f'' (Chantler) require bare element symbols.
         elem = _bare(ion)
-        s    = qvals / (4.0 * np.pi)
+        s = qvals / (4.0 * np.pi)
         try:
-            f0_ = np.asarray(f0(ion,  s), dtype=np.float64)
+            f0_ = np.asarray(f0(ion, s), dtype=np.float64)
         except Exception:
             f0_ = np.asarray(f0(elem, s), dtype=np.float64)
         if skip_anomalous:
@@ -154,14 +158,13 @@ class FormFactors:
     @beartype
     def fromIons(
         cls,
-        ions:     list[str],
-        energy:   float,
-        qMin:     int | float,
-        qMax:     int | float,
-        step:     float,
+        ions: list[str],
+        energy: float,
+        qMin: int | float,
+        qMax: int | float,
+        step: float,
         log_path: str | None = None,
-    ) -> 'FormFactors':
-
+    ) -> "FormFactors":
         """
         Computes complex form factors for a list of ions over a q grid.
 
@@ -211,11 +214,19 @@ class FormFactors:
             If bounds are invalid.
         """
 
-        if qMin < 0 or qMax < 0 or qMin >= qMax or step <= 0 or (qMax - qMin) < step:
-            raise ValueError(
-                f"Invalid bounds or step size. Ensure qMin={qMin} >= 0 and qMax={qMax} > 0, "
-                f"qMin < qMax, and step={step} is smaller than or equal to the total range."
-            )
+        if (
+            qMin < 0
+            or qMax < 0
+            or qMin >= qMax
+            or step <= 0
+            or (qMax - qMin) < step
+        ):
+            verr1 = "Invalid bounds or step size."
+            verr2 = f" Ensure qMin={qMin} >= 0 and qMax={qMax} > 0, "
+            verr3 = f"qMin < qMax, and step={step} "
+            verr4 = "is smaller than or equal to the total range"
+            verr  = verr1 + verr2 + verr3 + verr4
+            raise ValueError(verr)
 
         num_elements = int(round((qMax - qMin) / step)) + 1
         qvals = np.linspace(qMin, qMax, num_elements, dtype=np.float64)
@@ -232,25 +243,31 @@ class FormFactors:
                 log_lines.append(f"DUMMY   {ion}")
                 continue
 
-            # Tier 2 - f0-only: Chantler tabulation missing or energy out of range
+            # Tier 2 - f0-only: Chantler tabulation missing/energy out of range
             try:
                 cls._validate_energy(ion, energy)
             except ValueError:
                 log_lines.append(f"F0-ONLY {ion}")
-                ff_dict[ion] = cls._calc_formfact(ion, qvals, energy, skip_anomalous=True)
+                ff_dict[ion] = cls._calc_formfact(
+                    ion, qvals, energy, skip_anomalous=True
+                )
                 continue
 
             # Tier 3 - full form factor
-            ff_dict[ion] = cls._calc_formfact(ion, qvals, energy, skip_anomalous=False)
+            ff_dict[ion] = cls._calc_formfact(
+                ion, qvals, energy, skip_anomalous=False
+            )
 
         if log_path is not None and log_lines:
-            with open(log_path, 'w') as _fh:
-                _fh.write('\n'.join(log_lines) + '\n')
+            with open(log_path, "w") as _fh:
+                _fh.write("\n".join(log_lines) + "\n")
 
         if not ff_dict:
-            raise ValueError(
-                f"All {len(ions)} input ions were classified as dummy sites (no electron density). "
-                "Check that ion symbols are valid element names."
-            )
-        return cls(ions=list(ff_dict.keys()), qvals=qvals, ff=ff_dict, energy=energy)
-
+            verr1 = f"All {len(ions)} input ions were"
+            verr2 = " classified as dummy sites (no electron density). "
+            verr3 = "Check that ion symbols are valid element names."
+            verr  = verr1 + verr2 + verr3
+            raise ValueError(verr)
+        return cls(
+            ions=list(ff_dict.keys()), qvals=qvals, ff=ff_dict, energy=energy
+        )

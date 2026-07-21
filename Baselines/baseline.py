@@ -1,35 +1,40 @@
-import xraydb
 import re
 import time
+from abc import ABC, abstractmethod
+from collections.abc import Iterable
+
 import numpy as np
 import torch
+import xraydb
+from beartype import beartype
+from jaxtyping import Float, jaxtyped
 
-from abc                 import ABC, abstractmethod
-from collections.abc     import Iterable
-from jaxtyping           import Float, jaxtyped
-from beartype            import beartype
+from Preprocess import VOCAB
 from ScatterNet.batching import Batch
-from Preprocess          import VOCAB
 
-_QCHUNK_BUDGET: int = 16_000_000   # target element count for a (Qc, S, S) intermediate
+_QCHUNK_BUDGET: int = (
+    16_000_000  # target element count for a (Qc, S, S) intermediate
+)
+
 
 def q_chunks(nq: int, s: int):
-    """Yield (a, b) q-index ranges so each (Qc, S, S) block stays ~<= budget elements.
+    """Yield (a, b) q-index ranges so each (Qc, S, S) block stays <= budget.
 
-    Every pairwise-sinc baseline builds a (q, atom, atom) intermediate, which is
-    what dominates memory: it grows as S^2, so a single large molecule can ask
-    for gigabytes in one allocation. Chunking over q bounds that intermediate no
-    matter how big S gets.
+    Every pairwise-sinc baseline builds a (q, atom, atom) intermediate,
+    which is what dominates memory: it grows as S^2, so a single large
+    molecule can ask for gigabytes in one allocation. Chunking over q
+    bounds that intermediate no matter how big S gets.
     """
     qc = max(1, _QCHUNK_BUDGET // (s * s))
     for a in range(0, nq, qc):
         yield a, min(a + qc, nq)
 
+
 @jaxtyped(typechecker=beartype)
 def build_fmag_table(
-    qgrid:  Float[torch.Tensor, "Q"],
+    qgrid: Float[torch.Tensor, "Q"],  # noqa: F821
     energy: float,
-) -> Float[torch.Tensor, "V Q"]:
+) -> Float[torch.Tensor, "V Q"]:  # noqa: F722
     """Build atomic form factor magnitude table for all VOCAB ions.
 
     Index 0 is the padding sentinel (all zeros). For transuranic ions the
@@ -61,23 +66,23 @@ def build_fmag_table(
             resolved = VOCAB.SPECIAL_CASES[key]
             f_mag = torch.tensor(
                 np.hypot(
-                    xraydb.f0(resolved, sgrid) +
-                    xraydb.f1_chantler(resolved, energy),
+                    xraydb.f0(resolved, sgrid)
+                    + xraydb.f1_chantler(resolved, energy),
                     xraydb.f2_chantler(resolved, energy),
                 )
             ).float()
         else:
-            elem = re.sub(r'[0-9+\-]+$', '', key)
+            elem = re.sub(r"[0-9+\-]+$", "", key)
             f_mag = torch.tensor(
                 np.hypot(
-                    xraydb.f0(ion, sgrid) +
-                    xraydb.f1_chantler(elem, energy),
+                    xraydb.f0(ion, sgrid) + xraydb.f1_chantler(elem, energy),
                     xraydb.f2_chantler(elem, energy),
                 )
             ).float()
         table[idx + 1] = f_mag
 
     return table
+
 
 class Baseline(ABC):
     """Abstract base class for all baseline scattering-curve predictors.
@@ -113,7 +118,9 @@ class Baseline(ABC):
 
     @abstractmethod
     @jaxtyped(typechecker=beartype)
-    def __call__(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:
+    def __call__(
+        self, batch: Batch
+    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
         """Predict I(q) for every molecule in a batch.
 
         Parameters
@@ -132,8 +139,8 @@ class Baseline(ABC):
     def timed_call(
         self,
         batch: Batch,
-    ) -> tuple[Float[torch.Tensor, "N Q"], float]:
-        """Predict I(q) for a batch while measuring wall-clock time per atom.
+    ) -> tuple[Float[torch.Tensor, "N Q"], float]:  # noqa: F722
+        """Predict I(q) for a batch, measuring wall-clock time per atom.
 
         Wraps ``__call__`` so every baseline - existing and future, with no
         changes to the subclass itself - can be compared on cost per atom on
@@ -161,19 +168,20 @@ class Baseline(ABC):
         Returns
         -------
         tuple of (torch.Tensor, float)
-            ``(pred, wall_seconds_per_atom)``. ``pred`` is identical to calling
-            this baseline directly, shape ``(N, Q)``. ``wall_seconds_per_atom``
-            is the CUDA-synchronized wall time spent inside ``__call__`` divided
-            by the total number of real, non-padding atoms across the batch.
-            0.0 if the batch has no real atoms.
+            ``(pred, wall_seconds_per_atom)``. ``pred`` is identical to
+            calling this baseline directly, shape ``(N, Q)``.
+            ``wall_seconds_per_atom`` is the CUDA-synchronized wall time
+            spent inside ``__call__`` divided by the total number of real,
+            non-padding atoms across the batch. 0.0 if the batch has no
+            real atoms.
         """
         n_atoms = int(batch.padding_mask().sum().item())
-        cuda    = torch.cuda.is_available()
+        cuda = torch.cuda.is_available()
 
         if cuda:
             torch.cuda.synchronize()
-        start   = time.perf_counter()
-        pred    = self(batch)
+        start = time.perf_counter()
+        pred = self(batch)
         if cuda:
             torch.cuda.synchronize()
         elapsed = time.perf_counter() - start

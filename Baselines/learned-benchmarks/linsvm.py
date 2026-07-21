@@ -1,23 +1,24 @@
-import torch
-import numpy as np
+from collections.abc import Iterable
 
-from collections.abc              import Iterable
-from jaxtyping                    import Float, jaxtyped
-from beartype                     import beartype
-from sklearn.preprocessing        import StandardScaler
+import numpy as np
+import torch
+from beartype import beartype
+from jaxtyping import Float, jaxtyped
 from sklearn.kernel_approximation import Nystroem
-from sklearn.svm                  import LinearSVR
-from ScatterNet.batching          import Batch
-from Preprocess                   import VOCAB
-from Baselines.baseline           import Baseline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVR
+
+from Baselines.baseline import Baseline
+from Preprocess import VOCAB
+from ScatterNet.batching import Batch
 
 
 def _median_heuristic_gamma(
-    X:            np.ndarray,
-    sample_size:  int = 1000,
+    X: np.ndarray,
+    sample_size: int = 1000,
     random_state: int = 0,
 ) -> float:
-    """Estimate an RBF gamma from the data via the median pairwise-distance heuristic.
+    """Estimate an RBF gamma via the median pairwise-distance heuristic.
 
     The RBF kernel is ``exp(-gamma * ||x - x'||**2)``: gamma controls how
     quickly similarity decays with distance. A large gamma makes each point
@@ -47,13 +48,13 @@ def _median_heuristic_gamma(
         Estimated gamma. Falls back to 1.0 if every sampled pairwise
         distance is zero (degenerate/constant features).
     """
-    rng    = np.random.default_rng(random_state)
-    n      = X.shape[0]
-    idx    = rng.choice(n, size=min(sample_size, n), replace=False)
+    rng = np.random.default_rng(random_state)
+    n = X.shape[0]
+    idx = rng.choice(n, size=min(sample_size, n), replace=False)
     sample = X[idx]
 
-    sq_dists       = np.sum((sample[:, None, :] - sample[None, :, :]) ** 2, axis=-1)
-    triu           = sq_dists[np.triu_indices_from(sq_dists, k=1)]
+    sq_dists = np.sum((sample[:, None, :] - sample[None, :, :]) ** 2, axis=-1)
+    triu = sq_dists[np.triu_indices_from(sq_dists, k=1)]
     median_sq_dist = np.median(triu)
 
     return float(1.0 / median_sq_dist) if median_sq_dist > 0 else 1.0
@@ -80,9 +81,9 @@ class Linsvm(Baseline):
 
     def __init__(
         self,
-        n_components: int          = 500,
-        gamma:        float | None = None,
-        random_state: int          = 4209,
+        n_components: int = 500,
+        gamma: float | None = None,
+        random_state: int = 4209,
     ) -> None:
         """Store hyperparameters; the pipeline itself is built in ``fit``.
 
@@ -103,12 +104,12 @@ class Linsvm(Baseline):
         None
         """
         self._n_components = n_components
-        self._gamma         = gamma
-        self._random_state  = random_state
+        self._gamma = gamma
+        self._random_state = random_state
 
-        self._scaler:   StandardScaler | None = None
-        self._nystroem: Nystroem       | None = None
-        self._heads:    list[LinearSVR]       = []
+        self._scaler: StandardScaler | None = None
+        self._nystroem: Nystroem | None = None
+        self._heads: list[LinearSVR] = []
 
     def _molecule_features(self, batch: Batch) -> np.ndarray:
         """Compute a fixed-size feature vector per molecule in a batch.
@@ -125,57 +126,62 @@ class Linsvm(Baseline):
             composition fractions, atom count, and radius of gyration.
         """
         N, M = batch.vocab.shape
-        V    = len(VOCAB) + 1
+        V = len(VOCAB) + 1
 
-        dev      = batch.vocab.device
-        mask     = batch.padding_mask().float()
-        counts   = torch.zeros(N, V, device=dev).scatter_add_(
+        dev = batch.vocab.device
+        mask = batch.padding_mask().float()
+        counts = torch.zeros(N, V, device=dev).scatter_add_(
             1, batch.vocab.long(), torch.ones(N, M, device=dev)
         )
-        counts[:, 0] = 0.0                                    # drop the padding token
-        n_atoms      = counts.sum(dim=1, keepdim=True).clamp(min=1)
-        fractions    = counts / n_atoms                       # per-element composition
+        counts[:, 0] = 0.0  # drop the padding token
+        n_atoms = counts.sum(dim=1, keepdim=True).clamp(min=1)
+        fractions = counts / n_atoms  # per-element composition
 
-        r2  = (batch.coord ** 2).sum(dim=-1)                  # squared distance per atom
+        r2 = (batch.coord**2).sum(dim=-1)  # squared distance per atom
         rg2 = (r2 * mask).sum(dim=1, keepdim=True) / n_atoms
-        rg  = rg2.clamp(min=0).sqrt()                         # radius of gyration
+        rg = rg2.clamp(min=0).sqrt()  # radius of gyration
 
-        # log1p the size pair: atom counts span 1..6046 and I(0) grows ~n^2, so the
-        # log1p(I) target is ~linear in log(n). On the raw scale a handful of huge
-        # molecules sit orders of magnitude from the rest and dominate the pairwise
-        # distances the RBF kernel is built from.
-        size  = torch.log1p(torch.cat([n_atoms, rg], dim=1))
+        # log1p the size pair: atom counts span 1..6046 and I(0) grows
+        # ~n^2, so log1p(I) is ~linear in log(n). On the raw scale a
+        # handful of huge molecules sit orders of magnitude from the rest
+        # and dominate the pairwise distances the RBF kernel is built
+        # from.
+        size = torch.log1p(torch.cat([n_atoms, rg], dim=1))
         feats = torch.cat([fractions, size], dim=1)
         return feats.cpu().numpy()
 
     def _scale(self, X: np.ndarray) -> np.ndarray:
-        """Standardize the two trailing size columns only, leaving fractions untouched.
+        """Standardize the two trailing size columns; leave fractions alone.
 
-        The leading block is per-element composition *fractions*: already bounded
-        to [0, 1] and comparable column-to-column, so they need no rescaling.
-        Standardizing them is actively harmful here. A rare ion appears in only a
-        few molecules, so its column's std is ~1e-3, and dividing by that turns a
-        fraction of 0.25 into a value of ~80. Those inflated columns then dominate
-        the pairwise distances ``_median_heuristic_gamma`` measures, so the gamma
-        it returns is fitted to an artifact of the scaling rather than to real
-        composition structure (measured: gamma 0.11 with the fractions scaled vs
-        0.47 without, i.e. a kernel roughly 4x too wide, which underfits). Unlike
-        the MLP the RBF kernel is bounded, so this shows up as a quietly mediocre
-        fit rather than an explosion: MSLE 0.359 -> 0.104 and R^2(log1p) 0.951 ->
-        0.986 on the same data once the fractions are left alone.
+        The leading block is per-element composition *fractions*: already
+        bounded to [0, 1] and comparable column-to-column, so they need no
+        rescaling. Standardizing them is actively harmful here. A rare ion
+        appears in only a few molecules, so its column's std is ~1e-3, and
+        dividing by that turns a fraction of 0.25 into a value of ~80.
+        Those inflated columns then dominate the pairwise distances
+        ``_median_heuristic_gamma`` measures, so the gamma it returns is
+        fitted to an artifact of the scaling rather than to real
+        composition structure (measured: gamma 0.11 with the fractions
+        scaled vs 0.47 without, i.e. a kernel roughly 4x too wide, which
+        underfits). Unlike the MLP the RBF kernel is bounded, so this
+        shows up as a quietly mediocre fit rather than an explosion: MSLE
+        0.359 -> 0.104 and R^2(log1p) 0.951 -> 0.986 on the same data once
+        the fractions are left alone.
 
         Parameters
         ----------
         X : numpy.ndarray
-            Raw feature matrix from ``_molecule_features``, shape ``(N, V + 2)``.
+            Raw feature matrix from ``_molecule_features``, shape
+            ``(N, V + 2)``.
 
         Returns
         -------
         numpy.ndarray
-            Same shape, with only the trailing ``n_atoms``/``rg`` columns scaled.
+            Same shape, with only the trailing ``n_atoms``/``rg`` columns
+            scaled.
         """
         Z = X.copy()
-        Z[:, -2:] = self._scaler.transform(X[:, -2:])   # type: ignore
+        Z[:, -2:] = self._scaler.transform(X[:, -2:])  # type: ignore
         return Z
 
     def fit(self, loader: Iterable[Batch]) -> "Linsvm":
@@ -209,30 +215,33 @@ class Linsvm(Baseline):
         X = np.concatenate(X_parts, axis=0)
         Y = np.concatenate(Y_parts, axis=0)  # (n_samples, Q)
 
-        # fit the scaler on the size pair only -- see _scale for why the fraction
-        # block is deliberately left unscaled
+        # fit the scaler on the size pair only -- see _scale for why the
+        # fraction block is deliberately left unscaled
         self._scaler = StandardScaler().fit(X[:, -2:])
-        X_scaled     = self._scale(X)
+        X_scaled = self._scale(X)
 
         gamma = (
-            self._gamma if self._gamma is not None
-            else _median_heuristic_gamma(X_scaled, random_state=self._random_state)
+            self._gamma
+            if self._gamma is not None
+            else _median_heuristic_gamma(
+                X_scaled, random_state=self._random_state
+            )
         )
 
         self._nystroem = Nystroem(
-            kernel       = "rbf",
-            gamma        = gamma,
-            n_components = self._n_components,
-            random_state = self._random_state,
+            kernel="rbf",
+            gamma=gamma,
+            n_components=self._n_components,
+            random_state=self._random_state,
         ).fit(X_scaled)
         X_transformed = self._nystroem.transform(X_scaled)
 
         self._heads = []
         for q in range(Y.shape[1]):
             head = LinearSVR(
-                dual         = False,
-                loss         = "squared_epsilon_insensitive",
-                random_state = self._random_state,
+                dual=False,
+                loss="squared_epsilon_insensitive",
+                random_state=self._random_state,
             )
             head.fit(X_transformed, Y[:, q])
             self._heads.append(head)
@@ -240,7 +249,9 @@ class Linsvm(Baseline):
         return self
 
     @jaxtyped(typechecker=beartype)
-    def __call__(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:
+    def __call__(
+        self, batch: Batch
+    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
         """Predict I(q) for a batch of molecules.
 
         Parameters
@@ -263,8 +274,8 @@ class Linsvm(Baseline):
             raise RuntimeError("Linsvm must be fit before calling")
 
         device = batch.vocab.device
-        X             = self._molecule_features(batch)
-        X_scaled      = self._scale(X)
+        X = self._molecule_features(batch)
+        X_scaled = self._scale(X)
         X_transformed = self._nystroem.transform(X_scaled)
 
         log_preds = np.stack(

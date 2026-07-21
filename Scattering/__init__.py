@@ -1,4 +1,4 @@
-from .molecule        import Molecule
-from .formfact        import FormFactors
-from .spherical_funcs import sphHarm, sphBess
-from .stuhrmann       import StuhrmannMixin
+from .formfact import FormFactors
+from .molecule import Molecule
+from .spherical_funcs import sphBess, sphHarm
+from .stuhrmann import StuhrmannMixin

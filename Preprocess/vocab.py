@@ -1,11 +1,12 @@
-import xraydb
 from dataclasses import dataclass
 from typing import ClassVar
 
+import xraydb
+
+
 @dataclass(frozen=True)
 class _IonVocab:
-
-    """Static xraydb ion vocabulary, shared across all modules via the VOCAB singleton.
+    """Static xraydb ion vocabulary, shared across modules via VOCAB.
 
     Private; import VOCAB, not this class.
 
@@ -17,17 +18,31 @@ class _IonVocab:
         Mapping from lowercase ion symbol to its 1-based VOCAB index.
     """
 
-    # AS OF 2026: 98 neutral elements + 111 ionic forms + 2 special cases (sival, cval)
+    # AS OF 2026: 98 neutral elements + 111 ionic forms + 2 special
+    # cases (sival, cval)
     SPECIAL_CASES: ClassVar[dict[str, str]] = {"siva": "si", "cval": "c"}
-    
-    # transuranics have f0 but no f1/f2
-    TRANSURANICS:  ClassVar[frozenset[str]] = frozenset({
-        "np","np3+","np4+","np6+","pu","pu3+","pu4+","pu6+","am","cm","bk","cf"
-    })
 
-    ions:   tuple[str, ...]
-    index:  dict[str, int] 
-	
+    # transuranics have f0 but no f1/f2
+    TRANSURANICS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "np",
+            "np3+",
+            "np4+",
+            "np6+",
+            "pu",
+            "pu3+",
+            "pu4+",
+            "pu6+",
+            "am",
+            "cm",
+            "bk",
+            "cf",
+        }
+    )
+
+    ions: tuple[str, ...]
+    index: dict[str, int]
+
     @classmethod
     def load(cls) -> "_IonVocab":
         """Build the vocabulary from the xraydb f0 ion list.
@@ -41,7 +56,10 @@ class _IonVocab:
             1-based index mapping.
         """
         ions = tuple(xraydb.get_xraydb().f0_ions())
-        return cls(ions=ions, index={ion.lower(): idx+1 for idx, ion in enumerate(ions)})
+        return cls(
+            ions=ions,
+            index={ion.lower(): idx + 1 for idx, ion in enumerate(ions)},
+        )
 
     def __len__(self) -> int:
         """Return the number of ions in the vocabulary.
@@ -83,10 +101,10 @@ class _IonVocab:
             The 1-based index for a string input, or the ion symbol
             for an int input.
         """
-        if   isinstance(ion, str):
+        if isinstance(ion, str):
             return self.index[ion]
         elif isinstance(ion, int):
-            return self.ions[ion-1]
+            return self.ions[ion - 1]
 
     @property
     def size(self) -> int:
@@ -99,5 +117,5 @@ class _IonVocab:
         """
         return len(self.ions)
 
-VOCAB: _IonVocab = _IonVocab.load()
 
+VOCAB: _IonVocab = _IonVocab.load()

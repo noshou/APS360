@@ -1,12 +1,12 @@
-import numpy        as np
+import numpy as np
 import numpy.typing as npt
+from beartype import beartype
 
-from beartype   import beartype
 from .stuhrmann import StuhrmannMixin
+
 
 @beartype
 class Molecule(StuhrmannMixin):
-
     """
     Immutable representation of a molecule.
 
@@ -24,20 +24,21 @@ class Molecule(StuhrmannMixin):
     """
 
     _coords: npt.NDArray[np.float64]  # (n, 3); x, y, z in Å
-    _angles: npt.NDArray[np.float64]  # (n, 2); theta (polar, 0→π), phi (azimuthal, 0→2π)
-    _r:      npt.NDArray[np.float64]  # (n,)  ; radial distances in Å
-    _elms:   list[str]                # element symbols for each atom
-    _name:   str                      # molecule name
+    _angles: npt.NDArray[
+        np.float64
+    ]  # (n, 2); theta (polar, 0→π), phi (azimuthal, 0→2π)
+    _r: npt.NDArray[np.float64]  # (n,)  ; radial distances in Å
+    _elms: list[str]  # element symbols for each atom
+    _name: str  # molecule name
 
     def __init__(
         self,
-        x:    npt.NDArray[np.float64],
-        y:    npt.NDArray[np.float64],
-        z:    npt.NDArray[np.float64],
+        x: npt.NDArray[np.float64],
+        y: npt.NDArray[np.float64],
+        z: npt.NDArray[np.float64],
         elms: list[str],
         name: str,
     ):
-
         """
         Initialize a Molecule from Cartesian coordinates.
 
@@ -63,7 +64,9 @@ class Molecule(StuhrmannMixin):
 
         n = len(elms)
         if x.size != n or y.size != n or z.size != n or n == 0:
-            raise ValueError("Molecule: x, y, z, and elms must all be the same length and non-empty")
+            raise ValueError(
+                "Molecule: x, y, z, and elms must be same length and non-empty"
+            )
 
         r = np.sqrt(x**2 + y**2 + z**2)
         coords = np.column_stack((x, y, z))
@@ -72,20 +75,21 @@ class Molecule(StuhrmannMixin):
         # r=0 only occurs for single-atom molecules (atom is its own centroid).
         # j_l(0)=0 for l>0 so the angle is irrelevant; use r_safe to avoid NaN.
         r_safe = np.where(r > 0, r, 1.0)
-        angles = np.column_stack((
-            np.arccos(np.clip(z / r_safe, -1.0, 1.0)),
-            np.arctan2(y, x),
-        ))
+        angles = np.column_stack(
+            (
+                np.arccos(np.clip(z / r_safe, -1.0, 1.0)),
+                np.arctan2(y, x),
+            )
+        )
         coords.flags.writeable = False
         angles.flags.writeable = False
-        r.flags.writeable      = False
+        r.flags.writeable = False
 
         object.__setattr__(self, "_coords", coords)
         object.__setattr__(self, "_angles", angles)
-        object.__setattr__(self, "_r",      r)
-        object.__setattr__(self, "_elms",   elms)
-        object.__setattr__(self, "_name",   name)
-
+        object.__setattr__(self, "_r", r)
+        object.__setattr__(self, "_elms", elms)
+        object.__setattr__(self, "_name", name)
 
     def __setattr__(self, name: str, value: object) -> None:
         """Reject any attempt to set an attribute, enforcing immutability.
@@ -120,8 +124,7 @@ class Molecule(StuhrmannMixin):
         raise AttributeError("Molecule is immutable")
 
     @classmethod
-    def fromXYZ(cls, xyz_fp: str) -> 'Molecule':
-
+    def fromXYZ(cls, xyz_fp: str) -> "Molecule":
         """Load a Molecule from an XYZ file.
 
         XYZ format (strict):
@@ -166,38 +169,60 @@ class Molecule(StuhrmannMixin):
                         declared = int(line2)
                         name = line1.strip()
                     except ValueError:
-                        raise ValueError(f"Molecule.fromXYZ: could not find atom count in first two lines of '{xyz_fp}'")
+                        verr1 = "Molecule.fromXYZ: could not find atom "
+                        verr2 = f"count in first two lines of '{xyz_fp}'"
+                        verr  = verr1 + verr2
+                        raise ValueError(verr)
                 if declared == 0:
-                    raise ValueError(f"Molecule.fromXYZ: file '{xyz_fp}' declares 0 atoms")
+                    raise ValueError(
+                        f"Molecule.fromXYZ: file '{xyz_fp}' declares 0 atoms"
+                    )
                 el = []
                 xs, ys, zs = [], [], []
 
                 for lineno, line in enumerate(f, start=3):
                     parts = line.split()
                     if len(parts) < 4:
-                        raise ValueError(f"Molecule.fromXYZ: expected at least 4 columns on line {lineno}, got {len(parts)}")
+                        verr1 = "Molecule.fromXYZ: expected at least 4 columns"
+                        verr2 = f" on line {lineno}, got {len(parts)}"
+                        verr  = verr1 + verr2
+                        raise ValueError(verr)
                     elm = parts[0]
                     try:
                         xs.append(float(parts[1]))
                         ys.append(float(parts[2]))
                         zs.append(float(parts[3]))
                     except ValueError:
-                        raise ValueError(f"Molecule.fromXYZ: non-numeric coordinate on line {lineno}")
+                        verr1 = "Molecule.fromXYZ: non-numeric coordinate"
+                        verr2 = f" on line {lineno}"
+                        verr  = verr1 + verr2
+                        raise ValueError(verr)
                     el.append(elm)
         except FileNotFoundError:
-            raise FileNotFoundError(f"Molecule.fromXYZ: file '{xyz_fp}' not found")
+            raise FileNotFoundError(
+                f"Molecule.fromXYZ: file '{xyz_fp}' not found"
+            )
 
         if len(el) != declared:
-            raise ValueError(
-                f"Molecule.fromXYZ: declared {declared} atoms but found {len(el)} in '{xyz_fp}'"
-            )
+            verr1 = f"Molecule.fromXYZ: declared {declared} atoms "
+            verr2 = f"but found {len(el)} in '{xyz_fp}'"
+            verr  = verr1 + verr2
+            raise ValueError(verr)
 
         xs = np.array(xs, dtype=np.float64)
         ys = np.array(ys, dtype=np.float64)
         zs = np.array(zs, dtype=np.float64)
-        if not (np.isfinite(xs).all() and np.isfinite(ys).all() and np.isfinite(zs).all()):
-            raise ValueError(f"Molecule.fromXYZ: non-finite coordinate (inf or nan) in '{xyz_fp}'")
-        # Centre at geometric centroid so the Stuhrmann expansion is origin-independent.
+        if not (
+            np.isfinite(xs).all()
+            and np.isfinite(ys).all()
+            and np.isfinite(zs).all()
+        ):
+            verr1 = "Molecule.fromXYZ: non-finite coordinate "
+            verr2 = f"(inf or nan) in '{xyz_fp}'"
+            verr  = verr1 + verr2
+            raise ValueError(verr)
+        # Centre at geometric centroid so the
+        # Stuhrmann expansion is origin-independent.
         xs -= xs.mean()
         ys -= ys.mean()
         zs -= zs.mean()
@@ -327,8 +352,10 @@ class Molecule(StuhrmannMixin):
     def toHDF5(self, group: object) -> None:
         """Serialize structural data into an open h5py Group.
 
-        Writes: coords (float64, (n,3)), angles (float64, (n,2)), r (float64, (n,))
-        all ZFP lossless; elms (str, (n,)) uncompressed; name as a group attribute.
+        Writes: coords (float64, (n,3)),
+        angles (float64, (n,2)), r (float64, (n,))
+        all ZFP lossless; elms (str, (n,)) uncompressed;
+        name as a group attribute.
         I(q) is not stored here.
 
         Parameters
@@ -340,20 +367,24 @@ class Molecule(StuhrmannMixin):
         -------
         None
         """
-        import h5py       # lazy - keeps Scattering independent of storage deps
-        import hdf5plugin # type: ignore[import]
+        import h5py  # lazy - keeps Scattering independent of storage deps
+        import hdf5plugin  # type: ignore[import]
+
         _zfp = hdf5plugin.Zfp(reversible=True)  # type: ignore[attr-defined]
-        group.attrs['name'] = self._name                                        # type: ignore[union-attr]
-        group.create_dataset('coords', data=self._coords, chunks=True, **_zfp)  # type: ignore[union-attr]
-        group.create_dataset('angles', data=self._angles, chunks=True, **_zfp)  # type: ignore[union-attr]
-        group.create_dataset('r',      data=self._r,      chunks=True, **_zfp)  # type: ignore[union-attr]
-        group.create_dataset('elms',   data=np.array(self._elms, dtype=h5py.string_dtype()))  # type: ignore[union-attr]
+        group.attrs["name"] = self._name  # type: ignore[union-attr]
+        group.create_dataset("coords", data=self._coords, chunks=True, **_zfp)  # type: ignore[union-attr]
+        group.create_dataset("angles", data=self._angles, chunks=True, **_zfp)  # type: ignore[union-attr]
+        group.create_dataset("r", data=self._r, chunks=True, **_zfp)  # type: ignore[union-attr]
+        group.create_dataset( # type: ignore
+            "elms", data=np.array(self._elms, dtype=h5py.string_dtype())
+        )  # type: ignore[union-attr]
 
     @classmethod
-    def fromHDF5(cls, group: object) -> 'Molecule':
+    def fromHDF5(cls, group: object) -> "Molecule":
         """Reconstruct a Molecule from an h5py Group written by toHDF5.
 
-        Loads coords, angles, and r directly from the file rather than recomputing.
+        Loads coords, angles, and r directly from the file
+        rather than recomputing.
 
         Parameters
         ----------
@@ -365,19 +396,20 @@ class Molecule(StuhrmannMixin):
         Molecule
             A new Molecule instance reconstructed from the stored data.
         """
-        coords = group['coords'][:]                                             # type: ignore[index]
-        angles = group['angles'][:]                                             # type: ignore[index]
-        r      = group['r'][:]                                                  # type: ignore[index]
-        elms   = [e.decode() if isinstance(e, bytes) else e
-                  for e in group['elms'][:]]                                   # type: ignore[index]
-        name   = str(group.attrs['name'])                                       # type: ignore[union-attr]
+        coords = group["coords"][:]  # type: ignore[index]
+        angles = group["angles"][:]  # type: ignore[index]
+        r = group["r"][:]  # type: ignore[index]
+        elms = [
+            e.decode() if isinstance(e, bytes) else e for e in group["elms"][:] #type: ignore
+        ]  # type: ignore[index]
+        name = str(group.attrs["name"])  # type: ignore[union-attr]
         mol = cls.__new__(cls)
         coords.flags.writeable = False
         angles.flags.writeable = False
-        r.flags.writeable      = False
-        object.__setattr__(mol, '_coords', coords)
-        object.__setattr__(mol, '_angles', angles)
-        object.__setattr__(mol, '_r',      r)
-        object.__setattr__(mol, '_elms',   elms)
-        object.__setattr__(mol, '_name',   name)
+        r.flags.writeable = False
+        object.__setattr__(mol, "_coords", coords)
+        object.__setattr__(mol, "_angles", angles)
+        object.__setattr__(mol, "_r", r)
+        object.__setattr__(mol, "_elms", elms)
+        object.__setattr__(mol, "_name", name)
         return mol

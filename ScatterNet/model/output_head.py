@@ -1,43 +1,43 @@
+from collections import OrderedDict
+from typing import Callable
+
 import torch
 import torch.nn.functional as F
+from beartype import beartype
+from beartype.typing import Tuple
+from jaxtyping import Float, jaxtyped
+from numpy import floor, log2
+from torch import nn
 
-from torch                   import nn
-from jaxtyping               import Float, jaxtyped
-from beartype                import beartype
-from beartype.typing         import Tuple
-from ..batching              import Batch
-from .layer_head             import LayerHead
+from ..batching import Batch
 from ..utils.no_trilin_bilin import NoTrilinBilin
-from collections             import OrderedDict
-from numpy                   import log2, floor
-from typing                  import Callable
+from .layer_head import LayerHead
+
 
 class OutputHead(nn.Module):
-
     """
     Collapses per-atom contributions into a predicted I(q) curve.
 
-    For each atom, combines its embedding with its form factor magnitude via a bilinear
-    layer, passes the result through an MLP, weights by f_mags^2 (Debye diagonal prior),
-    and sums over atoms to produce I(q) per molecule.
+    For each atom, combines its embedding with its form factor magnitude
+    via a bilinear layer, passes the result through an MLP, weights
+    by f_mags^2, and sums over atoms to produce I(q) per molecule.
 
     The forward pass is chunked to avoid storing the
     (N, M, Q, lambda_3) bilinear output tensor.
     """
 
     _bilinear: NoTrilinBilin
-    _mlp:      nn.Sequential
-    _fwd_fn:   Callable
-    
+    _mlp: nn.Sequential
+    _fwd_fn: Callable
+
     def __init__(
         self,
-        lambda_1:  int,
-        lambda_3:  int,
-        lambda_4:  int,
+        lambda_1: int,
+        lambda_3: int,
+        lambda_4: int,
         out_chunk: int,
-        compile:   bool = False
+        compile: bool = False,
     ) -> None:
-
         """Build the bilinear layer and compression MLP.
 
         Parameters
@@ -67,16 +67,14 @@ class OutputHead(nn.Module):
 
         super().__init__()
         self._out_chunk = out_chunk
-        
+
         if lambda_4 <= 0:
             raise ValueError("lambda_4 must be > 0")
         if lambda_4 > floor(log2(lambda_3)):
-            raise ValueError(f"lambda_4 must be <= {int(floor(log2(lambda_3)))} for lambda_3={lambda_3}")
-        
-        # NoTrilinBilin, not nn.Bilinear: in2_features=1 here, the exact degenerate
-        # case NoTrilinBilin targets (see its docstring) - also avoids nn.Bilinear's
-        # F.bilinear op forcing a torch.compile graph break (aten::_trilinear isn't
-        # Inductor-supported), so this now fuses into the surrounding compiled graph.
+            verr1 = f"lambda_4 must be <= {int(floor(log2(lambda_3)))}"
+            verr2 = f" for lambda_3={lambda_3}"
+            verr  = verr1 + verr2
+            raise ValueError(verr)
         self._bilinear = NoTrilinBilin(lambda_1, 1, lambda_3)
 
         dims = [lambda_3 // 2**i for i in range(lambda_4 + 1)]
@@ -85,15 +83,24 @@ class OutputHead(nn.Module):
 
         ldicts = OrderedDict()
         for i in range(len(dims) - 1):
-            ldicts[f"layer_{i}"] = nn.Linear(dims[i], dims[i+1])
+            ldicts[f"layer_{i}"] = nn.Linear(dims[i], dims[i + 1])
             if i < len(dims) - 2:
                 ldicts[f"activation_{i}"] = nn.Mish()
         self._mlp = nn.Sequential(ldicts)
-        self._fwd_fn = torch.compile(self._forward_fn, dynamic=True, fullgraph=True) if compile else self._forward_fn
-        
-    @staticmethod
-    def _forward_fn(bilinear, mlp, emb_c, fmag_c, mask_c):
+        self._fwd_fn = (
+            torch.compile(self._forward_fn, dynamic=True, fullgraph=True)
+            if compile
+            else self._forward_fn
+        )
 
+    @staticmethod
+    def _forward_fn( # no jaxtype/beartype cuz torch.compile will break
+        bilinear: NoTrilinBilin,
+        mlp: torch.nn.Sequential,
+        emb_c: torch.Tensor,
+        fmag_c: torch.Tensor,
+        mask_c: torch.Tensor
+    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
         """Compute the Debye-sum I(q) contribution for one atom chunk.
 
         Parameters
@@ -119,30 +126,30 @@ class OutputHead(nn.Module):
         """
 
         # (N,M,Q, λ₁) x (N,M,Q,1) -> (N,M,Q,λ₃)
-        atomic   = F.mish(bilinear(emb_c, fmag_c))
+        atomic = F.mish(bilinear(emb_c, fmag_c))
 
         # MLP compression -> (N,M,Q,1) -> Squeeze to (N,M,Q)
         contribs = F.softplus(mlp(atomic)).squeeze(-1)
 
-        # Debye weighting + atom-sum forced to fp32 (autocast disabled): fmc**2 is the
-        # SQUARED form factor (up to ~1e4 for heavy atoms) and this reduces over M atoms,
-        # so in fp16 (amp) the sum and its GradScaler-amplified backward overflow 65504 -
-        # a second large-magnitude atom-sum alongside MessagePass's aggregation. It's a
-        # cheap elementwise + reduce, so fp32 here is ~free; the bilinear + mlp above stay
-        # in fp16. No-op when amp is off.
+        # Debye weighting + atom-sum forced to fp32 (autocast disabled):
+        # fmc**2 is the squared form factor (up to ~1e4 for heavy atoms)
+        # and this reduces over M atoms, so in fp16 (amp) the sum and its
+        # GradScaler-amplified backward overflow 65504.
         with torch.autocast(device_type=emb_c.device.type, enabled=False):
-            fmc = fmag_c.squeeze(-1).float()                            # (N, Mc, Q)
-            return (contribs.float() * fmc**2 * mask_c.float()).sum(dim=1)   # (N, Q), fp32
-        
+            fmc = fmag_c.squeeze(-1).float()  # (N, Mc, Q)
+            return (contribs.float() * fmc**2 * mask_c.float()).sum(
+                dim=1
+            )  # (N, Q), fp32
+
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
-        batch:    Batch,
+        batch: Batch,
         msg_head: LayerHead,
     ) -> Tuple[
-            Float[torch.Tensor, "N Q"], 
-            Float[torch.Tensor, "N M Q"],
-            Float[torch.Tensor, "N M Q"]
+            Float[torch.Tensor, "N Q"],   # noqa: F722
+            Float[torch.Tensor, "N M Q"], # noqa: F722
+            Float[torch.Tensor, "N M Q"], # noqa: F722
         ]:
 
         """Accumulate the Debye sum over atom chunks to predict I(q).
@@ -167,27 +174,28 @@ class OutputHead(nn.Module):
 
         # 1. initialize values
         N, M, Q, _ = msg_head.embeds.shape
-        mask       = batch.padding_mask().unsqueeze(-1).to(msg_head.embeds.dtype)  # (N, M, 1)
-        
-        # accumulate the Debye sum over atom-chunks; chunking avoids materialising
-        # the full (N, M, Q, λ₃) bilinear tensor for large molecules. fp32 accumulator:
-        # the running I(q) sum (Σ over atoms of contribs·f²) reaches ~1e5-1e6 for large
-        # molecules and would overflow fp16 if amp made embeds.dtype half; keep it fp32
-        # regardless of autocast (matches the fp32 per-chunk partials above; loss casts).
-        iq_accum   = torch.zeros(N, Q, device=msg_head.embeds.device, dtype=torch.float32)
-        
+        mask = (
+            batch.padding_mask().unsqueeze(-1).to(msg_head.embeds.dtype)
+        )  # (N, M, 1)
+
+        # accumulate the Debye sum over atom-chunks.
+        iq_accum = torch.zeros(
+            N, Q, device=msg_head.embeds.device, dtype=torch.float32
+        )
+
         # 2. Accumulate over chunks
         for mol1 in range(0, M, self._out_chunk):
             mol2 = min(mol1 + self._out_chunk, M)
-            # .contiguous(): these views' stride/storage_offset vary by mol1 (which
-            # chunk), and torch.compile guards on stride()/storage_offset() in addition
-            # to shape - causing extra recompiles beyond the intended chunk-size guard.
+            # .contiguous(): these views' stride/storage_offset
+            # vary by mol1 (which chunk), and torch.compile guards on
+            # stride()/storage_offset() in addition to shape causing
+            # extra recompiles beyond the intended chunk-size guard.
             iq_accum += self._fwd_fn(
                 self._bilinear,
                 self._mlp,
                 msg_head.embeds[:, mol1:mol2].contiguous(),
                 msg_head.f_mags[:, mol1:mol2].contiguous(),
-                mask[:, mol1:mol2].contiguous()
+                mask[:, mol1:mol2].contiguous(),
             )
 
         # 3. return output head

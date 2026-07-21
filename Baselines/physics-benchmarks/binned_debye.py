@@ -1,9 +1,10 @@
 import torch
+from beartype import beartype
+from jaxtyping import Float, jaxtyped
 
-from jaxtyping           import Float, jaxtyped
-from beartype            import beartype
+from Baselines.baseline import Baseline, build_fmag_table
 from ScatterNet.batching import Batch
-from Baselines.baseline  import Baseline, build_fmag_table
+
 
 class BinnedDebyeBaseline(Baseline):
     """
@@ -22,13 +23,13 @@ class BinnedDebyeBaseline(Baseline):
     structure beyond a coarse-grained histogram of pairwise distances.
     """
 
-    _qgrid:      Float[torch.Tensor, "Q"]
-    _fmag_table: Float[torch.Tensor, "V Q"]
-    _n_bins:     int
+    _qgrid: Float[torch.Tensor, "Q"]  # noqa: F722,F821
+    _fmag_table: Float[torch.Tensor, "V Q"]  # noqa: F722
+    _n_bins: int
 
     def __init__(
         self,
-        qgrid:  Float[torch.Tensor, "Q"],
+        qgrid: Float[torch.Tensor, "Q"],  # noqa: F722,F821
         energy: float,
         n_bins: int = 200,
     ) -> None:
@@ -42,12 +43,12 @@ class BinnedDebyeBaseline(Baseline):
         n_bins : int, default 200
             Number of histogram bins spanning ``[0, r_max]`` per molecule.
         """
-        self._qgrid      = qgrid
-        self._n_bins     = n_bins
+        self._qgrid = qgrid
+        self._n_bins = n_bins
         self._fmag_table = build_fmag_table(qgrid, energy)
 
     @jaxtyped(typechecker=beartype)
-    def __call__(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:
+    def __call__(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
         """Return the binned-Debye-sum I(q) per molecule. O(M²) per molecule.
 
         Parameters
@@ -61,23 +62,23 @@ class BinnedDebyeBaseline(Baseline):
             Predicted I(q) curves of shape ``(N, Q)``.
         """
         device = batch.coord.device
-        mask   = batch.padding_mask()           # (N, M)
-        qgrid  = self._qgrid.to(device)
+        mask = batch.padding_mask()  # (N, M)
+        qgrid = self._qgrid.to(device)
         ftable = self._fmag_table.to(device)
         n_bins = self._n_bins
 
-        preds: list[Float[torch.Tensor, "Q"]] = []
+        preds: list[Float[torch.Tensor, "Q"]] = []  # noqa: F722,F821
 
         for n in range(batch.coord.shape[0]):
             coords_n = batch.coord[n][mask[n]]  # (m, 3)
-            vocab_n  = batch.vocab[n][mask[n]]
+            vocab_n = batch.vocab[n][mask[n]]
             m = coords_n.shape[0]
 
-            f0  = ftable[vocab_n, 0]            # (m,) |f_i(0)| per atom
-            diag = (f0 ** 2).sum()              # i==j self-scattering term
+            f0 = ftable[vocab_n, 0]  # (m,) |f_i(0)| per atom
+            diag = (f0**2).sum()  # i==j self-scattering term
 
             if m < 2:
-                qr   = qgrid * 0.0
+                qr = qgrid * 0.0
                 preds.append(diag * torch.ones_like(qgrid))
                 continue
 
@@ -86,15 +87,15 @@ class BinnedDebyeBaseline(Baseline):
             if m > MAX_M:
                 sub = torch.randperm(m, device=device)[:MAX_M]
                 coords_n = coords_n[sub]
-                vocab_n  = vocab_n[sub]
-                f0       = f0[sub]
+                vocab_n = vocab_n[sub]
+                f0 = f0[sub]
                 m = MAX_M
 
-            diff  = coords_n.unsqueeze(0) - coords_n.unsqueeze(1)  # (m, m, 3)
-            dists = diff.norm(dim=-1)                               # (m, m)
-            idx   = torch.triu_indices(m, m, offset=1, device=device)
-            r_ij  = dists[idx[0], idx[1]]                           # (P,)
-            w_ij  = f0[idx[0]] * f0[idx[1]]                         # (P,)
+            diff = coords_n.unsqueeze(0) - coords_n.unsqueeze(1)  # (m, m, 3)
+            dists = diff.norm(dim=-1)  # (m, m)
+            idx = torch.triu_indices(m, m, offset=1, device=device)
+            r_ij = dists[idx[0], idx[1]]  # (P,)
+            w_ij = f0[idx[0]] * f0[idx[1]]  # (P,)
 
             r_max = r_ij.max()
             if r_max <= 0:
@@ -105,11 +106,17 @@ class BinnedDebyeBaseline(Baseline):
             weight_sum = torch.zeros(n_bins, device=device)
             weight_sum.scatter_add_(0, bin_idx, w_ij)
 
-            r_centers = (torch.arange(n_bins, device=device).float() + 0.5) * r_max / n_bins
-            qr   = qgrid.unsqueeze(1) * r_centers.unsqueeze(0)      # (Q, n_bins)
-            sinc = torch.where(qr.abs() < 1e-8, torch.ones_like(qr), torch.sin(qr) / qr)
+            r_centers = (
+                (torch.arange(n_bins, device=device).float() + 0.5)
+                * r_max
+                / n_bins
+            )
+            qr = qgrid.unsqueeze(1) * r_centers.unsqueeze(0)  # (Q, n_bins)
+            sinc = torch.where(
+                qr.abs() < 1e-8, torch.ones_like(qr), torch.sin(qr) / qr
+            )
 
-            offdiag = 2.0 * (sinc @ weight_sum)                     # (Q,)
+            offdiag = 2.0 * (sinc @ weight_sum)  # (Q,)
             preds.append(diag + offdiag)
 
         return torch.stack(preds)

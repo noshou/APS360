@@ -1,153 +1,30 @@
+import re
+from dataclasses import replace as _dc_replace
+from typing import Callable
+
+import numpy as np
 import torch
 import torch.distributed as dist
-
-from dataclasses     import replace as _dc_replace
-from torch           import nn
-from jaxtyping       import Float, jaxtyped
-from beartype        import beartype
+import xraydb
+from beartype import beartype
 from beartype.typing import Tuple
-from .batching       import Batch
-from .model          import Embed, MessagePass, OutputHead
+from jaxtyping import Float, jaxtyped
+from torch import nn
 
+from Preprocess import VOCAB
 
-class _DistributedSum(torch.autograd.Function):
-    """
-    All-reduce (SUM) in the forward pass; identity in the backward pass.
-
-    Used for partial I(q) sums from each rank's atom shard. Since both ranks
-    compute the same loss after the all-reduce, ∂L/∂partial_iq is already the
-    global gradient on every rank - no backward communication is needed.
-    """
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        """Sum-reduce `x` across all ranks in the process group.
-
-        Parameters
-        ----------
-        ctx : torch.autograd.function.FunctionCtx
-            Autograd context (unused; nothing needs to be saved for backward).
-        x : torch.Tensor
-            Local partial tensor (e.g. a partial I(q) sum) to be summed
-            across ranks.
-
-        Returns
-        -------
-        torch.Tensor
-            `x` all-reduced (summed) across every rank in the process group.
-        """
-        x = x.clone()
-        dist.all_reduce(x, op=dist.ReduceOp.SUM)
-        return x
-
-    @staticmethod
-    def backward(ctx, grad: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        """Pass the incoming gradient through unchanged.
-
-        Parameters
-        ----------
-        ctx : torch.autograd.function.FunctionCtx
-            Autograd context (unused).
-        grad : torch.Tensor
-            Gradient of the loss with respect to this function's output.
-
-        Returns
-        -------
-        torch.Tensor
-            `grad` unchanged; the gradient is already global on every rank
-            since all ranks compute the same loss after the forward all-reduce.
-        """
-        return grad
-
-
-class _AllGatherDim1(torch.autograd.Function):
-    """
-    Gather per-atom tensors from all ranks along the atom dimension (dim 1).
-
-    Forward: each rank contributes its shard; all ranks receive the full M tensor.
-    Padding is used when the last rank's shard is smaller than ceil(M / world_size).
-
-    Backward: each rank receives only the gradient slice for its own atoms.
-    No cross-rank communication is needed in the backward pass because the
-    gradient is already global (loss was computed identically on all ranks).
-    """
-
-    @staticmethod
-    def forward(  # type: ignore[override]
-        ctx,
-        x:      torch.Tensor,
-        m0:     int,
-        M_full: int,
-    ) -> torch.Tensor:
-        """Gather per-atom shards from every rank along the atom dimension.
-
-        Parameters
-        ----------
-        ctx : torch.autograd.function.FunctionCtx
-            Autograd context; used to stash `m0` and the local shard width
-            (`M_local`) for `backward`.
-        x : torch.Tensor
-            This rank's local shard, shape (N, M_local, ...).
-        m0 : int
-            Starting atom index of this rank's shard within the full
-            `M_full` atoms.
-        M_full : int
-            Total (unsharded) number of atoms across all ranks.
-
-        Returns
-        -------
-        torch.Tensor
-            Tensor of shape (N, M_full, ...) with every rank's shard
-            concatenated along dim 1, with any padding trimmed off.
-        """
-        ws       = dist.get_world_size()
-        N        = x.shape[0]
-        M_local  = x.shape[1]
-        rest     = x.shape[2:]
-        max_shard = (M_full + ws - 1) // ws
-
-        if M_local < max_shard:
-            pad   = x.new_zeros(N, max_shard - M_local, *rest)
-            x_pad = torch.cat([x, pad], dim=1)
-        else:
-            x_pad = x
-
-        gathered = [torch.zeros_like(x_pad) for _ in range(ws)]
-        dist.all_gather(gathered, x_pad.contiguous())
-
-        ctx.m0      = m0
-        ctx.M_local = M_local
-        return torch.cat(gathered, dim=1)[:, :M_full]
-
-    @staticmethod
-    def backward(ctx, grad: torch.Tensor):  # type: ignore[override]
-        """Slice out the gradient belonging to this rank's atom shard.
-
-        Parameters
-        ----------
-        ctx : torch.autograd.function.FunctionCtx
-            Autograd context holding `m0` and `M_local` saved in `forward`.
-        grad : torch.Tensor
-            Gradient of the loss with respect to the gathered
-            (N, M_full, ...) output.
-
-        Returns
-        -------
-        torch.Tensor
-            Gradient slice for this rank's own atoms, shape
-            (N, M_local, ...).
-        None
-            Placeholder gradient for the `m0` argument (not a tensor).
-        None
-            Placeholder gradient for the `M_full` argument (not a tensor).
-        """
-        return grad[:, ctx.m0 : ctx.m0 + ctx.M_local].contiguous(), None, None
+from .batching import Batch
+from .model import Embed, MessagePass, OutputHead
+from .utils.all_gather import AllGatherDim1
+from .utils.distributed_sum import DistributedSum
 
 
 class ScatterNet(nn.Module):
-
     """
     Full ScatterNet pipeline: Embed → MessagePass → OutputHead → I(q).
+
+    Also computes the training loss: Kratky MSLE plus form-factor and
+    sigma penalties.
 
     When a distributed process group is active (torch.distributed initialised)
     and the model is training, each batch is routed to one of two parallelism
@@ -167,12 +44,12 @@ class ScatterNet(nn.Module):
         1. Embed runs on the full batch on every rank (cheap, per-atom lookup).
         2. Each rank slices its atom shard from embed_head.
         3. MessagePass runs on the shard; an all-reduce inside MessagePass
-           reconstructs the global RFF context (features, chem_env) between
-           the two passes so every atom still attends to all others.
+        reconstructs the global RFF context (features, chem_env) between
+        the two passes so every atom still attends to all others.
         4. OutputHead produces partial I(q) and per-atom f_mags/sigmas for
-           the shard.
+        the shard.
         5. I(q) is summed across ranks (all-reduce); f_mags and sigmas are
-           gathered back to full M.
+        gathered back to full M.
 
     Data-parallel (DP) - training, M < dp_atom_threshold, AND N >= 2*mol_chunk:
         Molecules are divided across ranks (no atom sharding, no in-model
@@ -201,39 +78,56 @@ class ScatterNet(nn.Module):
         lambda_4:  number of halving steps in OutputHead MLP
         lambda_5:  number of RFF features in MessagePass
         atm_chunk: atoms per M-chunk in MessagePass and OutputHead
-        mol_chunk: molecules per N-chunk in MessagePass (controls chem_env peak size)
+        mol_chunk: molecules per N-chunk in MessagePass
         dp_atom_threshold: see class docstring; 0 = always TP
-        q_points:  number of q-grid points (Q)
+        qgrid:     q-grid tensor, shape (Q,)
+        energy:    X-ray energy (eV) for xraydb form factors
         eps_embd:  numerical floor for Embed
         eps_msgp:  numerical floor for MessagePass
-        compile:   torch.compile Embed/MessagePass/OutputHead's checkpointed step functions
+        compile:   torch.compile checkpointed step functions
+
+    Attributes
+    ----------
+    _fmag_table : torch.Tensor
+        Reference form factor magnitudes per vocabulary entry per
+        q-point, shape (V, Q) where V = len(VOCAB) + 1.
+    _q_weights_ : torch.Tensor
+        Kratky weighting (1 + q^2), shape (1, Q).
+    _s_weights_ : torch.Tensor
+        q-dependent weighting for the sigma penalty, shape (1, Q).
+        Proportional to q^2, normalised to mean 1 over the grid (see
+        __init__).
     """
 
-    _emb:      Embed
-    _msg:      MessagePass
-    _out:      OutputHead
+    _emb: Embed
+    _msg: MessagePass
+    _out: OutputHead
     _eps_embd: Float
     _eps_msgp: Float
     _dp_atom_threshold: int
-    _mol_chunk:         int
+    _mol_chunk: int
+    _fmag_table: Float[torch.Tensor, "V Q"]  # noqa: F722
+    _q_weights_: Float[torch.Tensor, "1 Q"]  # noqa: F722
+    _s_weights_: Float[torch.Tensor, "1 Q"]  # noqa: F722
+    _fwd_fn: Callable
 
     def __init__(
         self,
-        lambda_1:  int,
-        lambda_2:  int,
-        lambda_3:  int,
-        lambda_4:  int,
-        lambda_5:  int,
-        msg_seed:  int,
+        lambda_1: int,
+        lambda_2: int,
+        lambda_3: int,
+        lambda_4: int,
+        lambda_5: int,
+        msg_seed: int,
         atm_chunk: int,
         mol_chunk: int,
-        q_points:  int,
-        eps_embd:  float,
-        eps_msgp:  float,
+        qgrid: Float[torch.Tensor, "Q"],  # noqa: F722,F821
+        energy: float,
+        eps_embd: float,
+        eps_msgp: float,
         dp_atom_threshold: int = 0,
-        compile:   bool = False,
+        compile: bool = False,
     ) -> None:
-
         """Construct the Embed, MessagePass, and OutputHead submodules.
 
         Parameters
@@ -255,8 +149,11 @@ class ScatterNet(nn.Module):
         mol_chunk : int
             Molecules per N-chunk in MessagePass (controls chem_env peak
             size).
-        q_points : int
-            Number of q-grid points (Q).
+        qgrid : torch.Tensor
+            Q-grid points, shape (Q,).
+        energy : float
+            X-ray energy (eV) used to evaluate anomalous scattering
+            factors f1/f2 via xraydb.
         eps_embd : float
             Numerical floor used inside Embed.
         eps_msgp : float
@@ -275,23 +172,222 @@ class ScatterNet(nn.Module):
         """
 
         super().__init__()
-        self._emb      = Embed(lambda_1, q_points, compile=compile)
-        self._msg      = MessagePass(lambda_1, lambda_2, lambda_5, msg_seed, q_points, n_chunk=mol_chunk, m_chunk=atm_chunk, compile=compile)
-        self._out      = OutputHead(lambda_1, lambda_3, lambda_4, atm_chunk, compile=compile)
+        q_points = qgrid.shape[0]
+        self._emb = Embed(lambda_1, q_points, compile=compile)
+        self._msg = MessagePass(
+            lambda_1,
+            lambda_2,
+            lambda_5,
+            msg_seed,
+            q_points,
+            n_chunk=mol_chunk,
+            m_chunk=atm_chunk,
+            compile=compile,
+        )
+        self._out = OutputHead(
+            lambda_1, lambda_3, lambda_4, atm_chunk, compile=compile
+        )
         self._eps_embd = eps_embd
         self._eps_msgp = eps_msgp
         self._dp_atom_threshold = dp_atom_threshold
         self._mol_chunk = mol_chunk
 
-    @jaxtyped(typechecker=beartype)
-    def forward(self, batch: Batch) -> Tuple[
-            Float[torch.Tensor, "N Q"],
-            Float[torch.Tensor, "N M Q"],
-            Float[torch.Tensor, "N M Q"],
-            Batch,
-            float,
-        ]:
+        fmag_table = torch.zeros(len(VOCAB) + 1, len(qgrid))
 
+        # convert q vector to s vector
+        sgrid = (qgrid / (4 * torch.pi)).numpy()
+
+        # special cases:
+        # 1. ion is transuranic,  skip f1/f2
+        # 2. ion is special case, map to appropriate base case
+        # 3. ion is not in vocab, use ground state
+        for idx, ion in enumerate(VOCAB.ions):
+            key = ion.lower()
+            if key in VOCAB.TRANSURANICS:
+                f_mag = torch.tensor(xraydb.f0(ion, sgrid)).float()
+            elif key in VOCAB.SPECIAL_CASES:
+                resolved = VOCAB.SPECIAL_CASES[key]
+                f_mag = torch.tensor(
+                    np.hypot(
+                        xraydb.f0(resolved, sgrid)
+                        + xraydb.f1_chantler(resolved, energy),
+                        xraydb.f2_chantler(resolved, energy),
+                    )
+                ).float()
+            else:
+                elem = re.sub(r"[0-9+\-]+$", "", key)
+                f_mag = torch.tensor(
+                    np.hypot(
+                        xraydb.f0(ion, sgrid)
+                        + xraydb.f1_chantler(elem, energy),
+                        xraydb.f2_chantler(elem, energy),
+                    )
+                ).float()
+            fmag_table[idx + 1] = f_mag
+
+        self.register_buffer("_fmag_table", fmag_table)
+        self.register_buffer("_q_weights_", (1 + qgrid**2).unsqueeze(0))
+
+        # Sigma-penalty weighting, ~q^2. sigma is the message-passing kernel's
+        # range (MessagePass scales coordinates as r/sigma,
+        # so large sigma = long range), and the real-space distances
+        # a scattering vector q is sensitive to go like 1/q.
+        # A flat L2 penalty on sigma fights the model everywhere in the same
+        # units, and since low q is exactly long-range structure info lives,
+        # it crushes the kernel range where I(q) needs it most.
+        #
+        # At q = 0 the weight is exactly 0 (the grid starts there),
+        # i.e. sigma is left unconstrained at that q-point. This works out
+        # since I(0) is the forward-scattering limit, where sin(qr)/(qr) -> 1
+        # and the intensity reduces to (sum of form factors)^2.
+        # This is independent of the coordinates, and thus of the kernel range.
+        s_weights = qgrid**2
+        s_weights = s_weights / s_weights.mean().clamp(min=1e-12)
+        self.register_buffer("_s_weights_", s_weights.unsqueeze(0))
+        self._fwd_fn = (
+            torch.compile(self._loss_fn, dynamic=True, fullgraph=True)
+            if compile
+            else self._loss_fn
+        )
+
+    @staticmethod
+    def _loss_fn(  # can't jaxtype here bc of torch.compile graph breaking
+        fmag_table: torch.Tensor,
+        q_weights: torch.Tensor,
+        s_weights: torch.Tensor,
+        output_head: torch.Tensor,
+        f_mag_pred: torch.Tensor,
+        sigma_pred: torch.Tensor,
+        iqval: torch.Tensor,
+        vocab: torch.Tensor,
+        mask: torch.Tensor,
+        lambda_6: float,
+        lambda_7: float,
+    ) -> torch.Tensor:
+        """Compute the total training loss.
+
+        Sums the Kratky MSLE, form-factor penalty, and sigma penalty,
+        then averages over molecules and q-points.
+
+        Parameters
+        ----------
+        fmag_table : torch.Tensor
+            Reference form factor magnitudes per vocabulary entry per
+            q-point, shape (V, Q).
+        q_weights : torch.Tensor
+            Kratky weighting (1 + q^2), shape (1, Q).
+        s_weights : torch.Tensor
+            Sigma-penalty weighting (~q^2, mean 1), shape (1, Q).
+        output_head : torch.Tensor
+            Predicted I(q), shape (N, Q).
+        f_mag_pred : torch.Tensor
+            Predicted form factor magnitudes, shape (N, M, Q).
+        sigma_pred : torch.Tensor
+            Predicted sigma bandwidths, shape (N, M, Q).
+        iqval : torch.Tensor
+            Reference I(q), shape (N, Q).
+        vocab : torch.Tensor
+            Atom vocabulary indices, shape (N, M).
+        mask : torch.Tensor
+            Padding mask, shape (N, M); True marks a real (non-padding)
+            atom.
+        lambda_6 : float
+            Weight on the form-factor penalty term.
+        lambda_7 : float
+            Weight on the sigma L2 penalty term (q-weighted; see __init__).
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar total loss.
+        """
+
+        # Kratky-weighted MSLE: (1+q²) * (log1p(Î(q)) - log1p(I(q)))²
+        residual = torch.log1p(output_head) - torch.log1p(iqval)
+        msle_loss = q_weights * residual**2  # (N, Q)
+
+        mask_2d = mask.unsqueeze(-1)  # (N, M, 1)
+        n_atoms = mask.sum(dim=1, keepdim=True).float().clamp(min=1)  # (N, 1)
+
+        # form-factor penalty.
+        # log1p-normalized L2 vs xraydb reference, atom-count-normalized
+        f_mag_real = torch.log1p(fmag_table[vocab])
+        f_mag_pred = torch.log1p(f_mag_pred)
+        ff_penalty = (
+            (lambda_6 * ((f_mag_pred - f_mag_real) ** 2)) * mask_2d
+        ).sum(dim=1) / n_atoms  # (N, Q)
+
+        # sigma L2 penalty.
+        sg_sum = (torch.pow(sigma_pred, 2) * mask_2d).sum(
+            dim=1
+        ) / n_atoms  # (N, Q)
+        sg_penalty = lambda_7 * s_weights * sg_sum  # (N, Q)
+
+        return (msle_loss + ff_penalty + sg_penalty).mean()
+
+    @jaxtyped(typechecker=beartype)
+    def compute_loss(
+        self,
+        output_head: Float[torch.Tensor, "N Q"],  # noqa: F722
+        f_mag_pred: Float[torch.Tensor, "N M Q"],  # noqa: F722
+        sigma_pred: Float[torch.Tensor, "N M Q"],  # noqa: F722
+        batch: Batch,
+        lambda_6: float,
+        lambda_7: float,
+    ) -> Float[torch.Tensor, ""]:  # noqa: F722
+        """Compute the total training loss.
+
+        Sums the Kratky MSLE, form-factor penalty, and sigma penalty,
+        then averages over molecules and q-points.
+
+        Parameters
+        ----------
+        output_head : torch.Tensor
+            Predicted I(q), shape (N, Q).
+        f_mag_pred : torch.Tensor
+            Predicted form factor magnitudes, shape (N, M, Q).
+        sigma_pred : torch.Tensor
+            Predicted sigma bandwidths, shape (N, M, Q).
+        batch : Batch
+            Input batch with reference I(q), vocab, and padding mask.
+        lambda_6 : float
+            Weight on the form-factor penalty term.
+        lambda_7 : float
+            Weight on the sigma L2 penalty term (q-weighted; see __init__).
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar total loss.
+        """
+        # .contiguous(): output_head/f_mag_pred/sigma_pred/mask come from
+        # upstream concatenation/squeeze ops whose stride can vary run to
+        # run, and torch.compile guards on stride() in addition to shape -
+        # causing avoidable recompiles.
+        return self._fwd_fn(
+            self._fmag_table,
+            self._q_weights_,
+            self._s_weights_,
+            output_head.contiguous(),
+            f_mag_pred.contiguous(),
+            sigma_pred.contiguous(),
+            batch.iqval,
+            batch.vocab,
+            batch.padding_mask(),
+            lambda_6,
+            lambda_7,
+        )
+
+    @jaxtyped(typechecker=beartype)
+    def forward(
+        self, batch: Batch
+    ) -> Tuple[
+        Float[torch.Tensor, "N Q"],  # noqa: F722
+        Float[torch.Tensor, "N M Q"],  # noqa: F722
+        Float[torch.Tensor, "N M Q"],  # noqa: F722
+        Batch,
+        float,
+    ]:
         """Run the ScatterNet forward pass, routing to TP, DP, or single-GPU.
 
         Parameters
@@ -321,7 +417,7 @@ class ScatterNet(nn.Module):
         """
 
         embed_head = self._emb(batch, self._eps_embd)
-        dist_on    = dist.is_available() and dist.is_initialized()
+        dist_on = dist.is_available() and dist.is_initialized()
 
         if not dist_on:
             msg_head = self._msg(batch, embed_head, self._eps_msgp)
@@ -334,66 +430,63 @@ class ScatterNet(nn.Module):
             self._dp_atom_threshold > 0
             and M < self._dp_atom_threshold
             # DP halves the N-chunk loop but does NOT halve M (unlike TP, which
-            # shards M before MessagePass's own atm_chunk-loop runs on it), so a
-            # DP-routed bucket runs the M-chunk loop over the *full* M - roughly
-            # 2x the inner-loop launches TP would've had on the same bucket. That
-            # only pays for itself if halving N actually shrinks the outer loop;
+            # shards M before MessagePass's own atm_chunk-loop runs on it), so
+            # DP-routed bucket runs the M-chunk loop over the *full* M. That
+            # only pays for itself if halving N shrinks the outer loop,
             # if N already fits in one N-chunk (N < 2*mol_chunk), splitting it
-            # buys nothing while still eating the un-halved-M cost, so stay on TP.
+            # buys nothing while but eats the un-halved-M cost, so stay on TP.
             and N >= 2 * self._mol_chunk
         )
 
         if route_dp:
-            rank  = dist.get_rank()
-            ws    = dist.get_world_size()
-            N     = batch.vocab.shape[0]
+            rank = dist.get_rank()
+            ws = dist.get_world_size()
+            N = batch.vocab.shape[0]
             shard = (N + ws - 1) // ws
-            n0    = rank * shard
-            n1    = min(n0 + shard, N)
+            n0 = rank * shard
+            n1 = min(n0 + shard, N)
 
             local_batch = _dc_replace(
                 batch,
-                vocab = batch.vocab[n0:n1],
-                iqval = batch.iqval[n0:n1],
-                coord = batch.coord[n0:n1],
+                vocab=batch.vocab[n0:n1],
+                iqval=batch.iqval[n0:n1],
+                coord=batch.coord[n0:n1],
             )
             local_head = embed_head._replace(
-                embeds = embed_head.embeds[n0:n1],
-                f_mags = embed_head.f_mags[n0:n1],
-                sigmas = embed_head.sigmas[n0:n1],
+                embeds=embed_head.embeds[n0:n1],
+                f_mags=embed_head.f_mags[n0:n1],
+                sigmas=embed_head.sigmas[n0:n1],
             )
-            # use_all_reduce=False: each rank holds a disjoint set of molecules here,
+            # use_all_reduce=False: each rank holds a disjoint set of mols,
             # not a shard of the SAME molecules like TP, so there is nothing to
-            # reconcile across ranks. This is required for correctness, not just an
-            # optimization - see MessagePass._all_reduce's docstring for the deadlock
-            # this avoids (DP's two ranks can have different local N, hence a
-            # different number of N-chunk rounds and all_reduce calls, if this were
-            # left on).
-            msg_head           = self._msg(local_batch, local_head, self._eps_msgp, use_all_reduce=False)
+            # reconcile across ranks.
+            msg_head = self._msg(
+                local_batch, local_head, self._eps_msgp, use_all_reduce=False
+            )
             iq, f_mags, sigmas = self._out(local_batch, msg_head)
             return iq, f_mags, sigmas, local_batch, (n1 - n0) / N
 
-        rank  = dist.get_rank()
-        ws    = dist.get_world_size()
+        rank = dist.get_rank()
+        ws = dist.get_world_size()
         shard = (M + ws - 1) // ws
-        m0    = rank * shard
-        m1    = min(m0 + shard, M)
+        m0 = rank * shard
+        m1 = min(m0 + shard, M)
 
         shard_batch = _dc_replace(
             batch,
-            vocab = batch.vocab[:, m0:m1],
-            coord = batch.coord[:, m0:m1],
+            vocab=batch.vocab[:, m0:m1],
+            coord=batch.coord[:, m0:m1],
         )
         shard_head = embed_head._replace(
-            embeds = embed_head.embeds[:, m0:m1],
-            f_mags = embed_head.f_mags[:, m0:m1],
-            sigmas = embed_head.sigmas[:, m0:m1],
+            embeds=embed_head.embeds[:, m0:m1],
+            f_mags=embed_head.f_mags[:, m0:m1],
+            sigmas=embed_head.sigmas[:, m0:m1],
         )
 
-        msg_head           = self._msg(shard_batch, shard_head, self._eps_msgp)
+        msg_head = self._msg(shard_batch, shard_head, self._eps_msgp)
         iq, f_mags, sigmas = self._out(shard_batch, msg_head)
 
-        iq     = _DistributedSum.apply(iq)                       # type: ignore[assignment]
-        f_mags = _AllGatherDim1.apply(f_mags, m0, M)             # type: ignore[assignment]
-        sigmas = _AllGatherDim1.apply(sigmas, m0, M)             # type: ignore[assignment]
+        iq = DistributedSum.apply(iq)  # type: ignore[assignment]
+        f_mags = AllGatherDim1.apply(f_mags, m0, M)  # type: ignore[assignment]
+        sigmas = AllGatherDim1.apply(sigmas, m0, M)  # type: ignore[assignment]
         return iq, f_mags, sigmas, batch, 1.0
