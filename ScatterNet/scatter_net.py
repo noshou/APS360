@@ -225,8 +225,10 @@ class ScatterNet(nn.Module):
                 ).float()
             fmag_table[idx + 1] = f_mag
 
-        self.register_buffer("_fmag_table", fmag_table)
-        self.register_buffer("_q_weights_", (1 + qgrid**2).unsqueeze(0))
+        self.register_buffer("_fmag_table", fmag_table, persistent=False)
+        self.register_buffer(
+            "_q_weights_", (1 + qgrid**2).unsqueeze(0), persistent=False
+        )
 
         # Sigma-penalty weighting, ~q^2. sigma is the message-passing kernel's
         # range (MessagePass scales coordinates as r/sigma,
@@ -243,7 +245,9 @@ class ScatterNet(nn.Module):
         # This is independent of the coordinates, and thus of the kernel range.
         s_weights = qgrid**2
         s_weights = s_weights / s_weights.mean().clamp(min=1e-12)
-        self.register_buffer("_s_weights_", s_weights.unsqueeze(0))
+        self.register_buffer(
+            "_s_weights_", s_weights.unsqueeze(0), persistent=False
+        )
         self._fwd_fn = (
             torch.compile(self._loss_fn, dynamic=True, fullgraph=True)
             if compile
