@@ -5,39 +5,6 @@ from torch import nn
 
 
 class NoTrilinBilin(nn.Module):
-    """Mathematically identical replacement
-    for ``nn.Bilinear`` that avoids the `_trilinear` kernel.
-
-    ``nn.Bilinear`` dispatches to a generic `_trilinear` autograd op that
-    profiled as one of the two dominant CUDA kernels in this model (tied with
-    `bmm`), and it doesn't specialize for the degenerate shapes this model
-    actually uses (`in2_features=1` in `OutputHead`, `out_features=1` in
-    `MessagePass`). This class computes the exact same bilinear form via one
-    matmul (`x1 @ W`) plus an elementwise multiply-and-reduce over
-    `in2_features`, routing through the same well-optimized GEMM kernel
-    already dominant elsewhere in the model instead of a separate, less
-    launch-efficient op.
-
-    When to use it
-    ---------------
-    Use this in place of ``nn.Bilinear`` whenever `min(out_features,
-    in2_features) == 1`, or is otherwise small - i.e. one side of the
-    bilinear form is a near-scalar. Both current call sites are this shape:
-    `OutputHead` (`in2_features=1`) and `MessagePass._sigbilin`
-    (`out_features=1`). In that regime this class strictly wins: same math,
-    same init, fewer/cheaper kernel launches (matmul + elementwise instead of
-    `_trilinear`), and compile-friendly.
-
-    When NOT to use it
-    -------------------
-    Avoid it when both `out_features` and `in2_features` are large. The
-    intermediate `temp` tensor this class materializes has shape
-    ``(..., out_features, in2_features)`` - `nn.Bilinear`'s fused kernel
-    never allocates that full tensor, so on a genuine (large, large) bilinear
-    form, this decomposition costs strictly more memory for no compute
-    benefit. Profile before reusing this class outside its current call
-    sites; don't assume the win here generalizes.
-    """
 
     weight: nn.Parameter
     bias: "nn.Parameter | None"
@@ -49,7 +16,31 @@ class NoTrilinBilin(nn.Module):
         out_features: int,
         bias: bool = True,
     ) -> None:
-        """Construct the layer and initialize its parameters.
+        """Mathematically identical replacement
+        for ``nn.Bilinear`` that avoids the `_trilinear` kernel.
+
+        ``nn.Bilinear`` dispatches to a generic `_trilinear` autograd op that
+        can be very inneficient with small input features due to CUDA
+        kernel launch overheads. This class computes the exact same bilinear
+        form via one matmul (`x1 @ W`) plus an elementwise multiply-and-reduce
+        over `in2_features`, routing through the well-optimized GEMM kernel.
+
+        When to use it
+        ---------------
+        Use this in place of ``nn.Bilinear`` whenever `min(out_features,
+        in2_features) == 1`, or is otherwise small - i.e. one side of the
+        bilinear form is a near-scalar.
+
+        When NOT to use it
+        -------------------
+        Avoid it when both `out_features` and `in2_features` are large. The
+        intermediate `temp` tensor this class materializes has shape
+        ``(..., out_features, in2_features)`` which needs to be allocated.
+        `nn.Bilinear`'s fused kernel never allocates that full tensor, so on a
+        genuine (large, large) bilinear form, this decomposition costs
+        strictly more memory for no compute benefit. Profile before reusing
+        this class outside its current call sites;
+        don't assume the win here generalizes.
 
         Parameters
         ----------
@@ -97,8 +88,7 @@ class NoTrilinBilin(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        """Compute the bilinear form `y = x1 @ W @ x2 + bias`.
-
+        """
         Parameters
         ----------
         x1 : torch.Tensor

@@ -54,11 +54,21 @@ class StuhrmannMixin:
     """
 
     # Provided by the host class (e.g. Molecule) this mixin is combined
-    # with; declared here so static type checkers recognize them.
-    elms: list[str]
-    theta: npt.NDArray[np.float64]
-    phi: npt.NDArray[np.float64]
-    r: npt.NDArray[np.float64]
+    # with; declared here as properties (not plain annotations) so a host
+    # class overriding them with its own @property doesn't trip pyright's
+    # reportIncompatibleVariableOverride (a property override of a plain
+    # variable declaration is flagged; property-over-property is not).
+    @property
+    def elms(self) -> list[str]: ...
+
+    @property
+    def theta(self) -> npt.NDArray[np.float64]: ...
+
+    @property
+    def phi(self) -> npt.NDArray[np.float64]: ...
+
+    @property
+    def r(self) -> npt.NDArray[np.float64]: ...
 
     @beartype
     def stuhrmann(

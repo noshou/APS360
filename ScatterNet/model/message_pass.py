@@ -911,12 +911,8 @@ class MessagePass(nn.Module):
                     )
                     cont = self._pass_1(cont, eps)
                     cont = cont._replace(
-                        features=self._all_reduce(
-                            cont.features, use_all_reduce
-                        ),
-                        chem_env=self._all_reduce(
-                            cont.chem_env, use_all_reduce
-                        ),
+                        features=self._all_reduce(cont.features,use_all_reduce),
+                        chem_env=self._all_reduce(cont.chem_env,use_all_reduce)
                     )
                     # Mean-normalise the atom-sums. features/chem_env are
                     # Σ over all atoms (O(M): ~1e3-1e4 for a large molecule),

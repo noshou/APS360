@@ -31,9 +31,7 @@ class Embed(nn.Module):
     _prelu: nn.PReLU        # prelu activation function
     _sigma: NoTrilinBilin   # computes positional scaling
                             # factor based on embed and f_mag
-    _fwd_fn: (
-        Callable  # torch.compiled or plain _forward_fn, per the compile flag
-    )
+    _fwd_fn: (Callable)     # torch.compiled or plain _forward_fn flag
 
     def __init__(
         self,
@@ -59,8 +57,8 @@ class Embed(nn.Module):
 
         super().__init__()
         self._mbd = nn.Embedding(
-            len(VOCAB) + 1, lambda_1, padding_idx=0
-        )  # +1 since 0 is padding idx
+            len(VOCAB) + 1, lambda_1, padding_idx=0 # +1 since 0 is padding idx
+        )
         self._f0f1 = nn.Linear(lambda_1, qPoints)
         self._f2 = nn.Linear(lambda_1, qPoints)
         self._prelu = nn.PReLU(lambda_1)
