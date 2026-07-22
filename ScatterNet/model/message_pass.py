@@ -939,9 +939,7 @@ class MessagePass(nn.Module):
                 # via reference, so it's bound as a default arg (evaluated
                 # once, at definition time, per outer-loop iteration)
                 # instead, for the same reason.
-                def _n_chunk_round(  # noqa: ANN001
-                    emb_s, msk_s, ffs_s, sig_s, crd_s, round_idx=round_idx
-                ):
+                def _n_chunk_round(emb_s, msk_s, ffs_s, sig_s, crd_s, round_idx=round_idx):  # noqa: ANN001, E501
                     Nc_s = emb_s.shape[0]
                     cont = self._PassContainer(
                         M=M,
