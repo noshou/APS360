@@ -512,7 +512,7 @@ _CFG_SECTIONS: list[tuple[str, tuple[str, ...]]] = [
             "hdf5",
             "encodings_sqlite3_path",
             "ckpt_best",
-            "ckpt_resume",
+            "ckpt_dir",
             "resume",
         ),
     ),

@@ -8,8 +8,11 @@
 # or Kaggle (noso0s0n/iql50); see Preprocess/README.md.
 hdf5:                    Preprocess/I(q)@L=50.h5
 encodings_sqlite3_path:  Preprocess/iq_train_set-ENCODING.sqlite3
-ckpt_best:   scatternet_best.pt
-ckpt_resume: scatternet_resume.pt
+ckpt_best: scatternet_best.pt
+# Directory for numbered resume checkpoints; each mid-epoch/epoch-boundary save
+# writes its own file (checkpoint_<epoch>_<batch>.pt, "final" at epoch boundaries)
+# instead of overwriting a single fixed path.
+ckpt_dir:  checkpoints
 
 # Everything the run records, per epoch, under {data_dir}/epoch_{N:03d}/: metrics.json
 # (that epoch's train/val/test loss + R2), loss_per_batch.png, loss_per_epoch.png, and
@@ -26,7 +29,7 @@ ckpt_resume: scatternet_resume.pt
 # model architecture
 lambda_1: 128
 lambda_2: 4
-lambda_3: 64
+lambda_3: 256
 lambda_4: 4
 lambda_5: 128
 msg_seed: 42
@@ -50,7 +53,7 @@ eps_msgp: 1.0e-3
 # loss (RunConfig.__post_init__ coerces these to float, so an int like `1` won't
 # crash later inside the beartype-guarded Loss.loss() call -- still write 1.0, not 1)
 lambda_6: 1.0
-lambda_7: 0.5
+lambda_7: 0.15
 
 # optimiser / training loop
 lr:            1.3e-4

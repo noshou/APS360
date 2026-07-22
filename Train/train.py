@@ -71,7 +71,7 @@ def _rclone_push(path: str, dest: str | None):
             stderr=subprocess.PIPE,
         )
     except Exception as e:
-        print(f"  [rclone] push of {path} -> {dest} failed: {e}", flush=True)
+        print(f"  [rclone] push of {path} -> {dest} failed: {e}")
 
 
 # profiler
@@ -350,7 +350,7 @@ class _LoopProfiler:
                     f"peak_alloc={g_peak:.2f}G"
                 )
 
-        print("\n".join(lines), flush=True)
+        print("\n".join(lines))
 
 
 # CLI
@@ -374,7 +374,7 @@ def _parse_args():
     p.add_argument("--hdf5", default=None)
     p.add_argument("--encodings_sqlite3_path", default=None)
     p.add_argument("--ckpt_best", default=None)
-    p.add_argument("--ckpt_resume", default=None)
+    p.add_argument("--ckpt_dir", default=None)
     p.add_argument("--resume", default=None, help="path to resume checkpoint")
 
     # model
@@ -555,7 +555,6 @@ def evaluate(
                     f"  [{label}] batch {_bi + 1:5d}/{n_batch}  "
                     f"loss {total_loss / max(total_mols, 1)}  "
                     f"{rate} batch/s",
-                    flush=True,
                 )
     mean_loss = total_loss / total_mols
     ss_tot = sum_y2 - sum_y**2 / n_elem
@@ -677,7 +676,6 @@ def _worker(rank: int, cfg: RunConfig):
                 f"train={len(train_set)}/{n_trn}  "
                 f"val={len(val_set)}/{n_val}  "
                 f"test={len(test_set)}/{n_tst} batches",
-                flush=True,
             )
 
     pin = device != "cpu" and not str(device).startswith("privateuseone")
@@ -852,7 +850,7 @@ def _worker(rank: int, cfg: RunConfig):
                 rows = train_set._batches[i]
                 return f"{len(rows)} mols x {max(r[2] for r in rows)} atoms"
 
-            print(f"[profiler] probing {mode}", flush=True)
+            print(f"[profiler] probing {mode}")
             n_hm, n_hmax = prof_group_bounds
             for label, group, proxy_fn in (
                 ("worst N*M_shard", worst[:n_hm], _bucket_nm_proxy),
@@ -864,7 +862,6 @@ def _worker(rank: int, cfg: RunConfig):
                         f"  {label:<16s} "
                         f"proxy={proxy_fn(group[0]):<8d} "
                         f"{_describe(group[0])}",
-                        flush=True,
                     )
 
     if rank == 0:
@@ -876,12 +873,10 @@ def _worker(rank: int, cfg: RunConfig):
             f"val={len(val_loader)}  test={len(test_loader)}"
             f"  (buckets; same count by design - each bucket "
             f"contributes one sub-batch per split)",
-            flush=True,
         )
         print(
             f"molecules:     train={train_mols}  val={val_mols}  "
             f"test={test_mols}",
-            flush=True,
         )
 
     # model
@@ -903,8 +898,40 @@ def _worker(rank: int, cfg: RunConfig):
         compile=cfg.compile,
     ).to(device)
 
+    # Biases, norm/gain params, and PReLU/RFF-phase params are excluded from
+    # weight decay: with decoupled_weight_decay=False (classic Adam+L2), decay
+    # gets divided by each param's adaptive sqrt(exp_avg_sq) same as the loss
+    # gradient, so any param with a small gradient-history norm (which these
+    # low-dimensional gate/norm params always have) gets a disproportionately
+    # large relative decay push. Once such a param starts shrinking, its
+    # gradient history shrinks too, amplifying the decay further, a
+    # self-reinforcing collapse to (subnormal) zero - this is exactly what
+    # killed _msg._proj_agg/_rms_norm/_out._bilinear/_out._mlp.layer_0
+    # by epoch 1 of the 2026-07-21 run. decoupled_weight_decay=True switches
+    # to true AdamW-style decay (independent of the adaptive normalization),
+    # and excluding these params from decay entirely is extra insurance
+    # against the same class of parameter dying again.
+    decay_params, no_decay_params = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if (
+            name.endswith(".bias")
+            or "rms_norm" in name
+            or "prelu" in name
+            or "biasterm" in name
+        ):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
     optimizer = torch.optim.Adam(
-        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
+        [
+            {"params": decay_params, "weight_decay": cfg.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=cfg.lr,
+        decoupled_weight_decay=True,
     )
 
     # Mixed precision: fp16 autocast + GradScaler (CUDA only).
@@ -926,7 +953,6 @@ def _worker(rank: int, cfg: RunConfig):
         print(
             "mixed precision: fp16 autocast + GradScaler ON "
             f"(init_scale={cfg.amp_init_scale}, RFF+Debye kept fp32)",
-            flush=True,
         )
 
     start_epoch = 1
@@ -978,7 +1004,6 @@ def _worker(rank: int, cfg: RunConfig):
                 f"batch_idx {saved_bi}, val_loss {best_val:.4f}, "
                 f"plateau_best {plateau_best:.4f}, "
                 f"plateau_bad_streak {plateau_bad_streak})",
-                flush=True,
             )
 
     # Per-epoch LR decay. ExponentialLR.step() (this torch version) multiplies
@@ -1068,7 +1093,6 @@ def _worker(rank: int, cfg: RunConfig):
             print(
                 f"\n[profiler] top GPU ops (rank 0, "
                 f"{tb_active} active batch(es)):",
-                flush=True,
             )
             print(
                 p.key_averages().table(
@@ -1076,7 +1100,6 @@ def _worker(rank: int, cfg: RunConfig):
                     row_limit=25,
                     max_name_column_width=30,
                 ),
-                flush=True,
             )
         torch.profiler.tensorboard_trace_handler(
             f"./profiler_trace/rank{rank}"
@@ -1104,7 +1127,6 @@ def _worker(rank: int, cfg: RunConfig):
                 f"1+{prof_warmup}+{prof_active} batches, torch trace "
                 f"over 1+{prof_warmup}+{tb_active}; "
                 "traces -> ./profiler_trace/rank<r>/",
-                flush=True,
             )
 
     # training loop
@@ -1140,6 +1162,10 @@ def _worker(rank: int, cfg: RunConfig):
         -------
         None
         """
+        os.makedirs(cfg.ckpt_dir, exist_ok=True)
+        batch_tag = "final" if batch_idx < 0 else str(batch_idx)
+        ckpt_name = f"checkpoint_{ep}_{batch_tag}.pt"
+        ckpt_path = os.path.join(cfg.ckpt_dir, ckpt_name)
         torch.save(
             {
                 "epoch": ep,
@@ -1153,9 +1179,9 @@ def _worker(rank: int, cfg: RunConfig):
                 "energy": energy,
                 "hparams": hparams,
             },
-            cfg.ckpt_resume,
+            ckpt_path,
         )
-        _rclone_push(cfg.ckpt_resume, cfg.ckpt_rclone_dest)
+        _rclone_push(ckpt_path, cfg.ckpt_rclone_dest)
 
     # Dump the run's full config at the root of the data dir, so the per-epoch
     # metrics underneath it are self-describing. Written after the resume
@@ -1284,7 +1310,6 @@ def _worker(rank: int, cfg: RunConfig):
                         f"  [debug] batch {_bi}  loss={loss.item()}  "
                         f"iq_nan={iq.isnan().any().item()}  "
                         f"iq_inf={iq.isinf().any().item()}",
-                        flush=True,
                     )
                 if loss.isnan() or loss.isinf():
                     print(f"  [NaN/Inf] batch {_bi}  loss={loss.item()}")
@@ -1297,7 +1322,6 @@ def _worker(rank: int, cfg: RunConfig):
                     print(
                         f"    vocab shape: {local_batch.vocab.shape}  "
                         f"n_real_atoms: {n_real}",
-                        flush=True,
                     )
 
             with loop_prof.section("backward", rec):
@@ -1378,7 +1402,6 @@ def _worker(rank: int, cfg: RunConfig):
             ):
                 print(
                     f"  [grad] batch {_bi}  grad_norm={grad_norm.item()}",
-                    flush=True,
                 )
 
             if _prof is not None:
@@ -1392,7 +1415,6 @@ def _worker(rank: int, cfg: RunConfig):
                         print(
                             "[profiler] torch trace written - see "
                             "./profiler_trace/rank<r>/",
-                            flush=True,
                         )
 
             if cfg.profiler:
@@ -1449,7 +1471,6 @@ def _worker(rank: int, cfg: RunConfig):
                     f"  loss {train_loss_sum / max(train_mols, 1)}  "
                     f"{rate} batch/s  peak_alloc={mem_pk}G "
                     f"reserved={mem_rs}G",
-                    flush=True,
                 )
                 torch.cuda.reset_peak_memory_stats()
 
@@ -1491,7 +1512,6 @@ def _worker(rank: int, cfg: RunConfig):
                             f"{plateau_best:.4f}, this window "
                             f"{window_mean:.4f}) -- cutting lr "
                             f"x{cfg.plateau_factor}",
-                            flush=True,
                         )
                 if is_dist:
                     dist.broadcast(cut_now, src=0)
@@ -1513,7 +1533,6 @@ def _worker(rank: int, cfg: RunConfig):
                     print(
                         f"  [ckpt] saved mid-epoch resume @ epoch "
                         f"{epoch} batch {_bi}",
-                        flush=True,
                     )
 
         if cfg.profiler:
@@ -1647,7 +1666,7 @@ def _worker(rank: int, cfg: RunConfig):
         # ranks same as the model weights.
         scheduler.step()
         if rank == 0:
-            print(f"  lr -> {scheduler.get_last_lr()[0]:.3g}", flush=True)
+            print(f"  lr -> {scheduler.get_last_lr()[0]:.3g}")
 
     if is_dist:
         dist.destroy_process_group()
@@ -1682,7 +1701,7 @@ def main(cfg: RunConfig | None = None):
             hdf5=A.hdf5,
             encodings_sqlite3_path=A.encodings_sqlite3_path,
             ckpt_best=A.ckpt_best,
-            ckpt_resume=A.ckpt_resume,
+            ckpt_dir=A.ckpt_dir,
             resume=A.resume,
             lambda_1=A.lambda_1,
             lambda_2=A.lambda_2,

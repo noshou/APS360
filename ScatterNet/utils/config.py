@@ -84,8 +84,11 @@ class RunConfig:
         (via Preprocess) if file does not exist.
     ckpt_best : str
         Where to save the checkpoint w/ the lowest validation loss.
-    ckpt_resume : str
-        Where to save the latest checkpoint for run resumption.
+    ckpt_dir : str
+        Directory to save numbered resume checkpoints into. Each
+        mid-epoch/epoch-boundary save writes its own file
+        (checkpoint_<epoch>_<batch>.pt, with "final" for epoch
+        boundaries) instead of overwriting a single fixed path.
     resume : str or None
         Path to a checkpoint to resume (None = train from scratch).
 
@@ -272,13 +275,13 @@ class RunConfig:
     hdf5: str = "Preprocess/I(q)@L=50.h5"
     encodings_sqlite3_path: str = "Preprocess/scatternet-ENCODING.sqlite3"
     ckpt_best: str = "scatternet_best.pt"
-    ckpt_resume: str = "scatternet_resume.pt"
+    ckpt_dir: str = "checkpoints"
     resume: Optional[str] = None
 
     # model
     lambda_1: int = 128
     lambda_2: int = 4
-    lambda_3: int = 64
+    lambda_3: int = 256
     lambda_4: int = 4
     lambda_5: int = 128
     msg_seed: int = 42
@@ -295,7 +298,7 @@ class RunConfig:
 
     # loss
     lambda_6: float = 1.0
-    lambda_7: float = 0.5
+    lambda_7: float = 0.15
 
     # training
     lr: float = 1.3e-4

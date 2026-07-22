@@ -309,14 +309,16 @@ After the AllReduce, `features` and `chem_env` are divided by the per-molecule r
 
 1. **Learnable Parameters**
 
-  | Parameter          | Shape      | Notes                                       |
-  | ------------------ | ---------- | ------------------------------------------- |
-  | `_proj_agg.weight` | (2λ₁, λ₁)  | MishGLU projection: agg -> [p1, p2]         |
-  | `_proj_agg.bias`   | (2λ₁,)     |                                             |
-  | `_biasterm`        | (λ₅,)      | Learnable RFF phase offsets b               |
-  | `_sigbilin.weight` | (1, λ₁, Q) | Bilinear: (embedding, f_mag) -> sigma delta |
-  | `_sigbilin.bias`   | (1,)       |                                             |
-  | `_rms_norm.weight` | (λ₁,)      | RMSNorm scale                               |
+  `_proj_agg`, `_sigbilin`, and `_rms_norm` are each an `nn.ModuleList` of length λ₂: every message-passing round gets its own instance (`_proj_agg[i]`, `_sigbilin[i]`, `_rms_norm[i]`), not a single set of weights reused across rounds.
+
+  | Parameter             | Shape      | Notes                                       |
+  | ---------------------- | ---------- | ------------------------------------------- |
+  | `_proj_agg[i].weight`  | (2λ₁, λ₁)  | MishGLU projection: agg -> [p1, p2]         |
+  | `_proj_agg[i].bias`    | (2λ₁,)     |                                             |
+  | `_biasterm`            | (λ₅,)      | Learnable RFF phase offsets b (shared across rounds) |
+  | `_sigbilin[i].weight`  | (1, λ₁, Q) | Bilinear: (embedding, f_mag) -> sigma delta |
+  | `_sigbilin[i].bias`    | (1,)       |                                             |
+  | `_rms_norm[i].weight`  | (λ₁,)      | RMSNorm scale                               |
 
   Buffers (fixed):
 
@@ -679,12 +681,14 @@ Evaluation is done once per epoch for both val and test. Val is used for checkpo
 
 ### Checkpoint and Resume
 
-| File          | Contents                                | Saved when                                        |
-| ------------- | --------------------------------------- | ------------------------------------------------- |
-| `ckpt_best`   | model weights only                      | val_loss improves                                 |
-| `ckpt_resume` | weights + optimizer + epoch + batch_idx | every`ckpt_interval_sec` seconds and at epoch end |
+| File                                    | Contents                                | Saved when                                        |
+| --------------------------------------- | ---------------------------------------- | ------------------------------------------------- |
+| `ckpt_best`                             | model weights only                      | val_loss improves                                 |
+| `ckpt_dir/checkpoint_<epoch>_<batch>.pt` | weights + optimizer + epoch + batch_idx | every `ckpt_interval_sec` seconds and at epoch end |
 
-Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle identically, then the loop fast-forwards over `batch_idx` batches via `continue`. Both checkpoints are pushed to a rclone remote (`ckpt_rclone_dest`) for Kaggle session crash durability.
+Resume checkpoints are numbered, not overwritten: each save under `ckpt_dir` gets its own file, `checkpoint_<epoch>_<batch>.pt` for a mid-epoch save, `checkpoint_<epoch>_final.pt` for an epoch-boundary save, so the full history survives for later comparison (e.g. debugging a training collapse) instead of only the latest save.
+
+Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle identically, then the loop fast-forwards over `batch_idx` batches via `continue`. Both `ckpt_best` and each numbered resume checkpoint are pushed to a rclone remote (`ckpt_rclone_dest`) for Kaggle session crash durability.
 
 ### Run Data (metrics + diagnostic plots)
 

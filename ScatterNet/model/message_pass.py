@@ -82,7 +82,13 @@ class MessagePass(nn.Module):
     dataset bucket the batch came from. `_step1_fn`/`_step2_fn` (the compiled
     step functions) therefore only ever see one shape for the life of the
     module: no recompiles from a ragged tail chunk or from bucket-to-bucket
-    shape variety.
+    shape variety. `_step2` additionally takes `round_idx` (a Python int
+    selecting that round's entry of `_proj_agg`/`_sigbilin`/`_rms_norm`,
+    since message-passing rounds have distinct, not shared, weights) as a
+    static argument, so `_step2_fn` compiles up to `lambda_2` separate
+    graphs per shape tier instead of one; `__init__` scales
+    `torch._dynamo.config.cache_size_limit` up by a `lambda_2` factor to
+    cover it.
     """
 
     _lambda_1: int  # atom embedding dimension (λ₁)
@@ -98,8 +104,10 @@ class MessagePass(nn.Module):
     # per axis instead of one shape per distinct real size.
     _CHUNK_TIERS: tuple[int, ...] = (8, 16, 32, 64, 128)
 
-    # projects aggregated context λ₁ → 2λ₁ for MishGLU gating
-    _proj_agg: (nn.Linear)
+    # projects aggregated context λ₁ → 2λ₁ for MishGLU gating.
+    # one nn.Linear per message-passing round (length λ₂); rounds do NOT
+    # share weights.
+    _proj_agg: nn.ModuleList
 
     # fixed RFF frequency matrix: λ₅ random 3-D directions
     _omegafrq: Float[torch.Tensor, "λ₅ 3"]  # noqa: F722
@@ -107,11 +115,15 @@ class MessagePass(nn.Module):
     # RFF random phase offsets b ∈ R^λ₅
     _biasterm: nn.Parameter
 
-    # updates σ from (updated embedding, form factor)
-    _sigbilin: NoTrilinBilin
+    # updates σ from (updated embedding, form factor).
+    # one NoTrilinBilin per message-passing round (length λ₂); rounds do NOT
+    # share weights.
+    _sigbilin: nn.ModuleList
 
-    # normalises aggregated context before gating
-    _rms_norm: nn.RMSNorm
+    # normalises aggregated context before gating.
+    # one nn.RMSNorm per message-passing round (length λ₂); rounds do NOT
+    # share weights.
+    _rms_norm: nn.ModuleList
 
     # number of q-points (Q)
     _q_points: int
@@ -305,7 +317,16 @@ class MessagePass(nn.Module):
         self._lambda_5 = lambda_5
         self._nchunk = n_chunk
         self._mchunk = m_chunk
-        self._proj_agg = nn.Linear(lambda_1, 2 * lambda_1)
+        # one instance per message-passing round (length lambda_2): each
+        # round gets its own learned transform rather than reusing the same
+        # weights lambda_2 times. Constructed in a loop so each element's
+        # torch-RNG-driven init (nn.Linear/nn.RMSNorm/NoTrilinBilin all use
+        # torch's default/global RNG, not the numpy `rng` above) draws a
+        # distinct set of initial values per round without needing explicit
+        # per-round seeding.
+        self._proj_agg = nn.ModuleList(
+            [nn.Linear(lambda_1, 2 * lambda_1) for _ in range(lambda_2)]
+        )
         self.register_buffer(
             "_omegafrq",
             torch.from_numpy(rng.standard_normal((lambda_5, 3))).float(),
@@ -319,8 +340,12 @@ class MessagePass(nn.Module):
         # avoids nn.Bilinear's F.bilinear op forcing a torch.compile
         # graph break (aten::_trilinear isn't Inductor-supported),
         # so this now fuses into the surrounding compiled graph.
-        self._sigbilin = NoTrilinBilin(lambda_1, q_points, 1)
-        self._rms_norm = nn.RMSNorm(lambda_1)
+        self._sigbilin = nn.ModuleList(
+            [NoTrilinBilin(lambda_1, q_points, 1) for _ in range(lambda_2)]
+        )
+        self._rms_norm = nn.ModuleList(
+            [nn.RMSNorm(lambda_1) for _ in range(lambda_2)]
+        )
         self._q_points = q_points
 
         self._rffscale = (2 / lambda_5) ** 0.5
@@ -328,10 +353,15 @@ class MessagePass(nn.Module):
         # dynamic=False: forward() pads every N-/M-chunk fed to these
         # to exactly n_chunk/m_chunk atoms/molecules, so these functions only.
         # ever see one shape for the module's whole lifetime.
+        # `_step2_fn` is additionally called once per round with a distinct
+        # `round_idx` (a static/specialized int arg, since it selects which
+        # round's ModuleList entry to use), so it produces up to lambda_2x
+        # as many distinct compiled graphs as `_step1_fn`; the extra
+        # `* lambda_2` factor accounts for that.
         if compile:
             torch._dynamo.config.cache_size_limit = max(
                 torch._dynamo.config.cache_size_limit,
-                2 * (len(self._CHUNK_TIERS) + 1) ** 2,
+                2 * (len(self._CHUNK_TIERS) + 1) ** 2 * lambda_2,
             )
         self._step1_fn = (
             torch.compile(self._step1, fullgraph=True)
@@ -488,6 +518,7 @@ class MessagePass(nn.Module):
         features: torch.Tensor,
         chem_env: torch.Tensor,
         epsilon_: float,
+        round_idx: int,
     ):
         """Compute the per-atom neighbourhood
         aggregate and updated embedding/sigma.
@@ -514,6 +545,10 @@ class MessagePass(nn.Module):
         epsilon_ : float
             Numerical floor for clamping sigma and the aggregate
             denominator.
+        round_idx : int
+            Index (0-based) of the current message-passing round; selects
+            which round's entry of `_proj_agg`/`_sigbilin`/`_rms_norm` to
+            use, since rounds no longer share weights.
 
         Returns
         -------
@@ -578,14 +613,16 @@ class MessagePass(nn.Module):
         # its input and dispatches to the fused kernel.
         pre_norm = locality / weights.unsqueeze(-1).clamp(min=epsilon_)
         with torch.autocast(device_type=pre_norm.device.type, enabled=False):
-            agg = self._rms_norm(pre_norm.float())
+            agg = self._rms_norm[round_idx](pre_norm.float())
         agg = agg.to(locality.dtype)
 
         # MishGLU gate: one linear projects to 2λ₁,
         # split into value p1 and gate p2.
         # gate = p1 · Mish(p2) selectively passes neighbourhood signal
         # into the residual stream.
-        p1, p2 = self._proj_agg(agg).chunk(2, dim=-1)  # each (Nc, mc, Q, λ₁)
+        p1, p2 = self._proj_agg[round_idx](agg).chunk(
+            2, dim=-1
+        )  # each (Nc, mc, Q, λ₁)
         gate = p1 * F.mish(p2) * mask  # (Nc, mc, Q, λ₁)
 
         # residual update
@@ -597,12 +634,14 @@ class MessagePass(nn.Module):
         # and grows linearly for large x. softplus keeps σ strictly positive.
         f_in = ffsslice.transpose(-1, -2).expand(-1, -1, q_points, -1)
         new_sig = F.softplus(
-            sigslice + F.tanhshrink(self._sigbilin(new_emb, f_in))
+            sigslice + F.tanhshrink(self._sigbilin[round_idx](new_emb, f_in))
         )
 
         return new_emb, new_sig
 
-    def _pass_2(self, cont: _PassContainer, eps: float) -> _PassContainer:
+    def _pass_2(
+        self, cont: _PassContainer, eps: float, round_idx: int
+    ) -> _PassContainer:
         """
         Compute per-atom neighbourhood aggregate
         and update embeddings and sigmas.
@@ -619,6 +658,9 @@ class MessagePass(nn.Module):
         eps : float
             Numerical floor for sigma clamping and the aggregate
             denominator inside `_step2`.
+        round_idx : int
+            Index (0-based) of the current message-passing round; passed
+            through to `_step2` to select that round's weights.
 
         Returns
         -------
@@ -651,6 +693,7 @@ class MessagePass(nn.Module):
                 cont_feat,
                 cont_chnv,
                 eps,
+                round_idx,
             )
             emb_c, sig_c = checkpoint(
                 self._step2_fn, *args, use_reentrant=False
@@ -881,7 +924,7 @@ class MessagePass(nn.Module):
         embeds = embeds_raw.expand(-1, -1, self._q_points, -1)
         N, M = (coord.shape[0], coord.shape[1])
 
-        for _ in range(self._lambda_2):
+        for round_idx in range(self._lambda_2):
             new_embeds_n = []
             new_sigmas_n = []
 
@@ -891,9 +934,14 @@ class MessagePass(nn.Module):
                 # Nc derived from emb_s.shape[0] inside the closure rather
                 # than closed over as a variable. Python closures capture
                 # by reference so a loop variable would give the
-                # last iteration's value when the checkpoint
-                # replays during backward.
-                def _n_chunk_round(emb_s, msk_s, ffs_s, sig_s, crd_s):  # noqa: ANN001
+                # last iteration's value when the checkpoint replays during
+                # backward. round_idx is captured the same way it would be
+                # via reference, so it's bound as a default arg (evaluated
+                # once, at definition time, per outer-loop iteration)
+                # instead, for the same reason.
+                def _n_chunk_round(  # noqa: ANN001
+                    emb_s, msk_s, ffs_s, sig_s, crd_s, round_idx=round_idx
+                ):
                     Nc_s = emb_s.shape[0]
                     cont = self._PassContainer(
                         M=M,
@@ -930,7 +978,7 @@ class MessagePass(nn.Module):
                         features=cont.features * inv,
                         chem_env=cont.chem_env * inv.unsqueeze(-1),
                     )
-                    cont = self._pass_2(cont, eps)
+                    cont = self._pass_2(cont, eps, round_idx)
                     return cont.emb_n, cont.sig_n
 
                 # use_reentrant=False: chem_env lives only inside this
