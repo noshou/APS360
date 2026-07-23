@@ -4,6 +4,7 @@ import random
 import subprocess
 import time as _time
 import warnings
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import replace as dc_replace
 from time import perf_counter
@@ -680,10 +681,34 @@ def _worker(rank: int, cfg: RunConfig):
 
     pin = device != "cpu" and not str(device).startswith("privateuseone")
     pw = cfg.num_workers > 0
+
+    class _ResumableSampler(torch.utils.data.Sampler):
+        """RandomSampler equivalent, but able to start partway through the
+        permutation. On a mid-epoch resume, iterating a shuffle=True
+        DataLoader from index 0 and discarding batches via `if _bi < skip:
+        continue` still pays the full load/collate cost for every skipped
+        batch (real HDF5 reads through the dataset's __getitem__), which is
+        silent and can take hours late in a long epoch. Slicing the
+        permutation here means skipped indices are never handed to the
+        DataLoader at all.
+        """
+
+        def __init__(self, data_source: BatchSet):
+            self.data_source = data_source
+            self.skip = 0
+
+        def __len__(self) -> int:
+            return len(self.data_source) - self.skip
+
+        def __iter__(self) -> Iterator[int]:
+            perm = torch.randperm(len(self.data_source)).tolist()
+            return iter(perm[self.skip :])
+
+    train_sampler = _ResumableSampler(train_set)
     train_loader = DataLoader(
         train_set,
         batch_size=1,
-        shuffle=True,
+        sampler=train_sampler,
         collate_fn=_first,
         num_workers=cfg.num_workers,
         pin_memory=pin,
@@ -869,7 +894,7 @@ def _worker(rank: int, cfg: RunConfig):
         val_mols = sum(len(b) for b in val_set._batches)
         test_mols = sum(len(b) for b in test_set._batches)
         print(
-            f"batches/epoch: train={len(train_loader)}  "
+            f"batches/epoch: train={len(train_set)}  "
             f"val={len(val_loader)}  test={len(test_loader)}"
             f"  (buckets; same count by design - each bucket "
             f"contributes one sub-batch per split)",
@@ -1223,15 +1248,17 @@ def _worker(rank: int, cfg: RunConfig):
         # On a mid-epoch resume, fast-forward over already-trained batches. The
         # per-epoch seed above makes the shuffle deterministic, so batch _bi
         # here
-        # is the same molecule group as in the interrupted run.
+        # is the same molecule group as in the interrupted run. train_sampler
+        # excludes the skipped indices outright (see _ResumableSampler), so
+        # this costs nothing regardless of where in the epoch we resume.
         skip = resume_skip if epoch == start_epoch else 0
         resume_skip = 0
+        train_sampler.skip = skip
 
         for _bi, batch in enumerate(
-            prof_loader if prof_loader is not None else train_loader
+            prof_loader if prof_loader is not None else train_loader,
+            start=skip,
         ):
-            if _bi < skip:
-                continue
             if cfg.max_batches is not None and _bi >= cfg.max_batches:
                 break
 
@@ -1467,7 +1494,7 @@ def _worker(rank: int, cfg: RunConfig):
                     torch.cuda.memory_reserved() / 1e9
                 )  # allocator cache (benign)
                 print(
-                    f"  ep {epoch}  batch {_bi + 1:5d}/{len(train_loader)}"
+                    f"  ep {epoch}  batch {_bi + 1:5d}/{len(train_set)}"
                     f"  loss {train_loss_sum / max(train_mols, 1)}  "
                     f"{rate} batch/s  peak_alloc={mem_pk}G "
                     f"reserved={mem_rs}G",
