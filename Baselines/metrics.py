@@ -767,12 +767,17 @@ def plot_summary(results: list, out_path: str):
         for bar, v in zip(bars, vals):
             label = "n/a" if not math.isfinite(v) else fmt.format(v)
             negative = math.isfinite(v) and bar.get_width() < 0
+            # negative bars: anchor the label just right of the zero line
+            # (empty space in that row), not left of the bar's clamped tip
+            # -- on the leftmost subplot that tip sits right where the
+            # y-axis category names are, and the two collided/overlapped.
+            x = 0.02 * span if negative else bar.get_width() + 0.02 * span
             ax.text(
-                bar.get_width() + (-0.02 if negative else 0.02) * span,
+                x,
                 bar.get_y() + bar.get_height() / 2,
                 label,
                 va="center",
-                ha="right" if negative else "left",
+                ha="left",
                 color=TEXT_PRIMARY,
             )
         margin = 0.22 * span
@@ -1427,12 +1432,17 @@ def plot_per_q_summary(results: list, out_path: str):
         for bar, v in zip(bars, vals):
             label = "n/a" if not math.isfinite(v) else fmt.format(v)
             negative = math.isfinite(v) and bar.get_width() < 0
+            # negative bars: anchor the label just right of the zero line
+            # (empty space in that row), not left of the bar's clamped tip
+            # -- on the leftmost subplot that tip sits right where the
+            # y-axis category names are, and the two collided/overlapped.
+            x = 0.02 * span if negative else bar.get_width() + 0.02 * span
             ax.text(
-                bar.get_width() + (-0.02 if negative else 0.02) * span,
+                x,
                 bar.get_y() + bar.get_height() / 2,
                 label,
                 va="center",
-                ha="right" if negative else "left",
+                ha="left",
                 color=TEXT_PRIMARY,
             )
         margin = 0.25 * span
