@@ -8,7 +8,7 @@ from sklearn.kernel_approximation import Nystroem
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVR
 
-from Baselines.baseline import Baseline
+from Baselines.run.baseline import Baseline
 from Preprocess import VOCAB
 from ScatterNet.batching import Batch
 

@@ -7,12 +7,10 @@ from itertools import islice
 import h5py
 import hdf5plugin  # pip install hdf5plugin
 import numpy as np
-import pandas as pd
-from beartype import beartype
 from tqdm import tqdm
 
-from Scattering.formfact import FormFactors
-from Scattering.molecule import Molecule
+from Preprocess.generate_train_data.formfact import FormFactors
+from Preprocess.generate_train_data.molecule import Molecule
 
 # Per-worker globals set once by _worker_init: avoids pickling ff/lMax
 # per task.
@@ -78,50 +76,6 @@ def _process_mol(xyz_path: str) -> tuple[str, np.ndarray, Molecule] | None:
     return os.path.basename(xyz_path)[:-4], I_q, mol
 
 
-@beartype
-def loadFormFact(
-    makeup_tsv: str,
-    energy: int | float = 1.25e4,
-    qMax: int | float = 0.5,
-    qMin: int | float = 0,
-    step: float = 0.01,
-    col_name: str = "atom",
-    log_path: str | None = None,
-) -> FormFactors:
-    """Build a FormFactors object from a makeup TSV of ion symbols.
-
-    Parameters
-    ----------
-    makeup_tsv : str
-        Path to a tab-separated file with a column of ion symbols (e.g.
-        'C', 'Fe2+').
-    energy : int or float, optional
-        X-ray energy in eV. Default 12.5 keV.
-    qMax : int or float, optional
-        Maximum momentum transfer in Å⁻¹.
-    qMin : int or float, optional
-        Minimum momentum transfer in Å⁻¹.
-    step : float, optional
-        q-grid step size in Å⁻¹.
-    col_name : str, optional
-        Name of the column in `makeup_tsv` containing ion symbols.
-    log_path : str or None, optional
-        Optional path for logging skipped ions; passed through to
-        `FormFactors.fromIons`.
-
-    Returns
-    -------
-    FormFactors
-        FormFactors with precomputed complex form factors over the q grid.
-    """
-
-    df = pd.read_csv(makeup_tsv, sep="\t")
-    ions = df[col_name].tolist()
-    return FormFactors.fromIons(
-        ions, float(energy), qMin, qMax, step, log_path=log_path
-    )
-
-
 def buildDB(
     groups: dict[str, str],
     ff: FormFactors,
@@ -144,18 +98,18 @@ def buildDB(
     not as a supervised target.
 
     HDF5 layout:
-        /attrs:           lMax (int), energy (float)
-        /q_grid:          float64 (Q,)   momentum transfer grid, Å⁻¹
-        /sources_tsv:     uint8   (N,)   raw bytes of sources_tsv, if given
-        /makeup_tsv:      uint8   (M,)   raw bytes of makeup_tsv, if given
-        /<g>/<s>.attrs[name]: str        molecule name from XYZ header
-        /<g>/<s>/I_q:     float32 (Q,)   orientationally-avg. intensity
-        /<g>/<s>/coords:  float64 (n, 3) centroid-subtracted coords, Å
-        /<g>/<s>/angles:  float64 (n, 2) spherical angles: col 0 =
-                          theta (0→π), col 1 = phi (0→2π)
-        /<g>/<s>/r:       float64 (n,)   radial distance from centroid, Å
-        /<g>/<s>/elms:    str     (n,)   element symbol per atom
-                          (variable-length UTF-8)
+        /attrs:                 lMax (int),     energy (float)
+        /q_grid:                float64 (Q,)    momentum transfer grid, Å⁻¹
+        /sources_tsv:           uint8   (N,)    raw bytes of sources_tsv
+        /makeup_tsv:            uint8   (M,)    raw bytes of makeup_tsv
+        /<g>/<s>.attrs[name]:   str             molecule name from XYZ header
+        /<g>/<s>/I_q:           float32 (Q,)    orientationally-avg. intensity
+        /<g>/<s>/coords:        float64 (n, 3)  centroid-subtracted coords, Å
+        /<g>/<s>/angles:        float64 (n, 2)  spherical angles: col 0 =
+                                                theta (0→π), col 1 = phi (0→2π)
+        /<g>/<s>/r:             float64 (n,)    radial dist from centroid, Å
+        /<g>/<s>/elms:          str     (n,)    element symbol per atom
+                                                (variable-length UTF-8)
 
     All floating-point datasets are compressed with ZFP lossless
     compression; the uint8 TSV blobs use Bitshuffle+Zstd (ZFP is

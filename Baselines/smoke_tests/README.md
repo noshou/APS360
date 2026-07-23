@@ -1,7 +1,7 @@
 # Baselines smoke test
 
 CPU-only, synthetic-data smoke test for the baseline evaluation pipeline
-(`Baselines/metrics.py` plus every baseline in `physics-benchmarks/` and
+(`Baselines/run/metrics.py` plus every baseline in `physics-benchmarks/` and
 `learned-benchmarks/`).
 
 ## What it does

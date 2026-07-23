@@ -10,9 +10,9 @@ import torch
 from beartype import beartype
 from jaxtyping import Float, jaxtyped
 
-from Baselines.baseline import Baseline
-from Baselines.metrics import evaluate as _bl_evaluate
-from Baselines.metrics import run_all_plots
+from Baselines.run.baseline import Baseline
+from Baselines.run.metrics import evaluate as _bl_evaluate
+from Baselines.run.metrics import run_all_plots
 from ScatterNet import ScatterNet
 from ScatterNet.batching import Batch
 from ScatterNet.utils.config import RunConfig
@@ -22,8 +22,8 @@ class ScatterNetBaseline(Baseline):
     """Adapts a ScatterNet model to the `Baseline` interface.
 
     Lets a ScatterNet model be scored and plotted with the exact same code
-    (Baselines.metrics.evaluate/run_all_plots) used for every baseline in
-    Baselines/colab_baselines.ipynb.
+    (Baselines.run.metrics.evaluate/run_all_plots) used for every baseline in
+    Baselines/run/colab_baselines.ipynb.
 
     Optionally, when `compute_loss` is True, each forward pass also
     accumulates the composite training loss and log1p-space R2 as a side
@@ -78,7 +78,7 @@ class ScatterNetBaseline(Baseline):
             diagnostic plots) exactly -- unchanged. Pass `torch.bfloat16`
             for a standalone post-training inference speed comparison
             against the BF16-refactored baselines (see
-            `Baselines.baseline.autocast_dtype` for picking it based on
+            `Baselines.run.baseline.autocast_dtype` for picking it based on
             device capability) on Ampere+ GPUs (A100, L4, Blackwell); NOT
             recommended for T4 (no BF16 tensor cores) or for training-time
             use, since ScatterNet's numerics were tuned/guarded against fp16
@@ -141,9 +141,9 @@ class ScatterNetBaseline(Baseline):
         -------
         torch.Tensor
             Predicted I(q), shape (N, Q), clamped to non-negative (matching
-            every other Baseline's convention - see Baselines/metrics.py).
+            every other Baseline's convention - see Baselines/run/metrics.py).
         """
-        # Baselines.metrics.evaluate()'s loop never moves batches to device.
+        # Baselines.run.metrics.evaluate()'s loop never moves batches to device.
         # ScatterNet needs its own explicit move, same as
         # every call site in train.py's training/eval loops.
         batch = dc_replace(
@@ -205,15 +205,15 @@ class ScatterNetBaseline(Baseline):
 def _force_tp(model: ScatterNet):
     """Temporarily disable DP routing so every prediction covers full batch.
 
-    Baselines.metrics.evaluate() assumes a baseline's prediction shape
+    Baselines.run.metrics.evaluate() assumes a baseline's prediction shape
     matches the full batch it was given (pred.shape == batch.iqval.shape).
     A DP-routed bucket returns only a rank-local molecule shard instead,
-    which would silently break that assumption (and Baselines.metrics has no
+    which would silently break that assumption (and Baselines.run.metrics has no
     notion of cross-rank shards to begin with - it's a plain per-process
     function, unlike train.py's own evaluate()). TP is unaffected, since
     every rank already reconstructs the full-batch output internally, so
     forcing TP here keeps every rank's independent evaluate() call
-    numerically identical without touching Baselines/metrics.py.
+    numerically identical without touching Baselines/run/metrics.py.
 
     Parameters
     ----------
@@ -250,7 +250,7 @@ def save_epoch_plots(
     Evaluate `model` on `loader`, write this epoch's diagnostic plots, and
     return the test loss/R2 computed in the same single pass.
 
-    Mirrors Baselines/colab_baselines.ipynb's own evaluate() + run_all_plots()
+    Mirrors Baselines/run/colab_baselines.ipynb's own evaluate() + run_all_plots()
     call, so training progress is comparable to the baseline notebook's
     plots. The single shared run_all_plots() drives the whole set: per-q R^2,
     per-q percent error, Kratky overlay, the per-molecule signed-residual
@@ -372,7 +372,7 @@ def save_batch_loss_plot(
     """
     import matplotlib.pyplot as plt
 
-    from Baselines.metrics import (
+    from Baselines.run.metrics import (
         TEXT_PRIMARY,
         _configure_mpl,
         _style_axes,
@@ -506,7 +506,7 @@ def save_epoch_loss_plot(history: list[dict], data_dir: str) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.ticker import MaxNLocator
 
-    from Baselines.metrics import (
+    from Baselines.run.metrics import (
         TEXT_PRIMARY,
         _configure_mpl,
         _style_axes,

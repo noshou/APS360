@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, overload
 
 import xraydb
 
@@ -86,6 +86,11 @@ class _IonVocab:
         """
         return ion in self.index
 
+    @overload
+    def __getitem__(self, ion: str) -> int: ...
+    @overload
+    def __getitem__(self, ion: int) -> str: ...
+
     def __getitem__(self, ion: str | int) -> str | int:
         """Translate between ion symbol and 1-based VOCAB index.
 
@@ -105,17 +110,5 @@ class _IonVocab:
             return self.index[ion]
         elif isinstance(ion, int):
             return self.ions[ion - 1]
-
-    @property
-    def size(self) -> int:
-        """Return the number of ions in the vocabulary.
-
-        Returns
-        -------
-        int
-            Number of ions stored in `ions`.
-        """
-        return len(self.ions)
-
 
 VOCAB: _IonVocab = _IonVocab.load()

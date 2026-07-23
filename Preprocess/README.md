@@ -46,7 +46,7 @@ for filename in ["I(q)@L=50.h5", "iq_train_set-ENCODING.sqlite3"]:
     )
 ```
 
-Both files are also available on the **[Kaggle dataset](https://www.kaggle.com/datasets/noso0s0n/iql50)**: mounted directly as a notebook input when using `Train/kaggle_train.ipynb` (no download step needed there), or pulled via the Kaggle API when using `Baselines/colab_baselines.ipynb` on Colab (see that notebook's setup cell).
+Both files are also available on the **[Kaggle dataset](https://www.kaggle.com/datasets/noso0s0n/iql50)**: mounted directly as a notebook input when using `Train/kaggle_train.ipynb` (no download step needed there), or pulled via the Kaggle API when using `Baselines/run/colab_baselines.ipynb` on Colab (see that notebook's setup cell).
 
 Place the downloaded files at `Preprocess/I(q)@L=50.h5` and `Preprocess/iq_train_set-ENCODING.sqlite3` (the paths all pipeline scripts expect).
 
@@ -73,11 +73,13 @@ Open `Train/kaggle_train.ipynb`. Set `NOTEBOOK_NAME` to your Kaggle notebook slu
 
 ### Baselines (Colab notebook)
 
-Baselines run on Colab, not Kaggle (see `Baselines/colab_baselines.ipynb` -- it targets an L4 GPU for BF16 tensor-core acceleration on the O(atoms²) physics baselines; T4 has no BF16 tensor cores, so it isn't the target there). The notebook pulls `I(q)@L=50.h5` and `iq_train_set-ENCODING.sqlite3` from the Kaggle dataset via the Kaggle API (Colab Secrets `KAGGLE_USERNAME`/`KAGGLE_KEY`), not a mounted input.
+Baselines run on Colab, not Kaggle (see `Baselines/run/colab_baselines.ipynb` -- it targets an L4 GPU for BF16 tensor-core acceleration on the O(atoms²) physics baselines; T4 has no BF16 tensor cores, so it isn't the target there). The notebook pulls `I(q)@L=50.h5` and `iq_train_set-ENCODING.sqlite3` from the Kaggle dataset via the Kaggle API (Colab Secrets `KAGGLE_USERNAME`/`KAGGLE_KEY`), not a mounted input.
 
 ---
 
-Produced by `buildDB()` in `load_data.py`. The file is opened in append mode (`'a'`), so existing entries are skipped on resume.
+Produced by `buildDB()` in `Preprocess/generate_train_data/load_data.py`. The file is opened in append mode (`'a'`), so existing entries are skipped on resume.
+
+`buildDB()` is not called anywhere else in this repo (the `.h5`/`.sqlite3` files are downloaded pre-built, see above) -- it exists for anyone who wants to rebuild the database from source XYZ files. `Preprocess/generate_train_data/` also holds the scattering/form-factor code it depends on (`formfact.py`, `molecule.py`, `spherical_funcs.py`, `stuhrmann.py`).
 
 ## Root attributes
 

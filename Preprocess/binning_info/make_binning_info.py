@@ -2,7 +2,7 @@
 
 Usage (run from the repo root -- all paths below are relative to cwd, not
 this file's location):
-    python Preprocess/make_binning_info.py [--n-bins N]
+    python Preprocess/binning_info/make_binning_info.py [--n-bins N]
 
 Reads atom counts from Preprocess/iq_train_set-ENCODING.sqlite3, computes
 N equal-molecule-count bins, writes all_counts.npy + four plots +
@@ -149,7 +149,7 @@ COLORS = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
 
 def vlines(ax: Axes, color: str = "gray") -> None:
-    for lo, hi in BINS:
+    for lo, _hi in BINS:
         ax.axvline(lo, color=color, alpha=0.25, lw=0.5)
 
 

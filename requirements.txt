@@ -17,7 +17,6 @@ hdf5plugin==6.0.0
 xraydb==4.5.8
 beartype==0.22.9
 tqdm==4.67.3
-pandas==3.0.3
 plotly==6.7.0
 huggingface_hub==1.20.1
 pyyaml

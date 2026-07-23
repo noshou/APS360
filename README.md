@@ -504,7 +504,7 @@ route_dp = model.training and dp_atom_threshold > 0 and M < dp_atom_threshold an
 
 `dp_atom_threshold = 0` (default) always uses TP - matches pre-DP behaviour exactly.
 
-`forward()` applies the same routing rule in eval as in train (it does **not** branch on `model.training` — feeding the compiled step functions eval-only shapes caused a recompile storm). `evaluate()` all-reduces its six metric accumulators for a DP-routed bucket, so both routings give identical numbers. In practice eval lands on TP for nearly every bucket anyway: a val/test batch holds only ~15% of its bucket's molecules, and that small `N` fails `route_dp`'s `N >= 2*mol_chunk`. The plots pass forces TP outright (`eval_plots._force_tp`), since `Baselines/metrics.py` has no notion of cross-rank shards.
+`forward()` applies the same routing rule in eval as in train (it does **not** branch on `model.training` — feeding the compiled step functions eval-only shapes caused a recompile storm). `evaluate()` all-reduces its six metric accumulators for a DP-routed bucket, so both routings give identical numbers. In practice eval lands on TP for nearly every bucket anyway: a val/test batch holds only ~15% of its bucket's molecules, and that small `N` fails `route_dp`'s `N >= 2*mol_chunk`. The plots pass forces TP outright (`eval_plots._force_tp`), since `Baselines/run/metrics.py` has no notion of cross-rank shards.
 
 TP shards atoms of the *same* molecules across ranks and needs an all-reduce mid-forward to reconstruct each atom's full neighbourhood (see `MessagePass._AllReduce`). For a bucket with very few atoms per molecule (e.g. `max_atoms=3`), that all-reduce's fixed latency cost dwarfs the tiny amount of per-rank compute it buys - DP routes those buckets by molecule instead, with **no in-model communication at all**.
 
@@ -692,7 +692,7 @@ Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle
 
 ### Run Data (metrics + diagnostic plots)
 
-When `data_dir` is set, everything the run records lands under it (via `Train/eval_plots.py`, reusing `Baselines/metrics.py` so the plots are directly comparable to the baseline notebook):
+When `data_dir` is set, everything the run records lands under it (via `Train/eval_plots.py`, reusing `Baselines/run/metrics.py` so the plots are directly comparable to the baseline notebook):
 
 | File                                | Scope     | Cost                                                     |
 | ----------------------------------- | --------- | ------------------------------------------------------- |

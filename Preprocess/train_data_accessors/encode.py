@@ -76,8 +76,10 @@ class Encoding:
             A read-only connection to `path`.
         """
         return sqlite3.connect(
-            f"file:{path}?mode=ro&immutable=1", uri=True, **kwargs
-        )
+            f"file:{path}?mode=ro&immutable=1",
+            uri=True,
+            **kwargs #type: ignore
+        )            #type: ignore
 
     def __new__(cls, *args: object, **kwargs: object) -> "Encoding":
         """Return the shared singleton instance, creating it on first call.

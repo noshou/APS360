@@ -3,7 +3,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 
-from Baselines.baseline import Baseline
+from Baselines.run.baseline import Baseline
 from Preprocess import VOCAB
 from ScatterNet.batching import Batch
 

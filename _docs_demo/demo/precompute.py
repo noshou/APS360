@@ -21,7 +21,7 @@ from _docs_demo.demo.global_vals import (
     STRUCT_DIR,
     lMax,
 )
-from Scattering import FormFactors, Molecule
+from Preprocess.generate_train_data import FormFactors, Molecule
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 

@@ -4,7 +4,7 @@ import torch
 from beartype import beartype
 from jaxtyping import Float, jaxtyped
 
-from Baselines.baseline import Baseline
+from Baselines.run.baseline import Baseline
 from ScatterNet.batching import Batch
 
 

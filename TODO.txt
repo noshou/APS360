@@ -32,19 +32,65 @@ What's NOT done yet (the actual "wire it together" work):
 2. Make those carve-outs dtype-aware (e.g. only force fp32 when the active
    autocast dtype is fp16, skip the force under bf16) rather than an
    unconditional `enabled=False`.
-3. Build the actual comparison script/notebook cell: load a frozen
+3. Skip `torch.utils.checkpoint.checkpoint()` wrapping entirely at
+   inference. Checkpointing only trades compute for memory to survive
+   *backward* (recompute instead of storing activations) -- under
+   `torch.no_grad()`/`torch.inference_mode()` there's no backward, so
+   wrapping is pure overhead with zero benefit. Gate each checkpoint call
+   site on `torch.is_grad_enabled()` (or an explicit inference-mode flag
+   passed down) and call the wrapped function directly when false.
+4. Package the above (dtype-aware carve-outs + checkpoint bypass + BF16
+   autocast) as a single inference wrapper/mode -- e.g. an `infer.py`
+   entry point or an `inference=True` flag threaded through the model --
+   rather than scattering `if` checks. Given a single L4 GPU target, this
+   wrapper does NOT need to touch the TP/DP distributed-routing code
+   (`dp_atom_threshold`, `_AllReduce`, `AllGatherDim1` in
+   message_pass.py): those all-reduce/all-gather ops already guard on
+   `dist.is_initialized()`/`is_available()` and should already collapse to
+   near-no-ops when there's no process group. Worth confirming that's
+   actually cheap (not just assumed) before deciding it needs its own
+   switch -- but don't build one preemptively.
+5. Build the actual comparison script/notebook cell: load a frozen
    checkpoint, wrap in ScatterNetBaseline(dtype=torch.bfloat16), run
    through the same Baselines.metrics.evaluate()/timed_call() path as
    every baseline, so us_per_atom is directly comparable in the same
    summary.json/summary.png.
-4. Spot-check prediction accuracy (not just speed) of the bf16 path against
+6. Spot-check prediction accuracy (not just speed) of the bf16 path against
    the existing fp16/fp32 path before trusting comparison numbers --
    ScatterNet's numerics were tuned/guarded against fp16 overflow
    specifically, not yet validated against bf16's lower-mantissa rounding.
-5. End-to-end on/off toggle: a single config knob (e.g. a RunConfig field
+7. End-to-end on/off toggle: a single config knob (e.g. a RunConfig field
    or a notebook cell flag) that switches ScatterNetBaseline between fp16
    (default, matches training) and bf16 (comparison mode), without having
    to hand-edit code each time.
+
+---
+
+TODO -- major repo restructure (after BF16 inference work above is done)
+
+Status: not started, no code changes should happen until explicitly
+kicked off. This is a rename/reorg, not new functionality -- plan it as
+one pass so imports/paths only break once, not repeatedly.
+
+Planned layout:
+- Repo renamed APS360 -> ScatterNet.
+- Current ScatterNet/ (the model package) -> Network/.
+- Train/ moves inside as Network/train/.
+- New Network/infer/ (or similar) -- the inference-mode wrapper from the
+  BF16 TODO above (dtype-aware fp32 carve-outs, checkpoint bypass, BF16
+  autocast) lives here, not bolted onto Train/eval_plots.py long-term.
+- DONE (this pass): Scattering/ moved to Preprocess/generate_train_data/,
+  along with load_data.py (previously Preprocess/load_data.py); dead
+  loadFormFact() removed. make_binning_info.py moved into
+  Preprocess/binning_info/.
+
+Work needed when this is picked up: full import-path sweep across every
+module (ScatterNet.*, Train.*, Scattering.* references), notebook path
+fixes (kaggle_train.ipynb, colab_baselines.ipynb, any repo-clone/pip
+install cells that reference the old repo name or dir layout), README.md/
+Preprocess/README.md path references, CLAUDE.md, smoke test paths and
+configs (baselines_smoke_test.yaml, train.yaml), and a check for any
+hardcoded "APS360" or "ScatterNet/" string outside of comments/docs.
 
 Separate, smaller open item from the same conversation (not required for
 the above, can be done independently):

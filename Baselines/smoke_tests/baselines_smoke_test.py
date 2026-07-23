@@ -4,7 +4,7 @@ synthetic data.
 Generates a handful of fake molecules (valid VOCAB elements, random
 coordinates), derives "ground truth" I(q) from the most detailed physics
 baseline (BinnedDebyeBaseline) plus multiplicative log-normal noise, then
-runs every baseline + Baselines/metrics.py's evaluate()/run_all_plots()
+runs every baseline + Baselines/run/metrics.py's evaluate()/run_all_plots()
 against it. This lets every metric and plot be checked for a hard crash
 or obviously-wrong output *before* spending Colab GPU/session time on
 colab_baselines.ipynb -- it is not a check of prediction quality (the
@@ -44,7 +44,7 @@ from propo_est import PropoEstBaseline  # noqa: E402
 from rg import GuinierPorodBaseline, RgBaseline  # noqa: E402
 from strat_est import StratEstBaseline  # noqa: E402
 
-from Baselines.metrics import evaluate, run_all_plots  # noqa: E402
+from Baselines.run.metrics import evaluate, run_all_plots  # noqa: E402
 from Preprocess import VOCAB  # noqa: E402
 from ScatterNet.batching import Batch  # noqa: E402
 

@@ -1558,7 +1558,7 @@ def _worker(rank: int, cfg: RunConfig):
         # cost. Baseline-style diagnostic plots (per-q R2, percent error,
         # Kratky
         # overlay, residual histogram, error-vs-atom-count) reuse
-        # Baselines/metrics.py
+        # Baselines/run/metrics.py
         # so they stay directly comparable to Baselines/kaggle_baselines.ipynb.
         # The
         # plots pass runs on every rank (TP-forced forward needs all ranks); it

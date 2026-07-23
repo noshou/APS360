@@ -16,7 +16,7 @@ import torch
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
 
-from Baselines.baseline import Baseline
+from Baselines.run.baseline import Baseline
 from ScatterNet.batching import Batch
 
 # must happen before the first `import matplotlib.pyplot` anywhere in the

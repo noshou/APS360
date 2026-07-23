@@ -2,7 +2,7 @@ import torch
 from beartype import beartype
 from jaxtyping import Float, jaxtyped
 
-from Baselines.baseline import (
+from Baselines.run.baseline import (
     Baseline,
     autocast_dtype,
     build_fmag_table,
@@ -13,8 +13,7 @@ from ScatterNet.batching import Batch
 
 class PropoEstBaseline(Baseline):
     """
-    Deterministic propoEst estimator of the Debye sum (port of SaxsEst
-    propoEst).
+    Proportional estimator of the Debye sum.
 
     Replaces the per-pair form-factor product in the exact Debye equation
     with a single q-dependent scalar weight ``wEst(q)`` from the atom-type
@@ -27,10 +26,9 @@ class PropoEstBaseline(Baseline):
     """
 
     _MAX_M: int = (
-        6046  # max molecule size in the dataset (top DEFAULT_BUCKETS ceiling);
+        6046    # max molecule size in the dataset caps atoms
+                # per molecule to bound O(M^2) memory, no real subsampling
     )
-    # caps atoms per molecule to bound O(M^2) memory, no real subsampling
-
     _qgrid: Float[torch.Tensor, "Q"]  # noqa: F722,F821
     _fmag_table: Float[torch.Tensor, "V Q"]  # noqa: F722
     _E: float

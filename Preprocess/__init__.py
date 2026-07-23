@@ -1,2 +1,1 @@
-from .encode import Encoding
-from .vocab import VOCAB
+from .train_data_accessors import Encoding, VOCAB
