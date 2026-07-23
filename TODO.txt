@@ -1,0 +1,58 @@
+TODO -- BF16 inference for ScatterNet (post-training)
+
+Status: not started. Blocked on training actually finishing. Baselines
+already run BF16 (Baselines/baseline.py::autocast_dtype, targets Ampere+ /
+L4, no-ops to fp32 on T4) -- this item is the ScatterNet side of the same
+comparison, not the baselines side.
+
+Goal: once a ScatterNet checkpoint is frozen (done training), run inference
+in BF16 on a single L4 (plenty of VRAM for this model's size -- no sharding
+concerns) with a clean on/off toggle, so ScatterNet's speed is directly
+comparable to the now-BF16 baselines on the same hardware.
+
+What's already wired (this session):
+- Train/eval_plots.py::ScatterNetBaseline takes a `dtype` param
+  (default torch.float16, unchanged from before). Pass dtype=torch.bfloat16
+  to run the wrapped model's autocast region in BF16 instead. This is
+  inference-only plumbing -- training path (train.py's own evaluate()) is
+  untouched and still fp16/amp as configured.
+
+What's NOT done yet (the actual "wire it together" work):
+1. Audit every hardcoded `torch.autocast(..., enabled=False)` fp32
+   carve-out in the model (known ones: ScatterNet/model/message_pass.py's
+   RFF projection, ScatterNet/model/output_head.py's Debye-weighted sum,
+   possibly ScatterNet/model/embed.py) -- these force fp32 specifically to
+   dodge FP16's ~65504 overflow ceiling. BF16 has FP32's exponent range, so
+   most/all of these probably don't need to force fp32 under BF16 -- but
+   each one needs checking, not blanket-removed. This is where the actual
+   speedup lives (letting more of the forward pass run in reduced
+   precision), not from BF16 being a faster format than FP16 in the
+   abstract (it isn't -- same bit width, same tensor-core throughput on
+   Ampere+; BF16's only real edge is dynamic range).
+2. Make those carve-outs dtype-aware (e.g. only force fp32 when the active
+   autocast dtype is fp16, skip the force under bf16) rather than an
+   unconditional `enabled=False`.
+3. Build the actual comparison script/notebook cell: load a frozen
+   checkpoint, wrap in ScatterNetBaseline(dtype=torch.bfloat16), run
+   through the same Baselines.metrics.evaluate()/timed_call() path as
+   every baseline, so us_per_atom is directly comparable in the same
+   summary.json/summary.png.
+4. Spot-check prediction accuracy (not just speed) of the bf16 path against
+   the existing fp16/fp32 path before trusting comparison numbers --
+   ScatterNet's numerics were tuned/guarded against fp16 overflow
+   specifically, not yet validated against bf16's lower-mantissa rounding.
+5. End-to-end on/off toggle: a single config knob (e.g. a RunConfig field
+   or a notebook cell flag) that switches ScatterNetBaseline between fp16
+   (default, matches training) and bf16 (comparison mode), without having
+   to hand-edit code each time.
+
+Separate, smaller open item from the same conversation (not required for
+the above, can be done independently):
+- Baselines currently store only AGGREGATE stats per baseline
+  (Baselines/metrics.py::EvalResult -- global MSLE/R2, per-q mean curves,
+  pre-binned histograms) -- confirmed NOT storing raw per-molecule (N,Q)
+  predictions (deliberate, keeps checkpoint size bounded). If raw outputs
+  are wanted later (e.g. to re-derive diagnostics without re-running),
+  needs a decision on: full test set vs capped sample, storage location/
+  format (separate .pt/.npz per baseline?), and whether to include true
+  values + molecule identifiers alongside predictions.

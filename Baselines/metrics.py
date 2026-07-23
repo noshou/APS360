@@ -1473,9 +1473,9 @@ def run_all_plots(
         one-row bar chart is a strange way to show a single model's own
         numbers -- there's nothing to compare it against -- so callers
         plotting just one result (e.g. ScatterNet's per-epoch training
-        plots) should pass False. The multi-baseline comparison notebooks
-        (kaggle_baselines.ipynb etc.), where the bars genuinely compare
-        several baselines against each other, keep the default True.
+        plots) should pass False. The multi-baseline comparison notebook
+        (colab_baselines.ipynb), where the bars genuinely compare several
+        baselines against each other, keeps the default True.
 
     Returns
     -------

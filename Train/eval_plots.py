@@ -23,7 +23,7 @@ class ScatterNetBaseline(Baseline):
 
     Lets a ScatterNet model be scored and plotted with the exact same code
     (Baselines.metrics.evaluate/run_all_plots) used for every baseline in
-    Baselines/kaggle_baselines.ipynb.
+    Baselines/colab_baselines.ipynb.
 
     Optionally, when `compute_loss` is True, each forward pass also
     accumulates the composite training loss and log1p-space R2 as a side
@@ -47,6 +47,7 @@ class ScatterNetBaseline(Baseline):
         lambda_7: float | None = None,
         progress: bool = False,
         n_batch: int = 0,
+        dtype: torch.dtype = torch.float16,
     ) -> None:
         """Store the model and precision/device settings used at call time.
 
@@ -56,7 +57,7 @@ class ScatterNetBaseline(Baseline):
             Model to wrap; called in whatever train()/eval() mode the
             caller already put it in.
         amp : bool
-            Whether to run the forward pass under fp16 autocast.
+            Whether to run the forward pass under autocast at all.
         device : str
             Torch device string; autocast is only enabled on CUDA.
         compute_loss : bool, optional
@@ -71,6 +72,23 @@ class ScatterNetBaseline(Baseline):
             Print a progress line every 20 batches.
         n_batch : int
             Total number of batches, for the "i/N" in the progress line.
+        dtype : torch.dtype, optional
+            Autocast dtype. Default `torch.float16` matches train.py's own
+            `evaluate()` and every existing caller (the per-epoch training
+            diagnostic plots) exactly -- unchanged. Pass `torch.bfloat16`
+            for a standalone post-training inference speed comparison
+            against the BF16-refactored baselines (see
+            `Baselines.baseline.autocast_dtype` for picking it based on
+            device capability) on Ampere+ GPUs (A100, L4, Blackwell); NOT
+            recommended for T4 (no BF16 tensor cores) or for training-time
+            use, since ScatterNet's numerics were tuned/guarded against fp16
+            overflow specifically (see message_pass.py/output_head.py) and
+            haven't been separately re-validated for bf16's different
+            (lower-mantissa, wider-exponent) rounding behavior. This class
+            is inference-only wherever it's used today, so that's a smaller
+            concern than it would be for training, but still worth spot-
+            checking predictions against the fp16/fp32 path before trusting
+            a bf16 comparison run's accuracy numbers, not just its speed.
 
         Returns
         -------
@@ -84,6 +102,7 @@ class ScatterNetBaseline(Baseline):
         self._lambda_7 = lambda_7
         self._progress = progress
         self._n_batch = n_batch
+        self._dtype = dtype
         self._seen = 0
         self._last_printed = -1
         self._t0 = time.time()
@@ -134,7 +153,7 @@ class ScatterNetBaseline(Baseline):
             coord=batch.coord.to(self._device),
         )
         with torch.autocast(
-            device_type="cuda", dtype=torch.float16, enabled=self._amp
+            device_type="cuda", dtype=self._dtype, enabled=self._amp
         ):
             iq, fmags, sigmas, local_batch, _ = self._model(batch)
             # Composite loss/R2 as a side effect, in the same forward pass, so
@@ -231,7 +250,7 @@ def save_epoch_plots(
     Evaluate `model` on `loader`, write this epoch's diagnostic plots, and
     return the test loss/R2 computed in the same single pass.
 
-    Mirrors Baselines/kaggle_baselines.ipynb's own evaluate() + run_all_plots()
+    Mirrors Baselines/colab_baselines.ipynb's own evaluate() + run_all_plots()
     call, so training progress is comparable to the baseline notebook's
     plots. The single shared run_all_plots() drives the whole set: per-q R^2,
     per-q percent error, Kratky overlay, the per-molecule signed-residual

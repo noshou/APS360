@@ -11,7 +11,7 @@ coordinates), derives "ground truth" I(q) from the most detailed physics
 baseline (`BinnedDebyeBaseline`) plus multiplicative log-normal noise, then runs
 every baseline through `evaluate()` / `run_all_plots()` against it. This checks
 each metric and plot for a hard crash or obviously-wrong output *before*
-spending Kaggle GPU/session time on `kaggle_baselines.ipynb`.
+spending Colab GPU/session time on `colab_baselines.ipynb`.
 
 ## It only checks that things RUN
 

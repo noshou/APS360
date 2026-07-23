@@ -46,7 +46,7 @@ for filename in ["I(q)@L=50.h5", "iq_train_set-ENCODING.sqlite3"]:
     )
 ```
 
-Both files are also available on the **[Kaggle dataset](https://www.kaggle.com/datasets/noso0s0n/iql50)** and are mounted directly as notebook inputs when using `kaggle_train.ipynb` / `kaggle_baselines.ipynb` -- no download step needed there.
+Both files are also available on the **[Kaggle dataset](https://www.kaggle.com/datasets/noso0s0n/iql50)**: mounted directly as a notebook input when using `Train/kaggle_train.ipynb` (no download step needed there), or pulled via the Kaggle API when using `Baselines/colab_baselines.ipynb` on Colab (see that notebook's setup cell).
 
 Place the downloaded files at `Preprocess/I(q)@L=50.h5` and `Preprocess/iq_train_set-ENCODING.sqlite3` (the paths all pipeline scripts expect).
 
@@ -69,7 +69,11 @@ encodings_sqlite3_path:  Preprocess/iq_train_set-ENCODING.sqlite3         # down
 
 ### Kaggle (notebook)
 
-Open `Baselines/kaggle_baselines.ipynb`. Set `NOTEBOOK_NAME` to your Kaggle notebook slug at the top of the setup cell, and attach the [`noso0s0n/iql50`](https://www.kaggle.com/datasets/noso0s0n/iql50) dataset as a notebook input -- it provides both `I(q)@L=50.h5` and `iq_train_set-ENCODING.sqlite3` pre-mounted under `/kaggle/input/datasets/noso0s0n/iql50/`, no download or build step needed. The notebook clones the repo, installs dependencies, and runs all baselines.
+Open `Train/kaggle_train.ipynb`. Set `NOTEBOOK_NAME` to your Kaggle notebook slug at the top of the setup cell, and attach the [`noso0s0n/iql50`](https://www.kaggle.com/datasets/noso0s0n/iql50) dataset as a notebook input -- it provides both `I(q)@L=50.h5` and `iq_train_set-ENCODING.sqlite3` pre-mounted under `/kaggle/input/datasets/noso0s0n/iql50/`, no download or build step needed. The notebook clones the repo, installs dependencies, and runs training.
+
+### Baselines (Colab notebook)
+
+Baselines run on Colab, not Kaggle (see `Baselines/colab_baselines.ipynb` -- it targets an L4 GPU for BF16 tensor-core acceleration on the O(atoms²) physics baselines; T4 has no BF16 tensor cores, so it isn't the target there). The notebook pulls `I(q)@L=50.h5` and `iq_train_set-ENCODING.sqlite3` from the Kaggle dataset via the Kaggle API (Colab Secrets `KAGGLE_USERNAME`/`KAGGLE_KEY`), not a mounted input.
 
 ---
 

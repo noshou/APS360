@@ -6,15 +6,14 @@ coordinates), derives "ground truth" I(q) from the most detailed physics
 baseline (BinnedDebyeBaseline) plus multiplicative log-normal noise, then
 runs every baseline + Baselines/metrics.py's evaluate()/run_all_plots()
 against it. This lets every metric and plot be checked for a hard crash
-or obviously-wrong output *before* spending Kaggle GPU/session time on
-kaggle_baselines.ipynb -- it is not a check of prediction quality (the
+or obviously-wrong output *before* spending Colab GPU/session time on
+colab_baselines.ipynb -- it is not a check of prediction quality (the
 "ground truth" is synthetic).
 
 The smoke test only confirms the pipeline RUNS. The subset is tiny (a
 dozen synthetic molecules), so the MSLE / R2 / us-per-atom numbers it
 prints are not statistically meaningful -- do not read them as baseline
-performance. Use kaggle_baselines.ipynb / colab_baselines.ipynb on the
-real dataset for that.
+performance. Use colab_baselines.ipynb on the real dataset for that.
 
 Usage:
     python Baselines/smoke_tests/baselines_smoke_test.py \
