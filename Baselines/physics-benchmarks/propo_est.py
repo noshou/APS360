@@ -2,7 +2,12 @@ import torch
 from beartype import beartype
 from jaxtyping import Float, jaxtyped
 
-from Baselines.baseline import Baseline, build_fmag_table, q_chunks
+from Baselines.baseline import (
+    Baseline,
+    autocast_dtype,
+    build_fmag_table,
+    q_chunks,
+)
 from ScatterNet.batching import Batch
 
 
@@ -55,6 +60,12 @@ class PropoEstBaseline(Baseline):
         qgrid = self._qgrid.to(device)  # (Q,)
         ftable = self._fmag_table.to(device)  # (V, Q)
         eps = 1.0e-12
+        # BF16 on Ampere+ (native tensor cores there; T4 gets None -> stays
+        # fp32, see autocast_dtype's docstring). Only the O(m^2) sinc block
+        # below uses it -- it's pure elementwise (no matmul), so this is a
+        # memory-bandwidth win from halved tensor size, not a tensor-core
+        # one; the (Q,)-shaped setup math above/below it stays fp32.
+        dtype = autocast_dtype(device)
 
         preds: list[Float[torch.Tensor, "Q"]] = []  # noqa: F722,F821
 
@@ -120,15 +131,17 @@ class PropoEstBaseline(Baseline):
             # intermediates never exceed the old per-q (m, m) footprint by
             # much.
             est = torch.empty_like(qgrid)
+            dist_c = dist if dtype is None else dist.to(dtype)
             for a, b in q_chunks(qgrid.shape[0], m):
-                qd = qgrid[a:b].view(-1, 1, 1) * dist.unsqueeze(
-                    0
-                )  # (Qc, m, m)
+                q_ab = qgrid[a:b] if dtype is None else qgrid[a:b].to(dtype)
+                qd = q_ab.view(-1, 1, 1) * dist_c.unsqueeze(0)  # (Qc, m, m)
                 sinc = torch.where(
                     qd.abs() < 1e-8, torch.ones_like(qd), torch.sin(qd) / qd
                 )
-                # sum over j != i == full row sum minus j==i term (sinc(0)=1)
-                s_i = sinc.sum(dim=2) - 1.0  # (Qc, m)
+                # sum over j != i == full row sum minus j==i term (sinc(0)=1).
+                # Cast back to fp32 before the fp32 (Q,)-shaped math below --
+                # the reduced-precision block ends here.
+                s_i = (sinc.sum(dim=2) - 1.0).float()  # (Qc, m)
                 fq = fatom[:, a:b].transpose(0, 1)  # (Qc, m)
                 cross = wEst[a:b] * (fq * s_i).sum(dim=1)  # (Qc,)
                 est[a:b] = diag[a:b] + cross

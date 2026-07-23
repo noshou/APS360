@@ -30,6 +30,29 @@ def q_chunks(nq: int, s: int):
         yield a, min(a + qc, nq)
 
 
+def autocast_dtype(device: "torch.device | str") -> "torch.dtype | None":
+    """BF16 on GPUs with native BF16 tensor cores, else None (stay fp32).
+
+    Requires CUDA compute capability >= 8.0 (Ampere and newer: A100, L4,
+    RTX Blackwell, etc). Turing (T4, capability 7.5) has no BF16
+    tensor-core path -- its matmuls would run BF16 unaccelerated, likely a
+    wash or a net loss rather than a speedup, so T4 is deliberately
+    excluded rather than blanket-enabling BF16 on every CUDA device.
+    CPU always returns None (autocast on CPU defaults to bf16 too, but
+    these baselines' CPU path isn't the target of this optimization).
+
+    Callers that get None back should skip any explicit dtype cast/
+    `torch.autocast` entirely and run plain fp32, not pass `dtype=None` to
+    `torch.autocast` (which would silently reinterpret as "use the
+    default autocast dtype" rather than "do nothing").
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        return None
+    major, _minor = torch.cuda.get_device_capability(device)
+    return torch.bfloat16 if major >= 8 else None
+
+
 @jaxtyped(typechecker=beartype)
 def build_fmag_table(
     qgrid: Float[torch.Tensor, "Q"],  # noqa: F821

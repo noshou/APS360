@@ -2,7 +2,12 @@ import torch
 from beartype import beartype
 from jaxtyping import Float, jaxtyped
 
-from Baselines.baseline import Baseline, build_fmag_table, q_chunks
+from Baselines.baseline import (
+    Baseline,
+    autocast_dtype,
+    build_fmag_table,
+    q_chunks,
+)
 from ScatterNet.batching import Batch
 
 
@@ -75,6 +80,9 @@ class StratEstBaseline(Baseline):
         qgrid = self._qgrid.to(device)
         ftable = self._fmag_table.to(device)
         tol = self._TOL
+        # BF16 on Ampere+ for the bmm below (native tensor cores there; T4
+        # gets None -> stays fp32, see autocast_dtype's docstring).
+        dtype = autocast_dtype(device)
 
         preds: list[Float[torch.Tensor, "Q"]] = []  # noqa: F722,F821
 
@@ -221,24 +229,32 @@ class StratEstBaseline(Baseline):
             m_l = 1.0 - m_h  # (U,) light selector
 
             est = torch.empty_like(qgrid)
+            dist_c = dist if dtype is None else dist.to(dtype)
+            G_c = G if dtype is None else G.to(dtype)
+            m_h_c = m_h if dtype is None else m_h.to(dtype)
+            m_l_c = m_l if dtype is None else m_l.to(dtype)
             # vectorize over q in memory-bounded chunks so the (Qc, U, U) sinc
             # intermediate never exceeds the old per-q (U, U) footprint by much
             for a, b in q_chunks(qgrid.shape[0], U):
-                gc = G[:, a:b].transpose(0, 1)  # (Qc, U)
-                qd = qgrid[a:b].view(-1, 1, 1) * dist.unsqueeze(
-                    0
-                )  # (Qc, U, U)
+                gc = G_c[:, a:b].transpose(0, 1)  # (Qc, U)
+                q_ab = qgrid[a:b] if dtype is None else qgrid[a:b].to(dtype)
+                qd = q_ab.view(-1, 1, 1) * dist_c.unsqueeze(0)  # (Qc, U, U)
                 sinc = torch.where(
                     qd.abs() < 1e-8, torch.ones_like(qd), torch.sin(qd) / qd
                 )
 
                 # masking G per stratum lets one bmm carry both blocks, so the
                 # (Qc, U, U) kernel needs no elementwise pair-weight multiply
-                gh = gc * m_h  # (Qc, U)
-                gl = gc * m_l  # (Qc, U)
+                gh = gc * m_h_c  # (Qc, U)
+                gl = gc * m_l_c  # (Qc, U)
                 out = torch.bmm(
                     sinc, torch.stack((gh, gl), dim=2)
                 )  # (Qc, U, 2)
+                # back to fp32 for the accuracy-sensitive rescale/accumulate
+                # below -- the reduced-precision block ends at the bmm.
+                out = out.float()
+                gh = gh.float()
+                gl = gl.float()
 
                 hh = (gh * out[..., 0]).sum(
                     dim=1

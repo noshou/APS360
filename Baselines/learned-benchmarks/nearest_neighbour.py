@@ -2,7 +2,7 @@ import torch
 from beartype import beartype
 from jaxtyping import Float, jaxtyped
 
-from Baselines.baseline import Baseline, build_fmag_table
+from Baselines.baseline import Baseline, autocast_dtype, build_fmag_table
 from ScatterNet.batching import Batch
 
 
@@ -42,6 +42,10 @@ class NNBaseline(Baseline):
         mask = batch.padding_mask()  # (N, M)
         qgrid = self._qgrid.to(device)
         ftable = self._fmag_table.to(device)
+        # BF16 on Ampere+ for the O(m^2) distance-matrix build below (native
+        # tensor cores there; T4 gets None -> stays fp32, see
+        # autocast_dtype's docstring).
+        dtype = autocast_dtype(device)
 
         preds: list[Float[torch.Tensor, "Q"]] = []  # noqa: F821
 
@@ -62,8 +66,9 @@ class NNBaseline(Baseline):
                 vocab_n = vocab_n[sub]
                 m = MAX_M
 
-            diff = coords_n.unsqueeze(0) - coords_n.unsqueeze(1)  # (m, m, 3)
-            dists = diff.norm(dim=-1)  # (m, m)
+            coords_c = coords_n if dtype is None else coords_n.to(dtype)
+            diff = coords_c.unsqueeze(0) - coords_c.unsqueeze(1)  # (m, m, 3)
+            dists = diff.norm(dim=-1).float()  # (m, m), back to fp32
             dists.fill_diagonal_(float("inf"))  # exclude self-distance (0)
             r_nn = dists.min(
                 dim=1

@@ -2,7 +2,7 @@ import torch
 from beartype import beartype
 from jaxtyping import Float, jaxtyped
 
-from Baselines.baseline import Baseline, build_fmag_table
+from Baselines.baseline import Baseline, autocast_dtype, build_fmag_table
 from ScatterNet.batching import Batch
 
 
@@ -66,6 +66,11 @@ class BinnedDebyeBaseline(Baseline):
         qgrid = self._qgrid.to(device)
         ftable = self._fmag_table.to(device)
         n_bins = self._n_bins
+        # BF16 on Ampere+ for the O(m^2) distance-matrix build below (native
+        # tensor cores there; T4 gets None -> stays fp32, see
+        # autocast_dtype's docstring). Everything after the distance
+        # reduction (binning, sinc, the tiny (Q,n_bins) matmul) stays fp32.
+        dtype = autocast_dtype(device)
 
         preds: list[Float[torch.Tensor, "Q"]] = []  # noqa: F722,F821
 
@@ -91,8 +96,9 @@ class BinnedDebyeBaseline(Baseline):
                 f0 = f0[sub]
                 m = MAX_M
 
-            diff = coords_n.unsqueeze(0) - coords_n.unsqueeze(1)  # (m, m, 3)
-            dists = diff.norm(dim=-1)  # (m, m)
+            coords_c = coords_n if dtype is None else coords_n.to(dtype)
+            diff = coords_c.unsqueeze(0) - coords_c.unsqueeze(1)  # (m, m, 3)
+            dists = diff.norm(dim=-1).float()  # (m, m), back to fp32
             idx = torch.triu_indices(m, m, offset=1, device=device)
             r_ij = dists[idx[0], idx[1]]  # (P,)
             w_ij = f0[idx[0]] * f0[idx[1]]  # (P,)
