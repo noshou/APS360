@@ -143,7 +143,7 @@ class ScatterNetBaseline(Baseline):
             Predicted I(q), shape (N, Q), clamped to non-negative (matching
             every other Baseline's convention - see Baselines/run/metrics.py).
         """
-        # Baselines.run.metrics.evaluate()'s loop never moves batches to device.
+        # Baselines.run.metrics.evaluate() loop never moves batches to device.
         # ScatterNet needs its own explicit move, same as
         # every call site in train.py's training/eval loops.
         batch = dc_replace(
@@ -208,9 +208,7 @@ def _force_tp(model: ScatterNet):
     Baselines.run.metrics.evaluate() assumes a baseline's prediction shape
     matches the full batch it was given (pred.shape == batch.iqval.shape).
     A DP-routed bucket returns only a rank-local molecule shard instead,
-    which would silently break that assumption (and Baselines.run.metrics has no
-    notion of cross-rank shards to begin with - it's a plain per-process
-    function, unlike train.py's own evaluate()). TP is unaffected, since
+    which would silently break that assumption. TP is unaffected, since
     every rank already reconstructs the full-batch output internally, so
     forcing TP here keeps every rank's independent evaluate() call
     numerically identical without touching Baselines/run/metrics.py.
@@ -250,7 +248,7 @@ def save_epoch_plots(
     Evaluate `model` on `loader`, write this epoch's diagnostic plots, and
     return the test loss/R2 computed in the same single pass.
 
-    Mirrors Baselines/run/colab_baselines.ipynb's own evaluate() + run_all_plots()
+    Mirrors Baselines/run/colab_baselines.ipynb own evaluate()/run_all_plots()
     call, so training progress is comparable to the baseline notebook's
     plots. The single shared run_all_plots() drives the whole set: per-q R^2,
     per-q percent error, Kratky overlay, the per-molecule signed-residual
