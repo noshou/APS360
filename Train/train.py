@@ -1637,7 +1637,7 @@ def _worker(rank: int, cfg: RunConfig):
                     epoch,
                 )
                 save_epoch_loss_plot(
-                    load_epoch_history(cfg.data_dir), cfg.data_dir, epoch
+                    load_epoch_history(cfg.data_dir), cfg.data_dir
                 )
                 _rclone_push(cfg.data_dir, cfg.data_rclone_dest)
 

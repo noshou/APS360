@@ -234,12 +234,16 @@ def save_epoch_plots(
     Mirrors Baselines/kaggle_baselines.ipynb's own evaluate() + run_all_plots()
     call, so training progress is comparable to the baseline notebook's
     plots. The single shared run_all_plots() drives the whole set: per-q R^2,
-    per-q percent error, the aggregated per-q summary, Kratky overlay, the
-    per-molecule signed-residual histogram (with skew) and per-molecule MSLE
-    distribution, error-vs-atom-count (+ scaling-slope fit) and signed-residual
-    vs atom count, and a one-row summary bar chart. Because evaluate() now
-    collects the per-molecule error distributions too, every new baseline
-    statistic appears in the epoch plots automatically, no change needed here.
+    per-q percent error, Kratky overlay, the per-molecule signed-residual
+    histogram (with skew) and per-molecule MSLE distribution,
+    error-vs-atom-count (+ scaling-slope fit) and signed-residual vs atom
+    count, plus summary.json/per_q_summary.json (the aggregated summary and
+    per-q summary numbers -- written as JSON, not a bar chart, since only
+    ScatterNet is ever plotted here and a one-row bar chart has nothing to
+    compare against; see run_all_plots(bar_chart_png=False)). Because
+    evaluate() now collects the per-molecule error distributions too, every
+    new baseline statistic appears in the epoch plots automatically, no
+    change needed here.
 
     When `compute_loss` is True, this ONE forced-TP pass also accumulates the
     composite loss and log1p R2 (via ScatterNetBaseline), so the caller no
@@ -303,7 +307,13 @@ def save_epoch_plots(
         result = _bl_evaluate(baseline, loader, q_grid, "ScatterNet")
     if rank == 0:
         epoch_dir = os.path.join(data_dir, f"epoch_{epoch:03d}")
-        written = run_all_plots([result], q_grid, epoch_dir)
+        # bar_chart_png=False: only one result (ScatterNet) is ever plotted
+        # here, so a one-row bar chart has nothing to compare against --
+        # summary.json/per_q_summary.json (always written regardless) carry
+        # the same numbers without the pointless PNG.
+        written = run_all_plots(
+            [result], q_grid, epoch_dir, bar_chart_png=False
+        )
         print(
             f"  [plots] wrote {len(written)} file(s) to {epoch_dir}",
             flush=True,
@@ -322,14 +332,18 @@ def save_batch_loss_plot(
     position) drives the x-axis - the pre-resume stretch is left honestly blank
     rather than shifting the whole curve left.
 
+    Also writes `loss_per_batch.json` (the exact `batch_losses` this plot
+    draws from) alongside the PNG, so the raw per-batch numbers survive
+    independent of the image.
+
     Parameters
     ----------
     batch_losses : list of (int, float)
         (global batch index, training loss) for each batch trained this epoch.
     data_dir : str
-        Root plots directory; the file is written to
-        `{data_dir}/epoch_{epoch:03d}/loss_per_batch.png`, alongside the
-        epoch's diagnostic plots.
+        Root plots directory; files are written to
+        `{data_dir}/epoch_{epoch:03d}/loss_per_batch.{png,json}`, alongside
+        the epoch's diagnostic plots.
     epoch : int
         Current epoch number.
 
@@ -340,10 +354,10 @@ def save_batch_loss_plot(
     import matplotlib.pyplot as plt
 
     from Baselines.metrics import (
-        PALETTE,
         TEXT_PRIMARY,
         _configure_mpl,
         _style_axes,
+        _write_json,
     )
 
     if not batch_losses:
@@ -355,18 +369,21 @@ def save_batch_loss_plot(
     xs = [b for b, _ in batch_losses]
     ys = [loss for _, loss in batch_losses]
 
+    json_path = os.path.join(epoch_dir, "loss_per_batch.json")
+    _write_json({"batch": xs, "loss": ys}, json_path)
+    print(f"  [plots] wrote {json_path}", flush=True)
+
     fig, ax = plt.subplots(figsize=(11, 6))
-    ax.plot(xs, ys, color=PALETTE[0], linewidth=1.2)
+    ax.plot(xs, ys, color=TEXT_PRIMARY, linewidth=1.2)
     ax.set_yscale(
         "log"
     )  # loss spans well over an order of magnitude within an epoch
     ax.set_xlabel("batch", color=TEXT_PRIMARY)
     ax.set_ylabel("training loss", color=TEXT_PRIMARY)
-    ax.set_title(rf"epoch {epoch}: loss per batch", color=TEXT_PRIMARY, pad=10)
     _style_axes(ax)
     fig.tight_layout()
     out_path = os.path.join(epoch_dir, "loss_per_batch.png")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
     print(f"  [plots] wrote {out_path}", flush=True)
 
@@ -436,14 +453,21 @@ def load_epoch_history(data_dir: str) -> list[dict]:
     return history
 
 
-def save_epoch_loss_plot(
-    history: list[dict], data_dir: str, epoch: int
-) -> None:
-    """Plot train/val/test loss vs epoch, up to and including `epoch`.
+def save_epoch_loss_plot(history: list[dict], data_dir: str) -> None:
+    """Update the run-wide train/val/test loss-vs-epoch trend.
 
-    Cheap: reads `history` (per-epoch records already on disk); no model call.
-    Written to `{data_dir}/epoch_{epoch:03d}/loss_per_epoch.png`,
-    so each epoch keeps its own snapshot of the curve instead.
+    Cheap: reads `history` (per-epoch records already on disk); no model
+    call. Written ONCE to `{data_dir}/loss_per_epoch.{png,json}`, at the
+    ROOT of data_dir rather than nested under this epoch's own
+    subdirectory - unlike every other per-epoch artifact, this one is a
+    single running trend, not a per-epoch snapshot, so nesting it meant N
+    near-duplicate copies by the end of an N-epoch run. The `.json`
+    sidecar holds the exact `history` the plot draws from.
+
+    Skipped entirely (no files touched) when there's one epoch of history
+    or fewer: a trend line with one point isn't a trend, and matplotlib's
+    default axis autoscaling around a single x-value produces a
+    degenerate range rather than a meaningful plot.
 
     Parameters
     ----------
@@ -452,52 +476,71 @@ def save_epoch_loss_plot(
         "test_loss"; typically `load_epoch_history(data_dir)`.
     data_dir : str
         Root plots directory.
-    epoch : int
-        Current epoch number, used to name the per-epoch subdirectory.
 
     Returns
     -------
     None
     """
+    if len(history) <= 1:
+        return
+
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
 
     from Baselines.metrics import (
-        PALETTE,
         TEXT_PRIMARY,
         _configure_mpl,
         _style_axes,
+        _write_json,
     )
 
-    if not history:
-        return
     _configure_mpl()
-    epoch_dir = os.path.join(data_dir, f"epoch_{epoch:03d}")
-    os.makedirs(epoch_dir, exist_ok=True)
+    os.makedirs(data_dir, exist_ok=True)
+
+    json_path = os.path.join(data_dir, "loss_per_epoch.json")
+    _write_json(history, json_path)
+    print(f"  [plots] wrote {json_path}", flush=True)
 
     epochs = [h["epoch"] for h in history]
     fig, ax = plt.subplots(figsize=(11, 6))
-    for (key, label), color in zip(
-        [("train_loss", "train"), ("val_loss", "val"), ("test_loss", "test")],
-        PALETTE,
+    # all-black, distinguished by linestyle + marker rather than color (see
+    # _colors()'s docstring for the same reasoning applied there)
+    for (key, label, marker), linestyle in zip(
+        [
+            ("train_loss", "train", "o"),
+            ("val_loss", "val", "D"),
+            ("test_loss", "test", "s"),
+        ],
+        ["-", "--", ":"],
     ):
         ax.plot(
             epochs,
             [h[key] for h in history],
-            marker="o",
+            marker=marker,
+            markersize=8.5,
             linewidth=2,
-            color=color,
+            color=TEXT_PRIMARY,
+            linestyle=linestyle,
             label=label,
         )
     ax.set_xlabel("epoch", color=TEXT_PRIMARY)
     ax.set_ylabel("loss", color=TEXT_PRIMARY)
-    ax.set_title(
-        f"loss per epoch (through epoch {epoch})", color=TEXT_PRIMARY, pad=10
-    )
+    # epoch numbers are integers; matplotlib's default locator otherwise
+    # ticks fractional epochs (1.00, 1.25, 1.50, ...), which don't mean
+    # anything here
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     _style_axes(ax)
-    ax.legend(loc="upper right", frameon=False, labelcolor=TEXT_PRIMARY)
+    # boxed and outside the axes (right side) so it never sits on top of
+    # the loss curves themselves
+    ax.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1),
+        frameon=True,
+        labelcolor=TEXT_PRIMARY,
+    )
     fig.tight_layout()
-    out_path = os.path.join(epoch_dir, "loss_per_epoch.png")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    out_path = os.path.join(data_dir, "loss_per_epoch.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
     print(f"  [plots] wrote {out_path}", flush=True)
 

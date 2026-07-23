@@ -2,6 +2,7 @@
 predictors.
 """
 
+import json
 import math
 import re
 from collections.abc import Iterable
@@ -571,12 +572,145 @@ def _style_axes(ax: "Axes") -> None:
 
 
 def _colors(results: list) -> dict:
+    """Assign each result a display color.
+
+    A single result (e.g. ScatterNet plotted alone during training, the
+    common case in Train/eval_plots.py) gets plain black (TEXT_PRIMARY)
+    rather than the first qualitative-palette color -- PALETTE exists to
+    keep MULTIPLE baselines visually distinct from each other in the
+    comparison notebooks, which doesn't apply when there's only one
+    series and no other color to distinguish it from.
+    """
+    if len(results) == 1:
+        return {results[0].name: TEXT_PRIMARY}
     return {r.name: PALETTE[i % len(PALETTE)] for i, r in enumerate(results)}
 
 
 def _slug(name: str) -> str:
     """Baseline display name -> filesystem-safe filename fragment."""
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def _bar_clamp_range(
+    vals: list, floor_limit: float = 0.0, cap_limit: float | None = None
+) -> tuple:
+    """Clamp a column of (possibly negative) scalars into a bar-chart
+    range that always brackets 0.
+
+    ``ax.barh(..., left=0)`` (the default) draws each bar from x=0 out to
+    its value, so the axis range must always include 0. A column where
+    every finite value is negative -- a real R² column is often
+    all-negative for a single, early-training model, since only one
+    result gets plotted per training epoch -- makes a naive
+    ``max(finite_vals)`` itself negative. Clamping a value into
+    ``[0, that_negative_number]`` (or ``[floor, that_negative_number]``)
+    then just returns the value unclamped, since ``min(0, negative)``
+    picks the negative number back out. The bar (and its text label,
+    positioned relative to the bar's width) then get drawn outside
+    whatever ``set_xlim`` falls back to, and ``bbox_inches="tight"``
+    expands the saved figure to cover that off-screen content -- a
+    mostly-blank image with a stray floating number, rather than a
+    visible bar. Forcing ``cap = max(0.0, ...)`` and
+    ``floor = min(0.0, ...)`` keeps 0 inside ``[floor, cap]``
+    unconditionally, so that can't happen.
+
+    Parameters
+    ----------
+    vals : list of float
+        Raw values (may include non-finite entries).
+    floor_limit : float
+        Lower bound the clamp floor is not allowed to go below (e.g.
+        -1.0 so one catastrophic outlier doesn't crush every other bar
+        into an invisible sliver). Pass 0.0 for a metric that is never
+        negative.
+    cap_limit : float or None
+        Optional upper bound on the clamp cap (e.g. 500.0 for a
+        percent-error column that can blow up near I(q)=0).
+
+    Returns
+    -------
+    tuple of (list of float, float, float)
+        (plot_vals clamped into [floor, cap], floor, cap).
+    """
+    finite = [v for v in vals if math.isfinite(v)]
+    raw_cap = max(finite) if finite else 1.0
+    if cap_limit is not None:
+        raw_cap = min(cap_limit, raw_cap)
+    cap = max(0.0, raw_cap)
+    raw_floor = min(finite) if finite else 0.0
+    floor = min(0.0, max(floor_limit, raw_floor))
+    plot_vals = [
+        min(max(v, floor), cap) if math.isfinite(v) else floor for v in vals
+    ]
+    return plot_vals, floor, cap
+
+
+def _per_q_agg(r: "EvalResult") -> dict:
+    """Collapse one result's per-q R²/percent-error curves to scalars.
+
+    Shared by `plot_per_q_summary` (the bar chart) and
+    `per_q_summary_values` (the JSON backup), so the two can never drift
+    out of sync with each other.
+    """
+    r2 = np.asarray(r.r2_per_q, dtype=float)
+    pct = np.asarray(r.pct_err_per_q, dtype=float)
+    r2f = r2[np.isfinite(r2)]
+    pctf = pct[np.isfinite(pct)]
+    hi_slice = pct[max(0, int(len(pct) * 2 / 3)) :]
+    hi_slice = hi_slice[np.isfinite(hi_slice)]
+    return {
+        "mean_r2": float(r2f.mean()) if r2f.size else float("nan"),
+        "worst_r2": float(r2f.min()) if r2f.size else float("nan"),
+        "mean_pct": float(pctf.mean()) if pctf.size else float("nan"),
+        "highq_pct": float(hi_slice.mean()) if hi_slice.size else float("nan"),
+    }
+
+
+def summary_values(results: list) -> list:
+    """The exact numbers `plot_summary` bar-charts, as plain dicts.
+
+    One dict per result: name, msle, r2_raw, r2_log1p, us_per_atom.
+    """
+    return [
+        {
+            "name": r.name,
+            "msle": r.msle,
+            "r2_raw": r.r2_raw,
+            "r2_log1p": r.r2_log1p,
+            "us_per_atom": r.us_per_atom,
+        }
+        for r in results
+    ]
+
+
+def per_q_summary_values(results: list) -> list:
+    """The exact numbers `plot_per_q_summary` bar-charts, as plain dicts.
+
+    One dict per result: name, mean_r2, worst_r2, mean_pct, highq_pct.
+    """
+    return [{"name": r.name, **_per_q_agg(r)} for r in results]
+
+
+def _json_safe(obj: object) -> object:
+    """Recursively replace non-finite floats with None.
+
+    JSON has no NaN/Infinity literal; `json.dump` would otherwise emit
+    the non-standard bare `NaN`/`Infinity` tokens Python accepts but many
+    other JSON parsers reject outright.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+def _write_json(obj: object, out_path: str) -> None:
+    """Write `obj` to `out_path` as indented JSON, NaN/Inf-safe."""
+    with open(out_path, "w") as fh:
+        json.dump(_json_safe(obj), fh, indent=2)
 
 
 def plot_summary(results: list, out_path: str):
@@ -595,10 +729,10 @@ def plot_summary(results: list, out_path: str):
     colors = [PALETTE[i % len(PALETTE)] for i in range(len(ordered))]
 
     specs = [
-        ("msle", r"MSLE ($\ln(1+I)$)", "{:.4f}"),
-        ("r2_raw", r"$R^2$ (raw)", "{:.3f}"),
-        ("r2_log1p", r"$R^2$ ($\ln(1+I)$)", "{:.3f}"),
-        ("us_per_atom", r"$\mu\mathrm{s}$ / atom", "{:.1f}"),
+        ("msle", r"MSLE ($\ln(1+I)$)", "{:.4f}", 0.0),
+        ("r2_raw", r"$R^2$ (raw)", "{:.3f}", -1.0),
+        ("r2_log1p", r"$R^2$ ($\ln(1+I)$)", "{:.3f}", -1.0),
+        ("us_per_atom", r"$\mu\mathrm{s}$ / atom", "{:.1f}", 0.0),
     ]
 
     n = len(ordered)
@@ -608,19 +742,16 @@ def plot_summary(results: list, out_path: str):
     fig.subplots_adjust(wspace=0.5)
 
     y = range(n)
-    for ax, (attr, title, fmt) in zip(axes, specs):
+    for ax, (attr, title, fmt, floor_limit) in zip(axes, specs):
         vals = [getattr(r, attr) for r in ordered]
-        finite_vals = [v for v in vals if math.isfinite(v)]
-        xmax = max(finite_vals) if finite_vals else 1
-        # clamp bar geometry to [0, xmax] -- a metric like R^2 can be
-        # arbitrarily negative for a badly-fit baseline, and plotting that
-        # raw value as bar width blows the bbox_inches="tight" figure size
-        # out to cover it even though it's clipped out of the visible
-        # xlim. The printed label below still shows the true (possibly
-        # very negative) value.
-        plot_vals = [
-            min(max(v, 0.0), xmax) if math.isfinite(v) else 0 for v in vals
-        ]
+        # clamp bar geometry into a range that always brackets 0 -- see
+        # _bar_clamp_range's docstring (a metric like R^2 can be
+        # arbitrarily negative, even for every plotted result at once).
+        # The printed label still shows the true (possibly very negative)
+        # value.
+        plot_vals, floor, cap = _bar_clamp_range(
+            vals, floor_limit=floor_limit
+        )
 
         bars = ax.barh(y, plot_vals, color=colors, height=0.68, zorder=3)
         ax.set_yticks(list(y))
@@ -632,20 +763,23 @@ def plot_summary(results: list, out_path: str):
             spine.set_visible(False)
         ax.grid(axis="x", color=GRID, linewidth=0.8, zorder=0)
         ax.set_axisbelow(True)
+        span = (cap - floor) or 1.0
         for bar, v in zip(bars, vals):
             label = "n/a" if not math.isfinite(v) else fmt.format(v)
+            negative = math.isfinite(v) and bar.get_width() < 0
             ax.text(
-                bar.get_width() + 0.02 * xmax,
+                bar.get_width() + (-0.02 if negative else 0.02) * span,
                 bar.get_y() + bar.get_height() / 2,
                 label,
                 va="center",
-                ha="left",
+                ha="right" if negative else "left",
                 color=TEXT_PRIMARY,
             )
-        ax.set_xlim(0, xmax * 1.22 if xmax > 0 else 1)
+        margin = 0.22 * span
+        ax.set_xlim(floor - (margin if floor < 0 else 0.0), cap + margin)
 
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
 
 
@@ -676,22 +810,23 @@ def plot_per_q_r2(results: list, q_grid: torch.Tensor, out_path: str):
         )
     ax.axhline(0, color=TEXT_MUTED, linewidth=1, linestyle="--", zorder=1)
     ax.set_xlabel(_Q_LABEL, color=TEXT_PRIMARY)
-    ax.set_ylabel(
-        r"$R^2$ at this $q$-point ($\ln(1+I)$ space)", color=TEXT_PRIMARY
-    )
+    ax.set_ylabel(r"$R^2$", color=TEXT_PRIMARY)
     _style_axes(ax)
     finite = [v for r in results for v in r.r2_per_q if math.isfinite(v)]
     floor = max(-3.0, min(finite)) if finite else -3.0
     ax.set_ylim(floor - 0.1, 1.05)
-    # legend outside the axes (right side), never over the data itself
-    ax.legend(
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1),
-        frameon=False,
-        labelcolor=TEXT_PRIMARY,
-    )
+    # legend outside the axes (right side), never over the data itself --
+    # only shown when there's actually something to distinguish (a single
+    # result's own legend just repeats its name for no reason)
+    if len(results) > 1:
+        ax.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1),
+            frameon=True,
+            labelcolor=TEXT_PRIMARY,
+        )
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
 
 
@@ -737,14 +872,15 @@ def plot_per_q_percent_error(
     finite = [v for r in results for v in r.pct_err_per_q if math.isfinite(v)]
     ymax = min(500.0, max(finite) * 1.1) if finite else 100.0
     ax.set_ylim(0, ymax)
-    ax.legend(
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1),
-        frameon=False,
-        labelcolor=TEXT_PRIMARY,
-    )
+    if len(results) > 1:
+        ax.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1),
+            frameon=True,
+            labelcolor=TEXT_PRIMARY,
+        )
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
 
 
@@ -794,15 +930,21 @@ def plot_kratky(results: list, q_grid: torch.Tensor, out_dir: str) -> list:
             linewidth=2,
             label="pred",
         )
-        ax.set_title(r.name, color=TEXT_PRIMARY, pad=10)
         ax.set_xlabel(_Q_LABEL, color=TEXT_PRIMARY)
         ax.set_ylabel(r"mean $\ln(1+I(q))$", color=TEXT_PRIMARY)
         _style_axes(ax)
-        ax.legend(loc="upper right", frameon=False, labelcolor=TEXT_PRIMARY)
+        # boxed and outside the axes (right side) so it never sits on top
+        # of the true/pred curves themselves
+        ax.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1),
+            frameon=True,
+            labelcolor=TEXT_PRIMARY,
+        )
 
         fig.tight_layout()
         out_path = os.path.join(out_dir, f"kratky_{_slug(r.name)}.png")
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
         plt.close(fig)
         written.append(out_path)
 
@@ -827,6 +969,46 @@ def _draw_hist(
     )
 
 
+# matplotlib's "densely dashdotted" pattern -- tighter spacing than the
+# built-in '-.' so it reads as visually distinct from the plain '--' zero
+# line at a glance, not just a slightly different dash rhythm.
+_DENSE_DASHDOT = (0, (3, 1, 1, 1))
+
+
+def _stats_legend(ax: "Axes", stats: dict) -> None:
+    """Boxed legend for a per-molecule histogram: one entry per reference
+    line already plotted (zero/mean/median, each with its own line-style
+    swatch, added via each axvline's own `label=`), plus one text-only
+    entry for skew/n, which has no corresponding line to swatch.
+
+    This replaces the old plot title -- mean/median were always redundant
+    between the title text and their own reference lines, so folding them
+    into the existing line legend removes that duplication; skew/n get a
+    swatch-less entry since there's nothing on the plot for them to label.
+    No-op if there are no stats (n == 0, e.g. an empty test set).
+    """
+    from matplotlib.lines import Line2D
+
+    handles, labels = ax.get_legend_handles_labels()
+    if not handles or stats.get("n", 0) == 0:
+        return
+    handles.append(Line2D([], [], color="none"))
+    labels.append(f"skew = {stats['skew']:.2f}  (n = {stats['n']})")
+    # below the x-axis, not to the right: these figures are narrow (7in)
+    # and a right-side legend eats enough of that width to squash the
+    # histogram itself; a 2-column row underneath costs height instead,
+    # which these figures have plenty of.
+    ax.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.18),
+        frameon=True,
+        labelcolor=TEXT_PRIMARY,
+        ncol=2,
+    )
+
+
 def plot_residual_histogram(results: list, out_dir: str) -> list:
     """Per-MOLECULE signed residual distribution, one PNG per baseline.
 
@@ -843,8 +1025,9 @@ def plot_residual_histogram(results: list, out_dir: str) -> list:
     positive skew means a long right tail of over-predicted molecules, negative
     a long left tail of under-predicted ones.
 
-    Reference lines: muted dashed at zero (no bias), solid at the mean, dotted
-    at the median. Title reports mean, median, skew, and n.
+    Reference lines: muted dashed at zero (no bias), solid at the mean,
+    densely dash-dotted at the median. No title -- mean/median/skew/n are
+    reported as legend entries instead (see `_stats_legend`).
 
     Returns the list of file paths written.
     """
@@ -860,10 +1043,16 @@ def plot_residual_histogram(results: list, out_dir: str) -> list:
     for r in results:
         fig, ax = plt.subplots(figsize=(7, 5.5))
         _draw_hist(ax, r.resid_hist, r.resid_edges, colors[r.name])
-        ax.axvline(0, color=TEXT_MUTED, linewidth=1, linestyle="--", zorder=1)
+        ax.axvline(
+            0,
+            color=TEXT_MUTED,
+            linewidth=1,
+            linestyle="--",
+            zorder=1,
+            label="zero",
+        )
 
         s = r.resid_stats or {}
-        title = r.name
         if s.get("n", 0) > 0:
             ax.axvline(
                 s["mean"],
@@ -871,20 +1060,16 @@ def plot_residual_histogram(results: list, out_dir: str) -> list:
                 linewidth=1.5,
                 linestyle="-",
                 zorder=2,
+                label=f"mean = {s['mean']:.3f}",
             )
             ax.axvline(
                 s["median"],
                 color=TEXT_PRIMARY,
                 linewidth=1.2,
-                linestyle=":",
+                linestyle=_DENSE_DASHDOT,
                 zorder=2,
+                label=f"median = {s['median']:.3f}",
             )
-            title = (
-                rf"{r.name}: $\mu={s['mean']:.3f}$, "
-                rf"med$={s['median']:.3f}$, "
-                rf"skew$={s['skew']:.2f}$ ($n={s['n']}$)"
-            )
-        ax.set_title(title, color=TEXT_PRIMARY, pad=10, fontsize=12)
         ax.set_xlabel(
             r"per-molecule mean $\ln(1+\mathrm{pred}) - "
             r"\ln(1+\mathrm{true})$",
@@ -896,12 +1081,13 @@ def plot_residual_histogram(results: list, out_dir: str) -> list:
             spine.set_visible(False)
         ax.grid(axis="y", color=GRID, linewidth=0.8, zorder=0)
         ax.set_axisbelow(True)
+        _stats_legend(ax, s)
 
         fig.tight_layout()
         out_path = os.path.join(
             out_dir, f"residual_histogram_{_slug(r.name)}.png"
         )
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
         plt.close(fig)
         written.append(out_path)
 
@@ -916,8 +1102,8 @@ def plot_per_molecule_msle(results: list, out_dir: str) -> list:
     by construction, so a heavy right tail is expected and the interesting
     question is how heavy, a long tail means a subset of molecules the
     baseline fails badly on even when the bulk are fine (which a single
-    pooled MSLE hides). Title reports mean vs median (mean >> median flags
-    exactly that tail) and skew.
+    pooled MSLE hides). No title -- mean/median/skew/n are reported as
+    legend entries instead (see `_stats_legend`).
 
     Returns the list of file paths written.
     """
@@ -935,7 +1121,6 @@ def plot_per_molecule_msle(results: list, out_dir: str) -> list:
         _draw_hist(ax, r.msle_hist, r.msle_edges, colors[r.name])
 
         s = r.msle_stats or {}
-        title = r.name
         if s.get("n", 0) > 0:
             ax.axvline(
                 s["mean"],
@@ -943,20 +1128,16 @@ def plot_per_molecule_msle(results: list, out_dir: str) -> list:
                 linewidth=1.5,
                 linestyle="-",
                 zorder=2,
+                label=f"mean = {s['mean']:.3f}",
             )
             ax.axvline(
                 s["median"],
                 color=TEXT_PRIMARY,
                 linewidth=1.2,
-                linestyle=":",
+                linestyle=_DENSE_DASHDOT,
                 zorder=2,
+                label=f"median = {s['median']:.3f}",
             )
-            title = (
-                rf"{r.name}: mean$={s['mean']:.3f}$, "
-                rf"med$={s['median']:.3f}$, "
-                rf"skew$={s['skew']:.2f}$ ($n={s['n']}$)"
-            )
-        ax.set_title(title, color=TEXT_PRIMARY, pad=10, fontsize=12)
         ax.set_xlabel(
             r"per-molecule MSLE ($\ln(1+I)$ space)", color=TEXT_PRIMARY
         )
@@ -966,12 +1147,13 @@ def plot_per_molecule_msle(results: list, out_dir: str) -> list:
             spine.set_visible(False)
         ax.grid(axis="y", color=GRID, linewidth=0.8, zorder=0)
         ax.set_axisbelow(True)
+        _stats_legend(ax, s)
 
         fig.tight_layout()
         out_path = os.path.join(
             out_dir, f"per_molecule_msle_{_slug(r.name)}.png"
         )
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
         plt.close(fig)
         written.append(out_path)
 
@@ -1059,14 +1241,15 @@ def plot_error_vs_atom_count(results: list, out_path: str):
     # information (unlike a continuous axis) and just add clutter
     ax.grid(axis="y", color=GRID, linewidth=0.8, zorder=0)
     ax.set_axisbelow(True)
-    ax.legend(
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1),
-        frameon=False,
-        labelcolor=TEXT_PRIMARY,
-    )
+    if len(results) > 1:
+        ax.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1),
+            frameon=True,
+            labelcolor=TEXT_PRIMARY,
+        )
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
 
 
@@ -1148,14 +1331,15 @@ def plot_residual_by_atom_count(results: list, out_path: str):
         spine.set_visible(False)
     ax.grid(axis="y", color=GRID, linewidth=0.8, zorder=0)
     ax.set_axisbelow(True)
-    ax.legend(
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1),
-        frameon=False,
-        labelcolor=TEXT_PRIMARY,
-    )
+    if len(results) > 1:
+        ax.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1),
+            frameon=True,
+            labelcolor=TEXT_PRIMARY,
+        )
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
 
 
@@ -1183,23 +1367,7 @@ def plot_per_q_summary(results: list, out_path: str):
 
     _configure_mpl()
 
-    def _agg(r: EvalResult) -> dict:
-        r2 = np.asarray(r.r2_per_q, dtype=float)
-        pct = np.asarray(r.pct_err_per_q, dtype=float)
-        r2f = r2[np.isfinite(r2)]
-        pctf = pct[np.isfinite(pct)]
-        hi_slice = pct[max(0, int(len(pct) * 2 / 3)) :]
-        hi_slice = hi_slice[np.isfinite(hi_slice)]
-        return {
-            "mean_r2": float(r2f.mean()) if r2f.size else float("nan"),
-            "worst_r2": float(r2f.min()) if r2f.size else float("nan"),
-            "mean_pct": float(pctf.mean()) if pctf.size else float("nan"),
-            "highq_pct": float(hi_slice.mean())
-            if hi_slice.size
-            else float("nan"),
-        }
-
-    aggs = {r.name: _agg(r) for r in results}
+    aggs = {r.name: _per_q_agg(r) for r in results}
     ordered = sorted(
         results,
         key=lambda r: (
@@ -1228,25 +1396,22 @@ def plot_per_q_summary(results: list, out_path: str):
     y = range(n)
     for ax, (key, title, fmt, clip_pct) in zip(axes, specs):
         vals = [aggs[r.name][key] for r in ordered]
-        finite_vals = [v for v in vals if math.isfinite(v)]
         # clamp bar GEOMETRY so one blown-up value doesn't crush every
-        # other bar into an invisible sliver; the printed label still
-        # shows the true value.
+        # other bar into an invisible sliver, and so an all-negative
+        # column (a real R² column is often all-negative, since only one
+        # result gets plotted per training epoch) still lands inside a
+        # visible axis range -- see _bar_clamp_range's docstring. The
+        # printed label still shows the true value.
         # %err: cap at 500 (near-zero I(q) sends it to infinity), floor 0.
         # R²: floor at -1 (a catastrophically negative baseline like an
         # untrained MLP would otherwise set the axis to hundreds negative and
         # flatten the 0.9-vs-0.99 differences that actually matter).
         if clip_pct:
-            cap = min(500.0, max(finite_vals)) if finite_vals else 1.0
-            floor = 0.0
+            plot_vals, floor, cap = _bar_clamp_range(
+                vals, floor_limit=0.0, cap_limit=500.0
+            )
         else:
-            cap = max(finite_vals) if finite_vals else 1.0
-            floor = max(-1.0, min(finite_vals)) if finite_vals else 0.0
-            floor = min(floor, 0.0)
-        plot_vals = [
-            min(max(v, floor), cap) if math.isfinite(v) else floor
-            for v in vals
-        ]
+            plot_vals, floor, cap = _bar_clamp_range(vals, floor_limit=-1.0)
 
         bars = ax.barh(y, plot_vals, color=colors, height=0.68, zorder=3)
         ax.set_yticks(list(y))
@@ -1261,40 +1426,71 @@ def plot_per_q_summary(results: list, out_path: str):
         span = (cap - floor) or 1.0
         for bar, v in zip(bars, vals):
             label = "n/a" if not math.isfinite(v) else fmt.format(v)
+            negative = math.isfinite(v) and bar.get_width() < 0
             ax.text(
-                bar.get_width() + 0.02 * span,
+                bar.get_width() + (-0.02 if negative else 0.02) * span,
                 bar.get_y() + bar.get_height() / 2,
                 label,
                 va="center",
-                ha="left",
+                ha="right" if negative else "left",
                 color=TEXT_PRIMARY,
             )
-        ax.set_xlim(min(0.0, floor), cap * 1.25 if cap > 0 else 1.0)
+        margin = 0.25 * span
+        ax.set_xlim(floor - (margin if floor < 0 else 0.0), cap + margin)
 
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
 
 
 def run_all_plots(
-    results: list, q_grid: torch.Tensor, out_dir: str
+    results: list,
+    q_grid: torch.Tensor,
+    out_dir: str,
+    bar_chart_png: bool = True,
 ) -> list:
     """Write every plot above into ``out_dir``.
 
-    Returns the list of file paths written.
+    ``summary.json``/``per_q_summary.json`` (the exact numbers the two bar
+    charts below draw from -- see `summary_values`/`per_q_summary_values`)
+    are always written, regardless of `bar_chart_png`, so those numbers
+    survive even when the PNG is skipped or its styling changes later.
+
+    Parameters
+    ----------
+    bar_chart_png : bool
+        If False, skip ``summary.png``/``per_q_summary.png`` entirely. A
+        one-row bar chart is a strange way to show a single model's own
+        numbers -- there's nothing to compare it against -- so callers
+        plotting just one result (e.g. ScatterNet's per-epoch training
+        plots) should pass False. The multi-baseline comparison notebooks
+        (kaggle_baselines.ipynb etc.), where the bars genuinely compare
+        several baselines against each other, keep the default True.
+
+    Returns
+    -------
+    list
+        The file paths written.
     """
     import os
 
     os.makedirs(out_dir, exist_ok=True)
 
     written = []
+
+    summary_path = os.path.join(out_dir, "summary.json")
+    _write_json(summary_values(results), summary_path)
+    written.append(summary_path)
+
+    per_q_summary_path = os.path.join(out_dir, "per_q_summary.json")
+    _write_json(per_q_summary_values(results), per_q_summary_path)
+    written.append(per_q_summary_path)
+
     single_file_plots = {
-        "summary.png": lambda p: plot_summary(results, p),
         "per_q_r2.png": lambda p: plot_per_q_r2(results, q_grid, p),
         "per_q_percent_error.png": lambda p: plot_per_q_percent_error(
             results, q_grid, p
         ),
-        "per_q_summary.png": lambda p: plot_per_q_summary(results, p),
         "error_vs_atom_count.png": lambda p: plot_error_vs_atom_count(
             results, p
         ),
@@ -1302,6 +1498,11 @@ def run_all_plots(
             results, p
         ),
     }
+    if bar_chart_png:
+        single_file_plots["summary.png"] = lambda p: plot_summary(results, p)
+        single_file_plots["per_q_summary.png"] = lambda p: plot_per_q_summary(
+            results, p
+        )
     for fname, fn in single_file_plots.items():
         full = os.path.join(out_dir, fname)
         fn(full)
