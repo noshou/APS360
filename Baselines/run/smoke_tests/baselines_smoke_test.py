@@ -16,8 +16,8 @@ prints are not statistically meaningful -- do not read them as baseline
 performance. Use colab_baselines.ipynb on the real dataset for that.
 
 Usage:
-    python Baselines/smoke_tests/baselines_smoke_test.py \
-        --config Baselines/smoke_tests/baselines_smoke_test.yaml
+    python Baselines/run/smoke_tests/baselines_smoke_test.py \
+        --config Baselines/run/smoke_tests/baselines_smoke_test.yaml
 """
 
 import argparse
@@ -29,7 +29,9 @@ import torch
 import yaml
 
 REPO = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
 )
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "Baselines", "physics-benchmarks"))
@@ -37,10 +39,13 @@ sys.path.insert(0, os.path.join(REPO, "Baselines", "learned-benchmarks"))
 
 from atom_count import AtomCountBaseline  # noqa: E402
 from binned_debye import BinnedDebyeBaseline  # noqa: E402
+from binned_debye_learned import BinnedDebyeLearnedBaseline  # noqa: E402
+from hdbscan import Hdbscan  # noqa: E402
 from linsvm import Linsvm  # noqa: E402
 from mlp_2 import Mlp2Baseline  # noqa: E402
 from nearest_neighbour import NNBaseline  # noqa: E402
 from propo_est import PropoEstBaseline  # noqa: E402
+from rand_forest import RandForestBaseline  # noqa: E402
 from rg import GuinierPorodBaseline, RgBaseline  # noqa: E402
 from strat_est import StratEstBaseline  # noqa: E402
 
@@ -62,6 +67,34 @@ _BASELINE_FACTORIES = {
         n_components=cfg["linsvm_n_components"]
     ).fit(train),
     "nearest_neighbour": lambda cfg, q, e, train: NNBaseline(q, e).fit(train),
+    "hdbscan": lambda cfg, q, e, train: Hdbscan(q, e),
+    "rand_forest": lambda cfg, q, e, train: RandForestBaseline(
+        n_estimators=cfg["rf_n_estimators"]
+    ).fit(train),
+    "binned_debye_learned": lambda cfg, q, e, train: BinnedDebyeLearnedBaseline(
+        q,
+        e,
+        n_bins=cfg["bdl_n_bins"],
+        hidden=tuple(cfg["bdl_hidden"]),
+        epochs=cfg["bdl_epochs"],
+    ).fit(train),
+}
+
+# mirrors which of Baselines/{physics,learned}-benchmarks/ each key imports
+# from -- used to split run_all_plots' summary chart by group.
+_CATEGORIES = {
+    "rg": "physics",
+    "guinier_porod": "physics",
+    "atom_count": "physics",
+    "binned_debye": "physics",
+    "propo_est": "physics",
+    "strat_est": "physics",
+    "mlp": "learned",
+    "linear_svm": "learned",
+    "nearest_neighbour": "learned",
+    "hdbscan": "learned",
+    "rand_forest": "learned",
+    "binned_debye_learned": "learned",
 }
 
 _DISPLAY_NAMES = {
@@ -74,6 +107,9 @@ _DISPLAY_NAMES = {
     "mlp": "MLP",
     "linear_svm": "Linear SVM",
     "nearest_neighbour": "Nearest Neighbour",
+    "hdbscan": "HDBSCAN",
+    "rand_forest": "Random Forest",
+    "binned_debye_learned": "Binned Debye (learned)",
 }
 
 
@@ -172,7 +208,12 @@ def main(config_path: str) -> None:
         results.append(result)
 
     print(f"\nWriting plots to {cfg['out_dir']}...")
-    written = run_all_plots(results, q_grid, cfg["out_dir"])
+    categories = {
+        _DISPLAY_NAMES[key]: _CATEGORIES[key] for key in cfg["baselines"]
+    }
+    written = run_all_plots(
+        results, q_grid, cfg["out_dir"], categories=categories
+    )
     for path in written:
         print(f"  {path}")
     print(

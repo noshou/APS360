@@ -714,8 +714,14 @@ def _write_json(obj: object, out_path: str) -> None:
 
 
 def plot_summary(results: list, out_path: str):
-    """Bar chart: MSLE, R² (raw), R² (log1p), µs/atom, one row per
-    baseline.
+    """Bar chart: MSLE, R² (log1p), µs/atom, one row per baseline.
+
+    R² (raw) is deliberately not plotted here: raw-space R² is dominated by
+    molecule-to-molecule scale variance (I(0) roughly tracks atom count) and
+    reads as noise next to the log1p figure, which is the one that actually
+    discriminates baseline quality. It's still computed and kept in
+    ``EvalResult``/``summary.json`` (see ``summary_values``) -- only the
+    plotted bar chart drops it.
     """
     import matplotlib.pyplot as plt
 
@@ -730,7 +736,6 @@ def plot_summary(results: list, out_path: str):
 
     specs = [
         ("msle", r"MSLE ($\ln(1+I)$)", "{:.4f}", 0.0),
-        ("r2_raw", r"$R^2$ (raw)", "{:.3f}", -1.0),
         ("r2_log1p", r"$R^2$ ($\ln(1+I)$)", "{:.3f}", -1.0),
         ("us_per_atom", r"$\mu\mathrm{s}$ / atom", "{:.1f}", 0.0),
     ]
@@ -1457,25 +1462,36 @@ def run_all_plots(
     results: list,
     q_grid: torch.Tensor,
     out_dir: str,
+    categories: dict,
     bar_chart_png: bool = True,
 ) -> list:
     """Write every plot above into ``out_dir``.
 
-    ``summary.json``/``per_q_summary.json`` (the exact numbers the two bar
-    charts below draw from -- see `summary_values`/`per_q_summary_values`)
-    are always written, regardless of `bar_chart_png`, so those numbers
-    survive even when the PNG is skipped or its styling changes later.
+    ``summary.json``/``per_q_summary.json`` (the exact numbers the summary
+    bar charts draw from -- see `summary_values`/`per_q_summary_values`) are
+    always written, regardless of `bar_chart_png`, so those numbers survive
+    even when the PNG is skipped or its styling changes later.
 
     Parameters
     ----------
+    categories : dict
+        Maps each result's ``name`` to a group label (e.g. ``"physics"`` /
+        ``"learned"``). ``summary.png`` is split one-per-label (written as
+        ``summary_<label>.png``) rather than one chart mixing closed-form
+        physics formulas with fitted models -- their R²/MSLE/timing
+        characters aren't comparable on the same axes. Every name in
+        `results` must have an entry (a missing one is a bug in the
+        caller, not something to silently drop). Unused when
+        `bar_chart_png` is False, but still required for a consistent
+        call signature.
     bar_chart_png : bool
-        If False, skip ``summary.png``/``per_q_summary.png`` entirely. A
-        one-row bar chart is a strange way to show a single model's own
-        numbers -- there's nothing to compare it against -- so callers
-        plotting just one result (e.g. ScatterNet's per-epoch training
-        plots) should pass False. The multi-baseline comparison notebook
-        (colab_baselines.ipynb), where the bars genuinely compare several
-        baselines against each other, keeps the default True.
+        If False, skip ``summary_<label>.png``/``per_q_summary.png``
+        entirely. A one-row bar chart is a strange way to show a single
+        model's own numbers -- there's nothing to compare it against -- so
+        callers plotting just one result (e.g. ScatterNet's per-epoch
+        training plots) should pass False. The multi-baseline comparison
+        notebook (colab_baselines.ipynb), where the bars genuinely compare
+        several baselines against each other, keeps the default True.
 
     Returns
     -------
@@ -1509,7 +1525,18 @@ def run_all_plots(
         ),
     }
     if bar_chart_png:
-        single_file_plots["summary.png"] = lambda p: plot_summary(results, p)
+        missing = [r.name for r in results if r.name not in categories]
+        if missing:
+            raise ValueError(
+                f"run_all_plots: no category given for {missing} -- "
+                "every result needs an entry in `categories`"
+            )
+        for label in sorted(set(categories.values())):
+            group = [r for r in results if categories[r.name] == label]
+            if group:
+                single_file_plots[f"summary_{label}.png"] = (
+                    lambda p, group=group: plot_summary(group, p)
+                )
         single_file_plots["per_q_summary.png"] = lambda p: plot_per_q_summary(
             results, p
         )

@@ -1,7 +1,7 @@
 # Synthetic-data CPU smoke test for Baselines/metrics.py. Not real training data --
 # purely to check that every baseline runs end-to-end and every plot in
 # run_all_plots() renders without error before spending Kaggle GPU time.
-# Run: python Baselines/smoke_tests/baselines_smoke_test.py --config Baselines/smoke_tests/baselines_smoke_test.yaml
+# Run: python Baselines/run/smoke_tests/baselines_smoke_test.py --config Baselines/run/smoke_tests/baselines_smoke_test.yaml
 
 seed: 0
 
@@ -32,11 +32,15 @@ noise_log_std: 0.05
 # Mlp2Baseline, same class kaggle_baselines.ipynb uses -- it falls back to CPU
 # automatically, and this synthetic set is tiny enough that a few epochs are
 # instant either way.
-baselines: [rg, guinier_porod, atom_count, binned_debye, propo_est, strat_est, mlp, linear_svm, nearest_neighbour]
+baselines: [rg, guinier_porod, atom_count, binned_debye, propo_est, strat_est, mlp, linear_svm, nearest_neighbour, hdbscan, rand_forest, binned_debye_learned]
 
 # learned-baseline hyperparameters, cut down for smoke-test speed (not accuracy)
 mlp_hidden: [16, 16]
 mlp_epochs: 50
 linsvm_n_components: 20
+rf_n_estimators: 20
+bdl_n_bins: 20
+bdl_hidden: [16, 16]
+bdl_epochs: 50
 
-out_dir: Baselines/smoke_tests/smoke_test_out
+out_dir: Baselines/run/smoke_tests/smoke_test_out

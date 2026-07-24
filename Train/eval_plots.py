@@ -329,7 +329,11 @@ def save_epoch_plots(
         # summary.json/per_q_summary.json (always written regardless) carry
         # the same numbers without the pointless PNG.
         written = run_all_plots(
-            [result], q_grid, epoch_dir, bar_chart_png=False
+            [result],
+            q_grid,
+            epoch_dir,
+            categories={"ScatterNet": "learned"},
+            bar_chart_png=False,
         )
         print(
             f"  [plots] wrote {len(written)} file(s) to {epoch_dir}",

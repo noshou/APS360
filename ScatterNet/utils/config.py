@@ -182,20 +182,6 @@ class RunConfig:
         wherever it left off), so a horizon-based schedule (cosine,
         step-to-a-target) isn't safe here; exponential per-epoch decay
         needs no known endpoint.
-    plateau_window : int
-        Batches per rolling window for the reactive mid-epoch LR cut.
-        Unlike lr_gamma's unconditional per-epoch decay, this one only
-        fires on an actual stall: every plateau_window batches, rank
-        0's mean training loss over that window is compared to the
-        best window seen since the last cut.
-    plateau_patience : int
-        Consecutive non-improving windows before cutting the LR by
-        plateau_factor. The bad-streak counter resets to 0 after a
-        cut, which doubles as the cooldown (no separate knob needed).
-    plateau_factor : float
-        Multiplicative LR cut applied on a detected plateau (see
-        plateau_window/plateau_patience). 1.0 disables the reactive
-        cut.
     weight_decay : float
         Adam L2 weight decay coefficient.
     grad_clip : float
@@ -302,10 +288,7 @@ class RunConfig:
 
     # training
     lr: float = 1.3e-4
-    lr_gamma: float = 0.9  # per-epoch ExponentialLR decay factor
-    plateau_window: int = 500  # batches per rolling window (reactive LR cut)
-    plateau_patience: int = 3  # non-improving windows before a cut
-    plateau_factor: float = 0.5  # multiplicative LR cut on a detected plateau
+    lr_gamma: float = 0.7  # per-epoch ExponentialLR decay factor
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     epochs: int = 20
@@ -356,7 +339,6 @@ class RunConfig:
             "lambda_7",
             "lr",
             "lr_gamma",
-            "plateau_factor",
             "weight_decay",
             "grad_clip",
             "dataset_frac",

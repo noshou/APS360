@@ -3,7 +3,6 @@ import os
 import random
 import subprocess
 import time as _time
-import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import replace as dc_replace
@@ -401,9 +400,6 @@ def _parse_args():
     # training
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--lr_gamma", type=float, default=None)
-    p.add_argument("--plateau_window", type=int, default=None)
-    p.add_argument("--plateau_patience", type=int, default=None)
-    p.add_argument("--plateau_factor", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
     p.add_argument("--grad_clip", type=float, default=None)
     p.add_argument("--epochs", type=int, default=None)
@@ -486,16 +482,6 @@ def evaluate(
         log1p space.
     """
     model.eval()
-    print(
-        f"  [{label}] entering evaluate(): rank={rank} pid={os.getpid()} "
-        f"world_size={
-            dist.get_world_size()
-            if dist.is_available()
-            and dist.is_initialized()
-            else 1
-        }",
-        flush=True,
-    )
     amp = bool(cfg.amp) and device.startswith("cuda")
     dist_on = dist.is_available() and dist.is_initialized()
     total_loss = 0.0
@@ -994,38 +980,16 @@ def _worker(rank: int, cfg: RunConfig):
     best_val = float("inf")
     # batches to skip in the first resumed epoch (exact mid-epoch resume)
     resume_skip = 0
-    # Reactive mid-epoch LR-cut state (see plateau check in the batch loop).
-    # Unlike the per-epoch ExponentialLR (a pure function of epoch number),
-    # this genuinely needs to survive a resume: it's memory of how close we
-    # were to the next cut, built from a sequence of training-loss windows
-    # that can't be recomputed after the fact. Losing it on a resume
-    # wouldn't corrupt anything, but this run resumes often (crash safety
-    # saves every ckpt_interval_sec), and forgetting an in-progress bad
-    # streak each time would silently make the reactive cut much slower to
-    # ever fire.
-    plateau_best = float("inf")
-    plateau_bad_streak = 0
-    # A checkpoint predating both schedulers has an lr that was never
-    # touched in place (see below) - it still needs fast-forwarding to the
-    # correct epoch's LR. A checkpoint saved BY this code already has the
-    # true current LR baked into optimizer["lr"] (ExponentialLR.step() and
-    # the plateau cut both mutate param_groups in place, so both are
-    # captured by optimizer.state_dict() same as the weights are), and
-    # fast-forwarding on top of that would double-apply the decay/cuts that
-    # already happened before the crash. "plateau_best" is only ever present
-    # in a checkpoint written by this code, so its presence marks which case
-    # we're in.
-    pre_scheduler_ckpt = False
 
     if cfg.resume:
         ckpt = torch.load(cfg.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
+        # optimizer.state_dict() mutates param_groups["lr"] in place on every
+        # ExponentialLR.step(), so the true current LR is captured here same
+        # as the weights - no separate fast-forwarding needed.
         optimizer.load_state_dict(ckpt["optimizer"])
         best_val = ckpt.get("val_loss", float("inf"))
         saved_bi = ckpt.get("batch_idx", -1)
-        pre_scheduler_ckpt = "plateau_best" not in ckpt
-        plateau_best = ckpt.get("plateau_best", float("inf"))
-        plateau_bad_streak = ckpt.get("plateau_bad_streak", 0)
         if (
             saved_bi is None or saved_bi < 0
         ):  # checkpoint sat at an epoch boundary
@@ -1034,34 +998,20 @@ def _worker(rank: int, cfg: RunConfig):
             start_epoch = ckpt["epoch"]
             resume_skip = saved_bi + 1
         if rank == 0:
+            resumed_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"resumed from {cfg.resume} (epoch {ckpt['epoch']}, "
                 f"batch_idx {saved_bi}, val_loss {best_val:.4f}, "
-                f"plateau_best {plateau_best:.4f}, "
-                f"plateau_bad_streak {plateau_bad_streak})",
+                f"lr {resumed_lr:.4g})",
             )
 
     # Per-epoch LR decay. ExponentialLR.step() (this torch version) multiplies
-    # the optimizer's CURRENT lr by gamma rather than recomputing from a fixed
-    # base, so it composes correctly with the in-place plateau cut below with
-    # no extra bookkeeping - whichever mechanism last touched param_groups
-    # wins, and both are captured together in optimizer.state_dict().
+    # the optimizer's CURRENT lr by gamma rather than recomputing from a
+    # fixed base, so a resumed run just keeps decaying from the restored LR
+    # with no extra bookkeeping.
     scheduler = torch.optim.lr_scheduler.ExponentialLR(
         optimizer, gamma=cfg.lr_gamma
     )
-    if pre_scheduler_ckpt:
-        # Resuming from a checkpoint predating this scheduler: its lr was
-        # never touched in place, so it's still exactly cfg.lr and must be
-        # fast-forwarded to the value epoch start_epoch should have. A
-        # checkpoint saved BY this code needs no such correction - see the
-        # comment where pre_scheduler_ckpt is set.
-        with warnings.catch_warnings():
-            # step() before any optimizer.step() is exactly what we want
-            # here (fast-forwarding past already-completed epochs, not
-            # skipping one).
-            warnings.filterwarnings("ignore", category=UserWarning)
-            for _ in range(start_epoch - 1):
-                scheduler.step()
 
     # profiler - diagnostic mode. Two decoupled layers, both on every rank:
     #
@@ -1208,8 +1158,7 @@ def _worker(rank: int, cfg: RunConfig):
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "val_loss": best_val,
-                "plateau_best": plateau_best,
-                "plateau_bad_streak": plateau_bad_streak,
+                "lr": optimizer.param_groups[0]["lr"],
                 "q_grid": q_grid,
                 "energy": energy,
                 "hparams": hparams,
@@ -1227,14 +1176,6 @@ def _worker(rank: int, cfg: RunConfig):
 
         save_run_config_rtf(cfg, cfg.data_dir)
         _rclone_push(cfg.data_dir, cfg.data_rclone_dest)
-
-    # Rolling window for the reactive plateau check (rank 0 only - see the
-    # check itself in the batch loop for why only rank 0's stream is used).
-    # Not resumed on a crash (unlike plateau_best/plateau_bad_streak above):
-    # losing at most one partial window's worth of accumulation is harmless,
-    # same as train_loss_sum resetting every epoch already.
-    plateau_win_loss_sum = 0.0
-    plateau_win_n = 0
 
     for epoch in range(start_epoch, start_epoch + cfg.epochs):
         # Seed before iteration so all ranks shuffle train_loader identically.
@@ -1511,51 +1452,6 @@ def _worker(rank: int, cfg: RunConfig):
                 )
                 torch.cuda.reset_peak_memory_stats()
 
-            # Reactive mid-epoch LR cut: unlike lr_gamma's unconditional
-            # per-epoch decay, this only fires on an actual stall. Only rank
-            # 0's loss stream feeds the window (under DP routing each rank
-            # sees a different molecule shard, so per-rank means would
-            # disagree on when to cut - which rank is "right" isn't a
-            # meaningful question and would desync the ranks' LRs). Window
-            # closure is triggered by _bi alone, which is identical across
-            # ranks every iteration (all ranks walk the same shuffled
-            # train_loader in lockstep - see the per-epoch seed above), so
-            # every rank enters this block together even though only rank 0
-            # decides; the decision is then broadcast so every rank's
-            # optimizer applies the identical cut.
-            if rank == 0:
-                plateau_win_loss_sum += batch_loss * n
-                plateau_win_n += n
-            if (_bi + 1) % cfg.plateau_window == 0:
-                cut_now = torch.zeros(1, device=device)
-                if rank == 0:
-                    window_mean = plateau_win_loss_sum / max(
-                        plateau_win_n, 1
-                    )
-                    plateau_win_loss_sum = 0.0
-                    plateau_win_n = 0
-                    if window_mean < plateau_best:
-                        plateau_best = window_mean
-                        plateau_bad_streak = 0
-                    else:
-                        plateau_bad_streak += 1
-                    if plateau_bad_streak >= cfg.plateau_patience:
-                        cut_now[0] = 1.0
-                        plateau_bad_streak = 0
-                        print(
-                            f"  [plateau] no improvement over "
-                            f"{cfg.plateau_patience} windows of "
-                            f"{cfg.plateau_window} batches (best "
-                            f"{plateau_best:.4f}, this window "
-                            f"{window_mean:.4f}) -- cutting lr "
-                            f"x{cfg.plateau_factor}",
-                        )
-                if is_dist:
-                    dist.broadcast(cut_now, src=0)
-                if cut_now.item() > 0.5:
-                    for g in optimizer.param_groups:
-                        g["lr"] *= cfg.plateau_factor
-
             # Crash safety: every ckpt_interval_sec, save a mid-epoch resume
             # point
             # (rank 0 only; both ranks hold identical weights) and push it
@@ -1758,9 +1654,6 @@ def main(cfg: RunConfig | None = None):
             lambda_7=A.lambda_7,
             lr=A.lr,
             lr_gamma=A.lr_gamma,
-            plateau_window=A.plateau_window,
-            plateau_patience=A.plateau_patience,
-            plateau_factor=A.plateau_factor,
             weight_decay=A.weight_decay,
             grad_clip=A.grad_clip,
             epochs=A.epochs,

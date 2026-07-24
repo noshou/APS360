@@ -24,7 +24,7 @@ on the real dataset for that.
 ## Run
 
 ```bash
-python Baselines/smoke_tests/baselines_smoke_test.py --config Baselines/smoke_tests/baselines_smoke_test.yaml
+python Baselines/run/smoke_tests/baselines_smoke_test.py --config Baselines/run/smoke_tests/baselines_smoke_test.yaml
 ```
 
 Plots are written to `smoke_test_out/`. A run that ends with
