@@ -71,7 +71,7 @@ _BASELINE_FACTORIES = {
     "rand_forest": lambda cfg, q, e, train: RandForestBaseline(
         n_estimators=cfg["rf_n_estimators"]
     ).fit(train),
-    "binned_debye_learned": lambda cfg, q, e, train: BinnedDebyeLearnedBaseline(
+    "binned_debye_learned": lambda cfg,q,e,train: BinnedDebyeLearnedBaseline(
         q,
         e,
         n_bins=cfg["bdl_n_bins"],
