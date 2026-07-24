@@ -1486,7 +1486,7 @@ def _worker(rank: int, cfg: RunConfig):
                 and (_bi + 1) % 20 == 0
             ):
                 elapsed = _time.time() - _t0
-                rate = (_bi + 1) / elapsed
+                rate = (_bi + 1 - skip) / elapsed
                 mem_pk = (
                     torch.cuda.max_memory_allocated() / 1e9
                 )  # peak LIVE tensors (OOM-relevant)
