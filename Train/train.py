@@ -486,6 +486,11 @@ def evaluate(
         log1p space.
     """
     model.eval()
+    print(
+        f"  [{label}] entering evaluate(): rank={rank} pid={os.getpid()} "
+        f"world_size={dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1}",
+        flush=True,
+    )
     amp = bool(cfg.amp) and device.startswith("cuda")
     dist_on = dist.is_available() and dist.is_initialized()
     total_loss = 0.0
