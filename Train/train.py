@@ -976,6 +976,15 @@ def _worker(rank: int, cfg: RunConfig):
             f"(init_scale={cfg.amp_init_scale}, RFF+Debye kept fp32)",
         )
 
+    # Per-epoch LR decay. ExponentialLR.step() (this torch version) multiplies
+    # the optimizer's CURRENT lr by gamma rather than recomputing from a
+    # fixed base, so a resumed run just keeps decaying from the restored LR
+    # with no extra bookkeeping. Constructed here (before the resume block)
+    # so its state_dict can be restored below alongside the optimizer.
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer, gamma=cfg.lr_gamma
+    )
+
     start_epoch = 1
     best_val = float("inf")
     # batches to skip in the first resumed epoch (exact mid-epoch resume)
@@ -988,7 +997,16 @@ def _worker(rank: int, cfg: RunConfig):
         # ExponentialLR.step(), so the true current LR is captured here same
         # as the weights - no separate fast-forwarding needed.
         optimizer.load_state_dict(ckpt["optimizer"])
-        best_val = ckpt.get("val_loss", float("inf"))
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        if "scaler" in ckpt and ckpt["scaler"]:
+            scaler.load_state_dict(ckpt["scaler"])
+        # "best_val" is the correct key going forward - it's the best
+        # end-of-epoch validation loss seen so far, not a per-checkpoint
+        # value (mid-epoch checkpoints don't run validation). Older
+        # checkpoints wrote this same quantity under the misleading key
+        # "val_loss", so fall back to that for backward compatibility.
+        best_val = ckpt.get("best_val", ckpt.get("val_loss", float("inf")))
         saved_bi = ckpt.get("batch_idx", -1)
         if (
             saved_bi is None or saved_bi < 0
@@ -1001,17 +1019,9 @@ def _worker(rank: int, cfg: RunConfig):
             resumed_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"resumed from {cfg.resume} (epoch {ckpt['epoch']}, "
-                f"batch_idx {saved_bi}, val_loss {best_val:.4f}, "
+                f"batch_idx {saved_bi}, best_val {best_val:.4f}, "
                 f"lr {resumed_lr:.4g})",
             )
-
-    # Per-epoch LR decay. ExponentialLR.step() (this torch version) multiplies
-    # the optimizer's CURRENT lr by gamma rather than recomputing from a
-    # fixed base, so a resumed run just keeps decaying from the restored LR
-    # with no extra bookkeeping.
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(
-        optimizer, gamma=cfg.lr_gamma
-    )
 
     # profiler - diagnostic mode. Two decoupled layers, both on every rank:
     #
@@ -1157,7 +1167,9 @@ def _worker(rank: int, cfg: RunConfig):
                 "batch_idx": batch_idx,
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
-                "val_loss": best_val,
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "best_val": best_val,
                 "lr": optimizer.param_groups[0]["lr"],
                 "q_grid": q_grid,
                 "energy": energy,
