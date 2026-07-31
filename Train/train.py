@@ -1299,7 +1299,13 @@ def _worker(rank: int, cfg: RunConfig):
         """
         os.makedirs(cfg.ckpt_dir, exist_ok=True)
         batch_tag = "final" if batch_idx < 0 else str(batch_idx)
-        ckpt_name = f"checkpoint_{ep}_{phase}_{batch_tag}.pt"
+        # "train" keeps the original two-part name (pre-existing runs and
+        # tooling already key off this format); only "val"/"test" - new
+        # phases as of this checkpointing feature - get the phase segment.
+        if phase == "train":
+            ckpt_name = f"checkpoint_{ep}_{batch_tag}.pt"
+        else:
+            ckpt_name = f"checkpoint_{ep}_{phase}_{batch_tag}.pt"
         ckpt_path = os.path.join(cfg.ckpt_dir, ckpt_name)
         torch.save(
             {
