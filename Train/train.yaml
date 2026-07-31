@@ -9,9 +9,9 @@
 hdf5:                    Preprocess/I(q)@L=50.h5
 encodings_sqlite3_path:  Preprocess/iq_train_set-ENCODING.sqlite3
 ckpt_best: scatternet_best.pt
-# Directory for numbered resume checkpoints; each mid-epoch/epoch-boundary save
-# writes its own file (checkpoint_<epoch>_<batch>.pt, "final" at epoch boundaries)
-# instead of overwriting a single fixed path.
+# Directory for numbered resume checkpoints; each mid-phase/phase-boundary save
+# writes its own file (checkpoint_<epoch>_<phase>_<batch>.pt, "final" at phase
+# boundaries; phase is train/val/test) instead of overwriting a single fixed path.
 ckpt_dir:  checkpoints
 
 # Everything the run records, per epoch, under {data_dir}/epoch_{N:03d}/: metrics.json

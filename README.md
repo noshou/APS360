@@ -40,28 +40,29 @@ GNN that predicts X-ray powder scattering curves I(q) from atomic coordinates an
 
 ## Notation
 
-| Symbol | Meaning                                                  |
-| ------ | -------------------------------------------------------- |
-| N      | molecules in a batch                                     |
-| M      | atoms per molecule (padded to the longest in the batch)  |
-| Q      | number of q-points in the scattering grid                |
-| λ₁     | atom embedding dimension (`lambda_1`, default 128)       |
-| λ₂     | message-passing rounds (`lambda_2`, default 4)           |
-| λ₃     | OutputHead MLP starting width (`lambda_3`, default 64)  |
-| λ₄     | OutputHead MLP halving steps (`lambda_4`, default 4)     |
-| λ₅     | Random Fourier Features count (`lambda_5`, default 128)   |
-| λ₆     | form-factor penalty weight (`lambda_6`, default 1.0)     |
-| λ₇     | sigma L2 penalty weight (`lambda_7`, default 0.5; penalty is q²-weighted) |
-| Nc     | molecules per N-chunk (`mol_chunk`)                      |
-| mc     | atoms per M-chunk (`atm_chunk`)                          |
-| V      | VOCAB size = len(VOCAB) + 1 (row 0 is padding)           |
-| ε_e    | `eps_embd` numerical floor in Embed (default 1e-8)       |
-| ε_m    | `eps_msgp` numerical floor in MessagePass (default 1e-3) |
-| r_m    | Cartesian coordinates of atom m, shape (3,) in Å         |
-| e_m    | embedding vector of atom m, shape (λ₁,)                  |
-| f_m(q) | form factor magnitude of atom m at q-point q, scalar     |
-| σ_m(q) | RFF kernel bandwidth of atom m at q-point q, scalar      |
-| φ_m(q) | RFF feature vector of atom m at q-point q, shape (λ₅,)   |
+
+| Symbol  | Meaning                                                                    |
+| --------- | ---------------------------------------------------------------------------- |
+| N       | molecules in a batch                                                       |
+| M       | atoms per molecule (padded to the longest in the batch)                    |
+| Q       | number of q-points in the scattering grid                                  |
+| λ₁    | atom embedding dimension (`lambda_1`, default 128)                         |
+| λ₂    | message-passing rounds (`lambda_2`, default 4)                             |
+| λ₃    | OutputHead MLP starting width (`lambda_3`, default 64)                     |
+| λ₄    | OutputHead MLP halving steps (`lambda_4`, default 4)                       |
+| λ₅    | Random Fourier Features count (`lambda_5`, default 128)                    |
+| λ₆    | form-factor penalty weight (`lambda_6`, default 1.0)                       |
+| λ₇    | sigma L2 penalty weight (`lambda_7`, default 0.5; penalty is q²-weighted) |
+| Nc      | molecules per N-chunk (`mol_chunk`)                                        |
+| mc      | atoms per M-chunk (`atm_chunk`)                                            |
+| V       | VOCAB size = len(VOCAB) + 1 (row 0 is padding)                             |
+| ε_e    | `eps_embd` numerical floor in Embed (default 1e-8)                         |
+| ε_m    | `eps_msgp` numerical floor in MessagePass (default 1e-3)                   |
+| r_m     | Cartesian coordinates of atom m, shape (3,) in Å                          |
+| e_m     | embedding vector of atom m, shape (λ₁,)                                  |
+| f_m(q)  | form factor magnitude of atom m at q-point q, scalar                       |
+| σ_m(q) | RFF kernel bandwidth of atom m at q-point q, scalar                        |
+| φ_m(q) | RFF feature vector of atom m at q-point q, shape (λ₅,)                   |
 
 ---
 
@@ -75,8 +76,9 @@ Atom indices are 1-based. Index 0 is reserved as the padding sentinel (`batch.vo
 
 ### Anomalous Correction Handling
 
+
 | Case                                        | Treatment                                                                      |
-| ------------------------------------------- | ------------------------------------------------------------------------------ |
+| --------------------------------------------- | -------------------------------------------------------------------------------- |
 | Transuranics (Np, Pu, Am, Cm, Bk, Cf, ions) | `f0` only; Chantler f1/f2 unavailable or unreliable                            |
 | Special cases (`siva->si`, `cval->c`, etc.) | Remapped to canonical base element before f1/f2 lookup                         |
 | Normal                                      | Charge suffix stripped for f1/f2 (`fe2+` -> `fe`); full ion string kept for f0 |
@@ -95,10 +97,11 @@ The training dataset (`noshou/iq_train_set` on HuggingFace) contains 1,044,583 m
 
 `Batch` is a frozen dataclass with runtime shape checking via jaxtyping + beartype.
 
-| Field   | Shape     | Dtype   | Contents                                              |
-| ------- | --------- | ------- | ----------------------------------------------------- |
-| `vocab` | (N, M)    | int64   | VOCAB index per atom. 0 = padding.                    |
-| `iqval` | (N, Q)    | float32 | Ground-truth I(q) from simulation.                    |
+
+| Field   | Shape     | Dtype   | Contents                                               |
+| --------- | ----------- | --------- | -------------------------------------------------------- |
+| `vocab` | (N, M)    | int64   | VOCAB index per atom. 0 = padding.                     |
+| `iqval` | (N, Q)    | float32 | Ground-truth I(q) from simulation.                     |
 | `coord` | (N, M, 3) | float32 | Cartesian x/y/z in Å. Padded positions are (0, 0, 0). |
 
 `batch.padding_mask()` returns (N, M) bool, True = real atom, derived as `vocab != 0`. Coordinates and intensities can legitimately be zero, so vocab is the only reliable mask source.
@@ -119,8 +122,9 @@ Molecules span 2 to 78,819 atoms. Without bucketing, a fixed-size batch would mi
 
 `__getitem__(i)` opens the HDF5 file and reads all molecules in batch i:
 
+
 | HDF5 dataset | Contents                          | Conversion                                          |
-| ------------ | --------------------------------- | --------------------------------------------------- |
+| -------------- | ----------------------------------- | ----------------------------------------------------- |
 | `elms`       | byte strings of element/ion names | decoded ->`enc._encode_ions()` -> int tensor (M_i,) |
 | `I_q`        | simulated scattering curve        | float tensor (Q,)                                   |
 | `coords`     | Cartesian positions               | float tensor (M_i, 3)                               |
@@ -145,29 +149,32 @@ Asymmetric masking: `f_mags` and `sigmas` are multiplied by the padding mask; `e
 
 Converts each atom's VOCAB index into three tensors that feed the rest of the pipeline:
 
-| Output   | Shape         | Meaning                          |
-| -------- | ------------- | -------------------------------- |
+
+| Output   | Shape           | Meaning                          |
+| ---------- | ----------------- | ---------------------------------- |
 | `embeds` | (N, M, 1, λ₁) | Learned per-atom identity vector |
-| `f_mags` | (N, M, Q, 1)  | Estimated form factor magnitude  |
-| `sigmas` | (N, M, Q, 1)  | RFF kernel bandwidth per q-point |
+| `f_mags` | (N, M, Q, 1)    | Estimated form factor magnitude  |
+| `sigmas` | (N, M, Q, 1)    | RFF kernel bandwidth per q-point |
 
 ### `Embed` Layers
 
 1. **Learnable Parameters**
 
-  | Parameter       | Shape      | Notes                                                     |
-  | --------------- | ---------- | --------------------------------------------------------- |
-  | `_mbd.weight`   | (V, λ₁)    | Embedding table. Row 0 frozen at zero via`padding_idx=0`. |
-  | `_f0f1.weight`  | (Q, λ₁)    | Linear: embedding -> real part of form factor.            |
-  | `_f0f1.bias`    | (Q,)       |                                                           |
-  | `_f2.weight`    | (Q, λ₁)    | Linear: embedding -> imaginary part of form factor.       |
-  | `_f2.bias`      | (Q,)       |                                                           |
-  | `_prelu.weight` | (λ₁,)      | One learned negative slope per embedding channel.         |
-  | `_sigma.weight` | (Q, λ₁, Q) | Bilinear weight: embedding x f_mag -> sigma logit.        |
-  | `_sigma.bias`   | (Q,)       |                                                           |
+
+| Parameter       | Shape        | Notes                                                     |
+| ----------------- | -------------- | ----------------------------------------------------------- |
+| `_mbd.weight`   | (V, λ₁)    | Embedding table. Row 0 frozen at zero via`padding_idx=0`. |
+| `_f0f1.weight`  | (Q, λ₁)    | Linear: embedding -> real part of form factor.            |
+| `_f0f1.bias`    | (Q,)         |                                                           |
+| `_f2.weight`    | (Q, λ₁)    | Linear: embedding -> imaginary part of form factor.       |
+| `_f2.bias`      | (Q,)         |                                                           |
+| `_prelu.weight` | (λ₁,)      | One learned negative slope per embedding channel.         |
+| `_sigma.weight` | (Q, λ₁, Q) | Bilinear weight: embedding x f_mag -> sigma logit.        |
+| `_sigma.bias`   | (Q,)         |                                                           |
 
 2. **Forward Pass**
-  ```{python}
+
+```{python}
   batch.vocab                           (N, M)
 
   # embedding with channel-wise PReLU
@@ -193,24 +200,27 @@ Converts each atom's VOCAB index into three tensors that feed the rest of the pi
   embed.unsqueeze(-2)  -> embeds        (N, M, 1, λ₁)  Q=1, broadcastable
   f_mag.unsqueeze(-1) * mask -> f_mags  (N, M, Q, 1)
   sigma                -> sigmas        (N, M, Q, 1)
-  ```
+```
+
 3. **Activations**
 
-  | Activation      | Location               | Behaviour                                                                        |
-  | --------------- | ---------------------- | -------------------------------------------------------------------------------- |
-  | `nn.PReLU(λ₁)`* | After embedding lookup | Learnable per-channel negative slope. Acts on dim=1, hence the double-transpose. |
-  | `F.softplus`    | On sigma logits        | `log(1 + exp(x))`, smooth positive-enforcing.                                    |
+
+| Activation        | Location               | Behaviour                                                                        |
+| ------------------- | ------------------------ | ---------------------------------------------------------------------------------- |
+| `nn.PReLU(λ₁)`* | After embedding lookup | Learnable per-channel negative slope. Acts on dim=1, hence the double-transpose. |
+| `F.softplus`      | On sigma logits        | `log(1 + exp(x))`, smooth positive-enforcing.                                    |
 
 **Comparison of `PReLU`  to other activation functions:*
 
-| Activation | λ₁  | Val loss | Val R² | Test R² |
-| ---------- | --- | -------- | ------ | ------- |
-| LeakyReLU  | 64  | 0.77     | 0.71   | 0.69    |
-| PReLU      | 128 | 0.67     | 0.74   | 0.73    |
-| PReLU      | 64  | 0.93     | 0.62   | 0.61    |
-| LeakyReLU  | 128 | NaN      | NaN    | NaN     |
-| ELU        | 64  | 2.44     | -0.05  | -0.01   |
-| Mish       | 64  | NaN      | NaN    | NaN     |
+
+| Activation | λ₁ | Val loss | Val R² | Test R² |
+| ------------ | ------ | ---------- | --------- | ---------- |
+| LeakyReLU  | 64   | 0.77     | 0.71    | 0.69     |
+| PReLU      | 128  | 0.67     | 0.74    | 0.73     |
+| PReLU      | 64   | 0.93     | 0.62    | 0.61     |
+| LeakyReLU  | 128  | NaN      | NaN     | NaN      |
+| ELU        | 64   | 2.44     | -0.05   | -0.01    |
+| Mish       | 64   | NaN      | NaN     | NaN      |
 
 ---
 
@@ -218,11 +228,12 @@ Converts each atom's VOCAB index into three tensors that feed the rest of the pi
 
 `LayerHead` is a `NamedTuple` (immutable, typed) passed between Embed, MessagePass, and OutputHead.
 
+
 | Field    | Shape from Embed | Shape after MessagePass | Meaning                                                                 |
-| -------- | ---------------- | ----------------------- | ----------------------------------------------------------------------- |
-| `embeds` | (N, M, 1, λ₁)    | (N, M, Q, λ₁)           | Per-atom identity vector. Q=1 on construction, expanded by MessagePass. |
-| `f_mags` | (N, M, Q, 1)     | unchanged               | Form factor magnitude. Trailing 1 broadcasts over λ₁.                   |
-| `sigmas` | (N, M, Q, 1)     | updated per round       | RFF bandwidth. Trailing 1 broadcasts over λ₁.                           |
+| ---------- | ------------------ | ------------------------- | ------------------------------------------------------------------------- |
+| `embeds` | (N, M, 1, λ₁)  | (N, M, Q, λ₁)         | Per-atom identity vector. Q=1 on construction, expanded by MessagePass. |
+| `f_mags` | (N, M, Q, 1)     | unchanged               | Form factor magnitude. Trailing 1 broadcasts over λ₁.                 |
+| `sigmas` | (N, M, Q, 1)     | updated per round       | RFF bandwidth. Trailing 1 broadcasts over λ₁.                         |
 
 The `*` wildcard in the jaxtyping annotation for `embeds` ("N M * λ₁") allows Q to be 1 or Q without a type error. `NamedTuple._replace(...)` produces modified copies without mutation.
 
@@ -311,54 +322,58 @@ After the AllReduce, `features` and `chem_env` are divided by the per-molecule r
 
   `_proj_agg`, `_sigbilin`, and `_rms_norm` are each an `nn.ModuleList` of length λ₂: every message-passing round gets its own instance (`_proj_agg[i]`, `_sigbilin[i]`, `_rms_norm[i]`), not a single set of weights reused across rounds.
 
-  | Parameter             | Shape      | Notes                                       |
-  | ---------------------- | ---------- | ------------------------------------------- |
-  | `_proj_agg[i].weight`  | (2λ₁, λ₁)  | MishGLU projection: agg -> [p1, p2]         |
-  | `_proj_agg[i].bias`    | (2λ₁,)     |                                             |
-  | `_biasterm`            | (λ₅,)      | Learnable RFF phase offsets b (shared across rounds) |
-  | `_sigbilin[i].weight`  | (1, λ₁, Q) | Bilinear: (embedding, f_mag) -> sigma delta |
-  | `_sigbilin[i].bias`    | (1,)       |                                             |
-  | `_rms_norm[i].weight`  | (λ₁,)      | RMSNorm scale                               |
+
+| Parameter             | Shape         | Notes                                                |
+| ----------------------- | --------------- | ------------------------------------------------------ |
+| `_proj_agg[i].weight` | (2λ₁, λ₁) | MishGLU projection: agg -> [p1, p2]                  |
+| `_proj_agg[i].bias`   | (2λ₁,)      |                                                      |
+| `_biasterm`           | (λ₅,)       | Learnable RFF phase offsets b (shared across rounds) |
+| `_sigbilin[i].weight` | (1, λ₁, Q)  | Bilinear: (embedding, f_mag) -> sigma delta          |
+| `_sigbilin[i].bias`   | (1,)          |                                                      |
+| `_rms_norm[i].weight` | (λ₁,)       | RMSNorm scale                                        |
 
   Buffers (fixed):
 
-  | Buffer      | Shape   | Notes                                         |
-  | ----------- | ------- | --------------------------------------------- |
-  | `_omegafrq` | (λ₅, 3) | RFF frequency matrix Ω, seeded from`msg_seed` |
+
+| Buffer      | Shape     | Notes                                          |
+| ------------- | ----------- | ------------------------------------------------ |
+| `_omegafrq` | (λ₅, 3) | RFF frequency matrix Ω, seeded from`msg_seed` |
 
 2. **Message Passing**
-  i. **Pass 1: Accumulate Global Context**  
-    `_pass_1` iterates over M-chunks and accumulates `features` and `chem_env` for the current N-chunk. Each `_step` is gradient-checkpointed (`use_reentrant=False`) to avoid holding the full `(Nc, M, Q, λ₅)` RFF tensor in memory.
-    ```{Latex}
-    # per M-chunk inputs:
-    emb_slice    (Nc, mc, Q, λ₁)
-    crd_slice    (Nc, mc, 3)
-    sig_slice    (Nc, mc, Q, 1)
-    msk_slice    (Nc, mc)            bool, True = real atom
+   i. **Pass 1: Accumulate Global Context**
+   `_pass_1` iterates over M-chunks and accumulates `features` and `chem_env` for the current N-chunk. Each `_step` is gradient-checkpointed (`use_reentrant=False`) to avoid holding the full `(Nc, M, Q, λ₅)` RFF tensor in memory.
+   ```{Latex}
+   # per M-chunk inputs:
+   emb_slice    (Nc, mc, Q, λ₁)
+   crd_slice    (Nc, mc, 3)
+   sig_slice    (Nc, mc, Q, 1)
+   msk_slice    (Nc, mc)            bool, True = real atom
 
-    # r~_m = r_m / σ_m(q)
-    scaled_coords  (Nc, mc, Q, 3)   crd_slice.unsqueeze(-2) / sig_slice.clamp(min=ε_m)
+   # r~_m = r_m / σ_m(q)
+   scaled_coords  (Nc, mc, Q, 3)   crd_slice.unsqueeze(-2) / sig_slice.clamp(min=ε_m)
 
-    # φ_m = sqrt(2/λ₅) * cos(Ω*r~_m + b)
-    proj           (Nc, mc, Q, λ₅)  scaled_coords @ Ω.T + b
-    zrff           (Nc, mc, Q, λ₅)  sqrt(2/λ₅) * cos(proj), zeroed at padding
+   # φ_m = sqrt(2/λ₅) * cos(Ω*r~_m + b)
+   proj           (Nc, mc, Q, λ₅)  scaled_coords @ Ω.T + b
+   zrff           (Nc, mc, Q, λ₅)  sqrt(2/λ₅) * cos(proj), zeroed at padding
 
-    # partial sum_m φ_m
-    step_features  (Nc, Q, λ₅)      zrff.sum(dim=1)
+   # partial sum_m φ_m
+   step_features  (Nc, Q, λ₅)      zrff.sum(dim=1)
 
-    # partial sum_m φ_m x e_m, via bmm to avoid (Nc,mc,Q,λ₅,λ₁) intermediate
-    zb             (Nc*Q, λ₅, mc)   zrff.permute(0,2,3,1).reshape(...)
-    eb             (Nc*Q, mc, λ₁)   emb_slice.permute(0,2,1,3).reshape(...)
-    step_chem_env  (Nc, Q, λ₅, λ₁)  bmm(zb, eb).reshape(Nc, Q, λ₅, λ₁)
+   # partial sum_m φ_m x e_m, via bmm to avoid (Nc,mc,Q,λ₅,λ₁) intermediate
+   zb             (Nc*Q, λ₅, mc)   zrff.permute(0,2,3,1).reshape(...)
+   eb             (Nc*Q, mc, λ₁)   emb_slice.permute(0,2,1,3).reshape(...)
+   step_chem_env  (Nc, Q, λ₅, λ₁)  bmm(zb, eb).reshape(Nc, Q, λ₅, λ₁)
 
-    # accumulate across M-chunks:
-    features  (Nc, Q, λ₅)       += step_features
-    chem_env  (Nc, Q, λ₅, λ₁)   += step_chem_env
-    ```
-  After the M-chunk loop, `_AllReduce` sums `features` and `chem_env` across ranks so every rank holds global sums over all atoms.  
-  ii. **Pass 2: Per-Atom Update**  
+   # accumulate across M-chunks:
+   features  (Nc, Q, λ₅)       += step_features
+   chem_env  (Nc, Q, λ₅, λ₁)   += step_chem_env
+   ```
+
+  After the M-chunk loop, `_AllReduce` sums `features` and `chem_env` across ranks so every rank holds global sums over all atoms.
+  ii. **Pass 2: Per-Atom Update**
   `_pass_2` recomputes φ_m per M-chunk and uses the globally complete `chem_env` to update embeddings and sigmas.
-  ```{rtf}
+
+```{rtf}
   # recompute φ_m (intermediate freed during forward by checkpointing)
   scaled_coords  (Nc, mc, Q, 3)
   proj           (Nc, mc, Q, λ₅)
@@ -386,28 +401,31 @@ After the AllReduce, `features` and `chem_env` are divided by the per-molecule r
   f_in           (Nc, mc, Q, 1)   ffs_slice expanded to Q
   delta          (Nc, mc, Q, 1)   tanhshrink(sigbilin(new_emb, f_in))
   new_sig        (Nc, mc, Q, 1)   softplus(sig_slice + delta)
-  ```
+```
+
 3. **Activations**
 
-  | Activation         | Location                | Behaviour                                                                                          |
-  | ------------------ | ----------------------- | -------------------------------------------------------------------------------------------------- |
-  | `cos`              | RFF feature computation | Core of the RFF kernel approximation.                                                              |
-  | `F.mish` (p2 path) | MishGLU gate            | `x*tanh(softplus(x))`. Near zero when p2 << 0 (gate closed); near-linear when p2 >> 0 (gate open). |
-  | `nn.RMSNorm`       | After locality/weights  | Normalises aggregate magnitude, preventing residual stream from compounding across rounds.         |
-  | `F.tanhshrink`     | Sigma delta             | `x - tanh(x)`. Near zero, output ≈ 0 (sticky region). For large                                    |
-  | `F.softplus`       | Sigma output            | Ensures σ > 0 always.                                                                              |
 
-  - MishGLU Gate  
-  `_proj_agg` is `nn.Linear(λ₁, 2λ₁)`. The output is split into p1 (value path) and p2 (gate path). `gate = p1 * Mish(p2)` is added to the atom embedding as a residual. The final `* mask` zeroes contributions from padding atoms.  
+| Activation         | Location                | Behaviour                                                                                          |
+| -------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `cos`              | RFF feature computation | Core of the RFF kernel approximation.                                                              |
+| `F.mish` (p2 path) | MishGLU gate            | `x*tanh(softplus(x))`. Near zero when p2 << 0 (gate closed); near-linear when p2 >> 0 (gate open). |
+| `nn.RMSNorm`       | After locality/weights  | Normalises aggregate magnitude, preventing residual stream from compounding across rounds.         |
+| `F.tanhshrink`     | Sigma delta             | `x - tanh(x)`. Near zero, output ≈ 0 (sticky region). For large                                   |
+| `F.softplus`       | Sigma output            | Ensures σ > 0 always.                                                                             |
+
+- MishGLU Gate
+  `_proj_agg` is `nn.Linear(λ₁, 2λ₁)`. The output is split into p1 (value path) and p2 (gate path). `gate = p1 * Mish(p2)` is added to the atom embedding as a residual. The final `* mask` zeroes contributions from padding atoms.
   The GLU pattern lets the network decide per-channel and per-q-point whether to incorporate the neighbourhood context, rather than always adding the full aggregate.
-  - Sigma Update
-    ```{rtf}
-    σ_new = softplus( σ_old + tanhshrink( bilinear(e_updated, f_mag) ) )
-    ```
-    `_sigbilin` is `nn.Bilinear(λ₁, Q, 1)`. The bilinear coupling `e^T W f` makes the sigma delta depend on the interaction between the atom's learned representation and its scattering strength.
-    Tanhshrink is unbounded by design: for large bilinear outputs sigma can shift significantly. The sigma L2 penalty in the loss (λ₇ · w(q) · σ², w ∝ q² - see [§8](#8-loss)) is the actual blowup prevention mechanism; its gradient grows with σ and pulls it back down. The two reach equilibrium where the bilinear delta just balances the MSLE gradient against the penalty. The maximum cumulative sigma change is also bounded by λ₂ rounds being small (default 5).
-    The sticky property near zero (tanhshrink ≈ 0, gradient = `1 - sech²(x)` = 0 at x=0) is a beneficial side effect: early in training when the bilinear has weak outputs, sigmas stay stable rather than wandering, then move more freely as the bilinear gains signal.
-    Softplus wraps the whole update to maintain σ > 0, since division by σ in the RFF step cannot encounter zero.
+- Sigma Update
+  ```{rtf}
+  σ_new = softplus( σ_old + tanhshrink( bilinear(e_updated, f_mag) ) )
+  ```
+
+  `_sigbilin` is `nn.Bilinear(λ₁, Q, 1)`. The bilinear coupling `e^T W f` makes the sigma delta depend on the interaction between the atom's learned representation and its scattering strength.
+  Tanhshrink is unbounded by design: for large bilinear outputs sigma can shift significantly. The sigma L2 penalty in the loss (λ₇ · w(q) · σ², w ∝ q² - see [§8](#8-loss)) is the actual blowup prevention mechanism; its gradient grows with σ and pulls it back down. The two reach equilibrium where the bilinear delta just balances the MSLE gradient against the penalty. The maximum cumulative sigma change is also bounded by λ₂ rounds being small (default 5).
+  The sticky property near zero (tanhshrink ≈ 0, gradient = `1 - sech²(x)` = 0 at x=0) is a beneficial side effect: early in training when the bilinear has weak outputs, sigmas stay stable rather than wandering, then move more freely as the bilinear gains signal.
+  Softplus wraps the whole update to maintain σ > 0, since division by σ in the RFF step cannot encounter zero.
 
 ---
 
@@ -419,20 +437,24 @@ Collapses per-atom representations into a predicted I(q) curve per molecule. Eac
 
 1. **Learnable Parameters**
 
-  | Parameter               | Shape       | Notes                                              |
-  | ----------------------- | ----------- | -------------------------------------------------- |
-  | `_bilinear.weight`      | (λ₃, λ₁, 1) | Bilinear: (embedding, f_mag scalar) -> λ₃ features |
-  | `_bilinear.bias`        | (λ₃,)       |                                                    |
-  | `_mlp / layer_i.weight` | varies      | MLP linear layers (halving pyramid)                |
-  | `_mlp / layer_i.bias`   | varies      |                                                    |
+
+| Parameter               | Shape           | Notes                                                |
+| ------------------------- | ----------------- | ------------------------------------------------------ |
+| `_bilinear.weight`      | (λ₃, λ₁, 1) | Bilinear: (embedding, f_mag scalar) -> λ₃ features |
+| `_bilinear.bias`        | (λ₃,)         |                                                      |
+| `_mlp / layer_i.weight` | varies          | MLP linear layers (halving pyramid)                  |
+| `_mlp / layer_i.bias`   | varies          |                                                      |
 
   MLP with `lambda_3=64, lambda_4=4`:
-  ```{rtf}
+
+```{rtf}
   Linear(64->32) -> Mish -> Linear(32->16) -> Mish -> Linear(16->8) -> Mish -> Linear(8->4) -> Mish -> Linear(4->1)
-  ```
+```
+
   No Mish after the final linear; `softplus` is applied to the MLP output.
 2. **Forward Pass**
-  ```{rtf}
+
+```{rtf}
   # inputs from MessagePass:
   msg_head.embeds  (N, M, Q, λ₁)
   msg_head.f_mags  (N, M, Q, 1)
@@ -459,14 +481,16 @@ Collapses per-atom representations into a predicted I(q) curve per molecule. Eac
   iq_accum           (N, Q)    predicted I(q)
   f_mags.squeeze(-1) (N, M, Q)
   sigmas.squeeze(-1) (N, M, Q)
-  ```
+```
+
 3. **Activations**
 
-  | Activation   | Location           | Behaviour                                                |
-  | ------------ | ------------------ | -------------------------------------------------------- |
-  | `F.mish`     | After bilinear     | Applied to bilinear features before the MLP.             |
-  | `nn.Mish`    | Between MLP layers | Between each pair of linear layers except the last.      |
-  | `F.softplus` | After full MLP     | Ensures per-atom scattering scalar is strictly positive. |
+
+| Activation   | Location           | Behaviour                                                |
+| -------------- | -------------------- | ---------------------------------------------------------- |
+| `F.mish`     | After bilinear     | Applied to bilinear features before the MLP.             |
+| `nn.Mish`    | Between MLP layers | Between each pair of linear layers except the last.      |
+| `F.softplus` | After full MLP     | Ensures per-atom scattering scalar is strictly positive. |
 
 ---
 
@@ -476,8 +500,9 @@ Top-level module. Wraps Embed, MessagePass, and OutputHead, and routes each batc
 
 ### Module Registry
 
+
 | Submodule | Type          |
-| --------- | ------------- |
+| ----------- | --------------- |
 | `_emb`    | `Embed`       |
 | `_msg`    | `MessagePass` |
 | `_out`    | `OutputHead`  |
@@ -580,11 +605,12 @@ Step 5: Gather
 
 ### Buffers
 
+
 | Buffer        | Shape  | Contents                                                               |
-| ------------- | ------ | ---------------------------------------------------------------------- |
+| --------------- | -------- | ------------------------------------------------------------------------ |
 | `_fmag_table` | (V, Q) | Reference form factor magnitudes from xraydb. Row 0 = zeros (padding). |
-| `_q_weights_` | (1, Q) | Kratky weights`(1 + q²)` per q-point.                                  |
-| `_s_weights_` | (1, Q) | Sigma-penalty weights, `q²` normalised to mean 1 over the grid.        |
+| `_q_weights_` | (1, Q) | Kratky weights`(1 + q²)` per q-point.                                 |
+| `_s_weights_` | (1, Q) | Sigma-penalty weights,`q²` normalised to mean 1 over the grid.        |
 
 Form factor table construction: `q -> s = q/(4π)` converts to crystallographic s (sinθ/λ used by xraydb), then `|f(q)| = hypot(f0 + f1_chantler, f2_chantler)`. Transuranics: f0 only.
 
@@ -679,72 +705,72 @@ Evaluation is done once per epoch for both val and test. Val is used for checkpo
 
 ### Checkpoint and Resume
 
-| File                                    | Contents                                                              | Saved when                                        |
-| --------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------- |
-| `ckpt_best`                             | model weights only                                                    | val_loss improves                                 |
-| `ckpt_dir/checkpoint_<epoch>_<batch>.pt` | weights + optimizer + scheduler + GradScaler + epoch + batch_idx + `best_val` | every `ckpt_interval_sec` seconds and at epoch end |
+| File                                             | Contents                                                                                                                                                               | Saved when                                                   |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------- |
+| `ckpt_best`                                      | model weights only                                                                                                                                                     | val_loss improves                                            |
+| `ckpt_dir/checkpoint_<epoch>_<phase>_<batch>.pt` | weights + optimizer + scheduler + GradScaler + epoch + phase + batch_idx + `best_val` + this epoch's already-known train/val/test scalars + phase's partial accumulator | every `ckpt_interval_sec` seconds and at every phase boundary |
 
-`best_val` is the best end-of-epoch validation loss seen so far, not a per-checkpoint value (mid-epoch checkpoints don't run validation, so this field is identical across every mid-epoch checkpoint within an epoch - that's expected, not stale data). Checkpoints written before this field was renamed still use the key `val_loss` for the same quantity; the resume loader falls back to it.
+Each epoch runs three phases in order - `train`, `val`, `test` (test also covers the diagnostic-plots pass) - and every phase gets the same mid-phase checkpointing, not just training: val and test are thousands of batches long too (walking the full val/test set once per epoch), so losing a whole pass to a late Kaggle-session timeout used to be as costly as losing the training tail. `phase` records which of the three the checkpoint belongs to; `batch_idx` is -1 at a phase boundary (that phase is done, the run moves on to the next one) or the last-processed batch mid-phase. A mid-val/test checkpoint also carries `eval_state` - that phase's accumulator (running sums, or for the test/plots pass also the growing per-molecule error-distribution lists) - and this epoch's `train_loss`/`train_r2`/`val_loss`/`val_r2` scalars already computed by earlier phases, so a resume into `val` or `test` never has to redo an earlier phase just to reconstruct them.
 
-Resume checkpoints are numbered, not overwritten: each save under `ckpt_dir` gets its own file, `checkpoint_<epoch>_<batch>.pt` for a mid-epoch save, `checkpoint_<epoch>_final.pt` for an epoch-boundary save, so the full history survives for later comparison (e.g. debugging a training collapse) instead of only the latest save.
+`best_val` is the best end-of-epoch validation loss seen so far, not a per-checkpoint value (it's only updated once, after test completes - see the trailer block in `Train/train.py`). Checkpoints written before this field was renamed still use the key `val_loss` for the same quantity; the resume loader falls back to it.
 
-Mid-epoch resume: `torch.manual_seed(batcher_seed + epoch)` re-seeds the shuffle identically, then the loop fast-forwards over `batch_idx` batches via `continue`. Both `ckpt_best` and each numbered resume checkpoint are pushed to a rclone remote (`ckpt_rclone_dest`) for Kaggle session crash durability.
+Resume checkpoints are numbered, not overwritten: each save under `ckpt_dir` gets its own file, `checkpoint_<epoch>_<phase>_<batch>.pt` for a mid-phase save, `checkpoint_<epoch>_<phase>_final.pt` for a phase boundary, so the full history survives for later comparison (e.g. debugging a training collapse) instead of only the latest save.
+
+Resume walks the phase order (`train` -> `val` -> `test`) from wherever the checkpoint left off: a mid-phase checkpoint (`batch_idx >= 0`) redoes that exact phase from `batch_idx + 1`, using the saved `eval_state` to pick the running accumulator back up instead of restarting it at zero; a phase-boundary checkpoint (`batch_idx == -1`) skips straight to the next phase (or, for `test`, to the next epoch). `torch.manual_seed(batcher_seed + epoch)` re-seeds the training shuffle identically on a mid-train resume; val/test are unshuffled, so a mid-phase resume there just skips the first `batch_idx + 1` indices via a resumable sequential sampler (`_ResumableSequentialSampler`) - same "skipped batches are never even handed to the DataLoader" trick as the training sampler, so resuming late into a long val/test pass costs nothing extra. Both `ckpt_best` and each numbered resume checkpoint are pushed to a rclone remote (`ckpt_rclone_dest`) for Kaggle session crash durability.
 
 ### Run Data (metrics + diagnostic plots)
 
 When `data_dir` is set, everything the run records lands under it (via `Train/eval_plots.py`, reusing `Baselines/run/metrics.py` so the plots are directly comparable to the baseline notebook):
 
-| File                                | Scope     | Cost                                                     |
-| ----------------------------------- | --------- | ------------------------------------------------------- |
-| `epoch_NNN/` (per-q R², Kratky, …)  | per epoch | full test-set pass (expensive; see note)                |
-| `epoch_NNN/metrics.json`            | per epoch | free — that epoch's train/val/test loss and R²          |
-| `epoch_NNN/loss_per_batch.png`      | per epoch | free — plotted from losses the train loop already logs  |
-| `epoch_NNN/loss_per_epoch.png`      | per epoch | free — train/val/test loss vs epoch, through this epoch; rebuilt by reading every earlier epoch's `metrics.json` off disk |
-| `run_config.rtf`                    | run-level | free — the full `RunConfig`, dumped once when training starts |
+
+| File                                 | Scope     | Cost                                                                                                                      |
+| -------------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `epoch_NNN/` (per-q R², Kratky, …) | per epoch | full test-set pass (expensive; see note)                                                                                  |
+| `epoch_NNN/metrics.json`             | per epoch | free — that epoch's train/val/test loss and R²                                                                          |
+| `epoch_NNN/loss_per_batch.png`       | per epoch | free — plotted from losses the train loop already logs                                                                   |
+| `epoch_NNN/loss_per_epoch.png`       | per epoch | free — train/val/test loss vs epoch, through this epoch; rebuilt by reading every earlier epoch's`metrics.json` off disk |
+| `run_config.rtf`                     | run-level | free — the full`RunConfig`, dumped once when training starts                                                             |
 
 `epoch_NNN` is the epoch number zero-padded to 3 digits (`epoch_001`, …). Every metric file is scoped to one epoch on purpose: a single run-level metrics file would be rewritten from the in-memory history at every epoch boundary, and since a resumed process starts with no memory of the epochs it did not run, resuming would silently truncate the record back to the resume point (and push the truncated copy to Drive). Reading the history back off disk instead means a resumed run extends the curve rather than restarting it. Concatenate the per-epoch `metrics.json` files after the run for the whole history.
 
-If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remote after every epoch (incrementally — only new files upload), a sibling of the `ckpts/` remote.
-
-> Note: the `epoch_NNN/` diagnostic plots re-evaluate the entire test set every epoch (on top of the val loss pass), which dominates end-of-epoch wall-clock. The two loss curves add no forward passes.
->
-> **End-of-epoch is more expensive than it looks.** The 70/15/15 split is at the *molecule* level within each bucket, so val and test hold **one batch per bucket, exactly like train** (`len(val_loader) == len(test_loader) == len(train_loader)`). The batches are thinner, but the atom-chunk loop doesn't shrink with molecule count and both passes run essentially all-TP (eval's small `N` fails `route_dp`'s `N >= 2*mol_chunk`; the plots pass forces TP), so neither gets the DP fast path. Val + test can cost on the order of a full training epoch. Under `verbosity="batch"` both print every 20 batches (`[val]`, `[test]`, `[test/plots]`) — otherwise the silence is indistinguishable from a hang.
+If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remote after every epoch.
 
 ---
 
 ## 10. Hyperparameter Reference
 
-| Name                | Default | What it controls                                                                                                                                |
-| ------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lambda_1`          | 128     | Atom embedding dimension. Width of the per-atom vector throughout MessagePass.                                                                  |
-| `lambda_2`          | 4       | Message-passing rounds. Also bounds the maximum cumulative sigma change.                                                                        |
-| `lambda_3`          | 64      | OutputHead MLP starting width. Must satisfy`lambda_3 >= 2^lambda_4`.                                                                            |
-| `lambda_4`          | 4       | OutputHead halving steps. With defaults: 64->32->16->8->4->1.                                                                                 |
-| `lambda_5`          | 128     | RFF count. More = tighter kernel approximation, higher memory cost.                                                                             |
-| `lambda_6`          | 1.0     | Form-factor penalty weight.                                                                                                                     |
-| `lambda_7`          | 0.5     | Sigma L2 penalty weight. Primary blowup prevention mechanism. The penalty is q²-weighted (mean 1 over the grid), so σ stays long-range at low q. |
-| `msg_seed`          | 42      | Seed for fixed RFF frequency matrix Ω.                                                                                                          |
-| `atm_chunk`         | 512     | Atoms per M-chunk. Reduce to lower VRAM.                                                                                                        |
-| `mol_chunk`         | 256     | Molecules per N-chunk. Reduce to lower VRAM on large molecules.                                                                                 |
-| `dp_atom_threshold` | 101     | Batches with padded atom count`M` below this **and** molecule count `N >= 2*mol_chunk` route through DP instead of TP                           |
-| `compile`           | True    | torch.compile Embed/MessagePass/OutputHead's checkpointed step functions (fullgraph=True, dynamic=True).                                        |
-| `amp`               | False   | fp16 autocast + GradScaler (CUDA only). Halves activation memory, uses T4 fp16 tensor cores; RFF projection and OutputHead Debye sum kept fp32. |
-| `amp_init_scale`    | 1024    | GradScaler starting loss scale when `amp` is on. Lower than torch's 65536 because activations are ~O(1) after mean-normalization.               |
-| `eps_embd`          | 1e-8    | Numerical floor in Embed (softplus, hypot).                                                                                                     |
-| `eps_msgp`          | 1e-3    | Numerical floor in MessagePass (sigma clamp, aggregate denominator).                                                                            |
-| `lr`                | 1.3e-4  | Adam learning rate (epoch-1 value; see `lr_gamma`).                                                                                             |
-| `lr_gamma`          | 0.7     | Per-epoch ExponentialLR decay factor: `lr * lr_gamma ** (epoch - 1)`. 1.0 = no decay.                                                           |
-| `weight_decay`      | 0.1     | Adam L2 weight decay.                                                                                                                           |
-| `grad_clip`         | 1.0     | Max gradient L2 norm before clipping.                                                                                                           |
-| `epochs`            | 20      | Training epochs.                                                                                                                                |
-| `batcher_seed`      | 0       | Seed for train/val/test split and per-epoch shuffle.                                                                                            |
-| `dataset_frac`      | 1.0     | Fraction of each split's batches to use, (0.0, 1.0]. Applies to **train, val and test** - eval costs on the order of a train epoch, so thinning train alone just lets eval dominate. Deterministic off `batcher_seed`, fixed for the run. |
-| `atom_size_ceil`    | -1      | Max total atoms per batch (-1 = 3x largest molecule).                                                                                           |
-| `num_workers`       | 4       | DataLoader worker processes.                                                                                                                    |
-| `ckpt_interval_sec` | 600     | Seconds between mid-epoch resume checkpoints.                                                                                                   |
-| `profiler`          | False   | Diagnostic run: per-rank torch.profiler + per-section wall-clock timers, then stop. Traces written per rank to`./profiler_trace/rank<r>/`.      |
-| `prof_warmup`       | 1       | Profiler warmup batches (profiled, discarded).                                                                                                  |
-| `prof_active`       | 3       | Profiler active batches (recorded). Loop runs`1 + prof_warmup + prof_active` batches; raise `prof_active` for more representative stats.        |
+
+| Name                | Default | What it controls                                                                                                                                                                                                                         |
+| --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `lambda_1`          | 128     | Atom embedding dimension. Width of the per-atom vector throughout MessagePass.                                                                                                                                                           |
+| `lambda_2`          | 4       | Message-passing rounds. Also bounds the maximum cumulative sigma change.                                                                                                                                                                 |
+| `lambda_3`          | 64      | OutputHead MLP starting width. Must satisfy`lambda_3 >= 2^lambda_4`.                                                                                                                                                                     |
+| `lambda_4`          | 4       | OutputHead halving steps. With defaults: 64->32->16->8->4->1.                                                                                                                                                                            |
+| `lambda_5`          | 128     | RFF count. More = tighter kernel approximation, higher memory cost.                                                                                                                                                                      |
+| `lambda_6`          | 1.0     | Form-factor penalty weight.                                                                                                                                                                                                              |
+| `lambda_7`          | 0.5     | Sigma L2 penalty weight. Primary blowup prevention mechanism. The penalty is q²-weighted (mean 1 over the grid), so σ stays long-range at low q.                                                                                       |
+| `msg_seed`          | 42      | Seed for fixed RFF frequency matrix Ω.                                                                                                                                                                                                  |
+| `atm_chunk`         | 512     | Atoms per M-chunk. Reduce to lower VRAM.                                                                                                                                                                                                 |
+| `mol_chunk`         | 256     | Molecules per N-chunk. Reduce to lower VRAM on large molecules.                                                                                                                                                                          |
+| `dp_atom_threshold` | 101     | Batches with padded atom count`M` below this **and** molecule count `N >= 2*mol_chunk` route through DP instead of TP                                                                                                                    |
+| `compile`           | True    | torch.compile Embed/MessagePass/OutputHead's checkpointed step functions (fullgraph=True, dynamic=True).                                                                                                                                 |
+| `amp`               | False   | fp16 autocast + GradScaler (CUDA only). Halves activation memory, uses T4 fp16 tensor cores; RFF projection and OutputHead Debye sum kept fp32.                                                                                          |
+| `amp_init_scale`    | 1024    | GradScaler starting loss scale when`amp` is on. Lower than torch's 65536 because activations are ~O(1) after mean-normalization.                                                                                                         |
+| `eps_embd`          | 1e-8    | Numerical floor in Embed (softplus, hypot).                                                                                                                                                                                              |
+| `eps_msgp`          | 1e-3    | Numerical floor in MessagePass (sigma clamp, aggregate denominator).                                                                                                                                                                     |
+| `lr`                | 1.3e-4  | Adam learning rate (epoch-1 value; see`lr_gamma`).                                                                                                                                                                                       |
+| `lr_gamma`          | 0.7     | Per-epoch ExponentialLR decay factor:`lr * lr_gamma ** (epoch - 1)`. 1.0 = no decay.                                                                                                                                                     |
+| `weight_decay`      | 0.1     | Adam L2 weight decay.                                                                                                                                                                                                                    |
+| `grad_clip`         | 1.0     | Max gradient L2 norm before clipping.                                                                                                                                                                                                    |
+| `epochs`            | 20      | Training epochs.                                                                                                                                                                                                                         |
+| `batcher_seed`      | 0       | Seed for train/val/test split and per-epoch shuffle.                                                                                                                                                                                     |
+| `dataset_frac`      | 1.0     | Fraction of each split's batches to use, (0.0, 1.0]. Applies to**train, val and test** - eval costs on the order of a train epoch, so thinning train alone just lets eval dominate. Deterministic off `batcher_seed`, fixed for the run. |
+| `atom_size_ceil`    | -1      | Max total atoms per batch (-1 = 3x largest molecule).                                                                                                                                                                                    |
+| `num_workers`       | 4       | DataLoader worker processes.                                                                                                                                                                                                             |
+| `ckpt_interval_sec` | 600     | Seconds between mid-epoch resume checkpoints.                                                                                                                                                                                            |
+| `profiler`          | False   | Diagnostic run: per-rank torch.profiler + per-section wall-clock timers, then stop. Traces written per rank to`./profiler_trace/rank<r>/`.                                                                                               |
+| `prof_warmup`       | 1       | Profiler warmup batches (profiled, discarded).                                                                                                                                                                                           |
+| `prof_active`       | 3       | Profiler active batches (recorded). Loop runs`1 + prof_warmup + prof_active` batches; raise `prof_active` for more representative stats.                                                                                                 |
 
 ### Validated 2xT4 config
 
@@ -867,14 +893,15 @@ Or load the `.pt.trace.json` file directly at `chrome://tracing`.
 
 ### Quick Optimization Checklist (T4 x2)
 
-| Setting       | Recommendation                                       |
-| ------------- | ---------------------------------------------------- |
-| `num_workers` | 2-4 (0 = serial, >4 = diminishing returns)           |
-| `pin_memory`  | True (already set in train.py for GPU)               |
+
+| Setting       | Recommendation                                                                                                                                    |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `num_workers` | 2-4 (0 = serial, >4 = diminishing returns)                                                                                                        |
+| `pin_memory`  | True (already set in train.py for GPU)                                                                                                            |
 | `atm_chunk`   | Start at 512; raising it buys no steady-state speed (compute is chunk-invariant, Appendix A1) and only costs memory + bigger torch.compile stalls |
-| `mol_chunk`   | Start at 256; drop to 128 if OOM on large molecules   |
-| `verbosity`   | `"batch"` for loss + memory stats every 20 batches   |
-| `max_batches` | Set to 20 for a quick smoke test before a full run   |
+| `mol_chunk`   | Start at 256; drop to 128 if OOM on large molecules                                                                                               |
+| `verbosity`   | `"batch"` for loss + memory stats every 20 batches                                                                                                |
+| `max_batches` | Set to 20 for a quick smoke test before a full run                                                                                                |
 
 ---
 
@@ -888,15 +915,17 @@ Or load the `.pt.trace.json` file directly at `chrome://tracing`.
 
 **Current sweep (2026-07-10, fp16 path)**: 2x T4, `λ₁=128, λ₂=3, λ₃=128, λ₄=4, λ₅=64`, `amp=True`, `compile=True`, `dp_atom_threshold=101`, profiler over 54 stratified batches (1 heaviest-`N*M_shard` + 2 more heavy-data/heavy-compute groups, see §12). "Steady-state" excludes the handful of torch.compile recompile-stall batches (see notes) to isolate actual per-batch compute; "profiled total" is the raw 54-batch sum including those stalls.
 
-| `atm_chunk` | `mol_chunk` | result | peak CUDA mem | steady-state ms/batch | profiled total (54 batches) | notes |
-| ----------- | ----------- | ------ | -------------- | ---------------------- | ---------------------------- | ----- |
-| 1024        | 512         | **OOM (real training run)** | n/a | n/a | n/a | GPU already at 12.13/14.56G in use, +3.19G alloc failed. Not a profiler run - this crashed a real (non-profiler) training run and is what started this investigation. |
-| **512**     | **256**     | **ok (chosen)** | **~5.8G** | **~880** | **~78.7s (r1) / ~72.9s (r0)** | Profiled before the `.contiguous()` recompile fix (see below), so its compile-stall batches include extra stride/storage_offset-driven recompiles on top of the legitimate chunk-tier ones. |
-| 800         | 400         | ok, but worse | ~8.9G | ~880 | ~130.8s (r1) / ~125.0s (r0) | Profiled after the `.contiguous()` fix - only 4 clean recompiles/rank (vs. ~14 noisy ones at 512/256), but the fewer stalls each compile a bigger graph and take longer overall (47.4s/22.0s/16.5s per rank vs. 512/256's 20.5s/6.9s/6.4s). Steady-state is unchanged from 512/256. |
+
+| `atm_chunk` | `mol_chunk` | result                      | peak CUDA mem | steady-state ms/batch | profiled total (54 batches)   | notes                                                                                                                                                                                                                                                                              |
+| ------------- | ------------- | ----------------------------- | --------------- | ----------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1024        | 512         | **OOM (real training run)** | n/a           | n/a                   | n/a                           | GPU already at 12.13/14.56G in use, +3.19G alloc failed. Not a profiler run - this crashed a real (non-profiler) training run and is what started this investigation.                                                                                                              |
+| **512**     | **256**     | **ok (chosen)**             | **~5.8G**     | **~880**              | **~78.7s (r1) / ~72.9s (r0)** | Profiled before the`.contiguous()` recompile fix (see below), so its compile-stall batches include extra stride/storage_offset-driven recompiles on top of the legitimate chunk-tier ones.                                                                                         |
+| 800         | 400         | ok, but worse               | ~8.9G         | ~880                  | ~130.8s (r1) / ~125.0s (r0)   | Profiled after the`.contiguous()` fix - only 4 clean recompiles/rank (vs. ~14 noisy ones at 512/256), but the fewer stalls each compile a bigger graph and take longer overall (47.4s/22.0s/16.5s per rank vs. 512/256's 20.5s/6.9s/6.4s). Steady-state is unchanged from 512/256. |
 
 Takeaway: **steady-state compute is invariant to chunk size** (~880 ms/batch at both 512/256 and 800/400) - this reconfirms the same finding from the older fp32-era sweeps below. Raising chunk size only buys fewer torch.compile recompiles at the cost of each one being slower to compile (bigger graph) and more peak memory - a net loss here, not a win. `512/256` is chosen: same steady-state speed as `800/400`, ~40% less peak memory, and a smaller worst-case compile stall. Don't raise further without re-profiling; don't lower without a memory-pressure reason, since it buys nothing on speed either.
 
 Two separate bugs were found and fixed in the course of this sweep (both in `ScatterNet/model/message_pass.py` and related files, see git history for exact diffs):
+
 - **RMSNorm/autocast dtype mismatch**: `MessagePass._rms_norm` ran under fp16 autocast against its fp32 weight, forcing an unfused fallback kernel (PyTorch warning: `Mismatch dtype ... Cannot dispatch to fused implementation`). Fixed by forcing that call to fp32 (matching the weight) via `torch.autocast(..., enabled=False)`, same pattern already used for the nearby RFF block.
 - **Non-contiguous chunk-slice views causing extra torch.compile recompiles**: `crd_slice`/`sig_slice`/`emb_slice`/`msk_slice`/`ffs_slice` (MessagePass), `embeds`/`f_mags`/`mask` chunks (OutputHead), and `output_head`/`f_mag_pred`/`sigma_pred` (Loss) are all views into larger padded tensors; their stride/storage_offset vary by chunk index, and torch.compile guards on that independently of shape - multiplying recompiles well past the intended `_CHUNK_TIERS` axis. Fixed by adding `.contiguous()` at each of these call sites. Confirmed via `TORCH_LOGS=recompiles`: dropped from ~14 distinct guard failures/rank (mostly stride/storage_offset noise) to 4 clean ones (2 legitimate chunk-tier shape growths, 1 Inductor fusion-size heuristic, 1 `None`-vs-tensor branch in the loss).
 
@@ -904,16 +933,17 @@ Two separate bugs were found and fixed in the course of this sweep (both in `Sca
 
 **Older fp32-era sweep** (predates the fp16 migration, mean-normalization, and the NoTrilinBilin swap; kept for historical profiling-methodology context only - not comparable to the table above). All runs on 2x T4, λ₁=λ₅=128, λ₂=5, fp32 (no amp). Also predates the current profiler's stratified sampling (used an older shuffle-window sampler that usually missed the true worst bucket, understating peaks).
 
-| `mol_chunk` | `atm_chunk` | product | result          | notes                                                       |
-| ----------- | ----------- | ------- | --------------- | ----------------------------------------------------------- |
-| 64          | 64          | 4096    | ok (baseline)   | ~15.3 / 18.2 s/batch (r0/r1)                                |
-| 128         | 16          | 2048    | ok              | atm too small, weak matmul contraction                      |
-| 104         | 46          | 4784    | ok              | more launches (69,507)                                      |
-| 56          | 100         | 5600    | ok              | fewest launches (58,889), balanced; atm_chunk reduced to 80 |
-| 32          | 200         | 6400    | ok, at ceiling  | peak 14.98G; ~14.5 / 17.3 s/batch                           |
-| 64          | 128         | 8192    | OOM             |                                                             |
-| 32          | 512         | 16384   | OOM             | looked stable in the profiler window, OOM'd mid-run         |
-| 256         | 256         | 65536   | OOM             |                                                             |
+
+| `mol_chunk` | `atm_chunk` | product | result         | notes                                                       |
+| ------------- | ------------- | --------- | ---------------- | ------------------------------------------------------------- |
+| 64          | 64          | 4096    | ok (baseline)  | ~15.3 / 18.2 s/batch (r0/r1)                                |
+| 128         | 16          | 2048    | ok             | atm too small, weak matmul contraction                      |
+| 104         | 46          | 4784    | ok             | more launches (69,507)                                      |
+| 56          | 100         | 5600    | ok             | fewest launches (58,889), balanced; atm_chunk reduced to 80 |
+| 32          | 200         | 6400    | ok, at ceiling | peak 14.98G; ~14.5 / 17.3 s/batch                           |
+| 64          | 128         | 8192    | OOM            |                                                             |
+| 32          | 512         | 16384   | OOM            | looked stable in the profiler window, OOM'd mid-run         |
+| 256         | 256         | 65536   | OOM            |                                                             |
 
 ---
 
@@ -928,8 +958,9 @@ The model routes each batch to whichever fits (dp_atom_threshold, see §7): high
 
 Worst-rank = the epoch-limiting rank (always rank 1 here, see the TP shard-imbalance note in §12). "in-model all-reduce" is the NCCL collective fired inside the TP forward. Two transitions matter; the **speed cliff is between 10 and 63**: at 10 only the `M=3` bucket routes DP (a degenerate DP, most buckets still pay the TP all-reduce), so it stays slow; by 63 every high-`N`/low-`M` bucket routes DP and the all-reduce (68s, 47% of CUDA) disappears, giving a 1.8x speedup. The **memory step is between 101 and 102**: at 102 the `mols=550, M=101` bucket flips to DP, which holds the full `M=101` per rank instead of sharding it, pushing peak from 13.55G to 14.51G for no speed gain. `dp_atom_threshold = 101` is chosen because the strict `M < threshold` gate keeps that bucket on TP: full speedup at the lower peak (~2.4G headroom). See §7 for the safe-band reasoning.
 
+
 | `dp_atom_threshold` | worst-rank s/batch | peak CUDA mem | Self CUDA total | Small molecule all-reduce time |
-| ------------------- | ------------------ | ------------- | --------------- | ------------------------------ |
+| --------------------- | -------------------- | --------------- | ----------------- | -------------------------------- |
 | 0 (all TP)          | 40.5               | 13.55G        | 145s            | 68s (47%)                      |
 | 10                  | 33.7               | 13.55G        | 145s            | 68s (47%)                      |
 | 63                  | 22.5               | 13.55G        | 62s             | eliminated                     |

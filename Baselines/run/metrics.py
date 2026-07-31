@@ -5,7 +5,8 @@ predictors.
 import json
 import math
 import re
-from collections.abc import Iterable
+import time as _time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -213,6 +214,10 @@ def evaluate(
     q_grid: torch.Tensor,
     name: str,
     device: "torch.device | str | None" = None,
+    start_batch: int = 0,
+    resume_state: dict | None = None,
+    ckpt_cb: "Callable[[dict, int], None] | None" = None,
+    ckpt_interval_sec: float = 0,
 ) -> EvalResult:
     """Evaluate a baseline over every batch in ``loader``, one streaming pass.
 
@@ -240,6 +245,25 @@ def evaluate(
         CPU path is unchanged. The per-baseline scalar/per-q reductions
         below still land on CPU via the existing ``.cpu()``/``.item()``
         calls.
+    start_batch : int
+        Global batch index of the first batch `loader` will yield (0
+        normally; > 0 on a mid-pass resume, where `loader` already skips
+        the batches before this index). Only used to label the checkpoint
+        callback; `resume_state` is what actually seeds the accumulators.
+    resume_state : dict or None
+        Accumulator state from an earlier `ckpt_cb` call (see
+        `_eval_state`/`_restore_eval_state` below), folded in before this
+        pass's own batches are added. None for a fresh pass.
+    ckpt_cb : callable or None
+        If given, called periodically as `ckpt_cb(state, batch_idx)` with
+        the full accumulator state and the last-processed global batch
+        index, so a caller evaluating a long-running baseline (e.g.
+        ScatterNet's per-epoch test/plots pass) can checkpoint mid-pass.
+        Every existing caller leaves this None, so behavior there is
+        unchanged.
+    ckpt_interval_sec : float
+        Minimum wall-clock seconds between `ckpt_cb` calls. 0 (default)
+        disables checkpointing even if `ckpt_cb` is given.
 
     Returns
     -------
@@ -261,10 +285,10 @@ def evaluate(
     sum_pct_err_q = torch.zeros(Q)
     n_mols = 0
 
-    bin_sq_errs = {
+    bin_sq_errs: dict = {
         label: [] for label in ATOM_BIN_LABELS
     }  # per-molecule MSLE, per atom-count bucket
-    bin_resids = {
+    bin_resids: dict = {
         label: [] for label in ATOM_BIN_LABELS
     }  # per-molecule signed residual, same bucketing
 
@@ -277,7 +301,31 @@ def evaluate(
 
     tpa_weighted, total_atoms = 0.0, 0
 
-    for batch in loader:
+    if resume_state:
+        sum_sq_err_log1p = resume_state["sum_sq_err_log1p"]
+        sum_y_log1p = resume_state["sum_y_log1p"]
+        sum_y2_log1p = resume_state["sum_y2_log1p"]
+        sum_sq_err_raw = resume_state["sum_sq_err_raw"]
+        sum_y_raw = resume_state["sum_y_raw"]
+        sum_y2_raw = resume_state["sum_y2_raw"]
+        n_points = resume_state["n_points"]
+        sum_sq_err_log1p_q = torch.tensor(resume_state["sum_sq_err_log1p_q"])
+        sum_true_log1p_q = torch.tensor(resume_state["sum_true_log1p_q"])
+        sum_pred_log1p_q = torch.tensor(resume_state["sum_pred_log1p_q"])
+        sum_y2_log1p_q = torch.tensor(resume_state["sum_y2_log1p_q"])
+        sum_pct_err_q = torch.tensor(resume_state["sum_pct_err_q"])
+        n_mols = resume_state["n_mols"]
+        bin_sq_errs = resume_state["bin_sq_errs"]
+        bin_resids = resume_state["bin_resids"]
+        all_msle = resume_state["all_msle"]
+        all_resid = resume_state["all_resid"]
+        all_atoms = resume_state["all_atoms"]
+        tpa_weighted = resume_state["tpa_weighted"]
+        total_atoms = resume_state["total_atoms"]
+
+    last_ckpt = _time.time()
+
+    for _bi, batch in enumerate(loader, start=start_batch):
         batch = batch.to(device)
         pred, tpa = baseline.timed_call(batch)
         # align pred to the batch's device: most baselines already return
@@ -332,6 +380,38 @@ def evaluate(
         n_atoms = int(batch.padding_mask().sum().item())
         tpa_weighted += tpa * n_atoms
         total_atoms += n_atoms
+
+        if (
+            ckpt_cb is not None
+            and ckpt_interval_sec > 0
+            and (_time.time() - last_ckpt) > ckpt_interval_sec
+        ):
+            ckpt_cb(
+                {
+                    "sum_sq_err_log1p": sum_sq_err_log1p,
+                    "sum_y_log1p": sum_y_log1p,
+                    "sum_y2_log1p": sum_y2_log1p,
+                    "sum_sq_err_raw": sum_sq_err_raw,
+                    "sum_y_raw": sum_y_raw,
+                    "sum_y2_raw": sum_y2_raw,
+                    "n_points": n_points,
+                    "sum_sq_err_log1p_q": sum_sq_err_log1p_q.tolist(),
+                    "sum_true_log1p_q": sum_true_log1p_q.tolist(),
+                    "sum_pred_log1p_q": sum_pred_log1p_q.tolist(),
+                    "sum_y2_log1p_q": sum_y2_log1p_q.tolist(),
+                    "sum_pct_err_q": sum_pct_err_q.tolist(),
+                    "n_mols": n_mols,
+                    "bin_sq_errs": bin_sq_errs,
+                    "bin_resids": bin_resids,
+                    "all_msle": all_msle,
+                    "all_resid": all_resid,
+                    "all_atoms": all_atoms,
+                    "tpa_weighted": tpa_weighted,
+                    "total_atoms": total_atoms,
+                },
+                _bi,
+            )
+            last_ckpt = _time.time()
 
     msle = sum_sq_err_log1p / n_points if n_points > 0 else float("nan")
 

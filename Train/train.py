@@ -3,7 +3,7 @@ import os
 import random
 import subprocess
 import time as _time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace as dc_replace
 from time import perf_counter
@@ -440,6 +440,9 @@ def evaluate(
     device: str,
     rank: int = 0,
     label: str = "eval",
+    start_batch: int = 0,
+    resume_state: dict | None = None,
+    ckpt_cb: "Callable[[dict, int], None] | None" = None,
 ) -> tuple[float, float]:
     """Run one pass over `loader` without gradients and return (mean_loss, R2).
 
@@ -474,6 +477,22 @@ def evaluate(
         Val and test hold one batch per bucket exactly like train, so
         this pass is thousands of batches long; it reports every 20,
         same as the train loop.
+    start_batch : int
+        Global batch index of the first batch `loader` will yield (0
+        normally; > 0 on a mid-phase resume, where `loader`'s sampler
+        already skips the batches before this index - see
+        `_ResumableSequentialSampler`). Only used to label `_bi` in the
+        progress line and checkpoint callback; the accumulators
+        themselves are seeded from `resume_state`, not recomputed.
+    resume_state : dict or None
+        Accumulator state saved by an earlier `ckpt_cb` call
+        (total_loss/total_mols/ss_res/sum_y/sum_y2/n_elem), folded in
+        before this pass's own batches are added. None for a fresh pass.
+    ckpt_cb : callable or None
+        If given, called periodically (same cadence as the training
+        loop's mid-epoch checkpoint) as `ckpt_cb(state, batch_idx)` with
+        the current accumulator state and the last-processed global
+        batch index, so the caller can write a resumable checkpoint.
 
     Returns
     -------
@@ -490,11 +509,19 @@ def evaluate(
     sum_y = 0.0
     sum_y2 = 0.0
     n_elem = 0.0
+    if resume_state:
+        total_loss = resume_state["total_loss"]
+        total_mols = resume_state["total_mols"]
+        ss_res = resume_state["ss_res"]
+        sum_y = resume_state["sum_y"]
+        sum_y2 = resume_state["sum_y2"]
+        n_elem = resume_state["n_elem"]
     verbose = rank == 0 and cfg.verbosity in ("batch", "diagnostic")
-    n_batch = len(loader)
+    n_batch = start_batch + len(loader)
     t0 = _time.time()
+    last_ckpt = _time.time()
     with torch.no_grad():
-        for _bi, batch in enumerate(loader):
+        for _bi, batch in enumerate(loader, start=start_batch):
             batch = dc_replace(
                 batch,
                 vocab=batch.vocab.to(device),
@@ -547,12 +574,34 @@ def evaluate(
 
             if verbose and (_bi + 1) % 20 == 0:
                 elapsed = _time.time() - t0
-                rate = (_bi + 1) / elapsed
+                rate = (_bi + 1 - start_batch) / elapsed
                 print(
                     f"  [{label}] batch {_bi + 1:5d}/{n_batch}  "
                     f"loss {total_loss / max(total_mols, 1)}  "
                     f"{rate} batch/s",
                 )
+
+            # Crash safety: same cadence as the training loop's mid-epoch
+            # checkpoint - val/test are thousands of batches long too, so
+            # losing a whole pass to a late timeout is exactly the failure
+            # mode this closes.
+            if (
+                rank == 0
+                and ckpt_cb is not None
+                and (_time.time() - last_ckpt) > cfg.ckpt_interval_sec
+            ):
+                ckpt_cb(
+                    {
+                        "total_loss": total_loss,
+                        "total_mols": total_mols,
+                        "ss_res": ss_res,
+                        "sum_y": sum_y,
+                        "sum_y2": sum_y2,
+                        "n_elem": n_elem,
+                    },
+                    _bi,
+                )
+                last_ckpt = _time.time()
     mean_loss = total_loss / total_mols
     ss_tot = sum_y2 - sum_y**2 / n_elem
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
@@ -700,6 +749,26 @@ def _worker(rank: int, cfg: RunConfig):
             perm = torch.randperm(len(self.data_source)).tolist()
             return iter(perm[self.skip :])
 
+    class _ResumableSequentialSampler(torch.utils.data.Sampler):
+        """SequentialSampler equivalent, but able to start partway through.
+
+        val/test loaders are unshuffled (order is already deterministic
+        across runs), so a mid-pass resume just needs to skip the first
+        `skip` indices - same rationale as `_ResumableSampler` above (skip
+        indices never reach the DataLoader, so no wasted HDF5 reads for
+        already-evaluated batches).
+        """
+
+        def __init__(self, data_source: BatchSet):
+            self.data_source = data_source
+            self.skip = 0
+
+        def __len__(self) -> int:
+            return len(self.data_source) - self.skip
+
+        def __iter__(self) -> Iterator[int]:
+            return iter(range(self.skip, len(self.data_source)))
+
     train_sampler = _ResumableSampler(train_set)
     train_loader = DataLoader(
         train_set,
@@ -710,19 +779,21 @@ def _worker(rank: int, cfg: RunConfig):
         pin_memory=pin,
         persistent_workers=pw,
     )
+    val_sampler = _ResumableSequentialSampler(val_set)
     val_loader = DataLoader(
         val_set,
         batch_size=1,
-        shuffle=False,
+        sampler=val_sampler,
         collate_fn=_first,
         num_workers=cfg.num_workers,
         pin_memory=pin,
         persistent_workers=pw,
     )
+    test_sampler = _ResumableSequentialSampler(test_set)
     test_loader = DataLoader(
         test_set,
         batch_size=1,
-        shuffle=False,
+        sampler=test_sampler,
         collate_fn=_first,
         num_workers=cfg.num_workers,
         pin_memory=pin,
@@ -989,6 +1060,15 @@ def _worker(rank: int, cfg: RunConfig):
     best_val = float("inf")
     # batches to skip in the first resumed epoch (exact mid-epoch resume)
     resume_skip = 0
+    # which stage of start_epoch to resume into: None (fresh epoch, run
+    # train → val → test as normal), or "val"/"test" to skip the stage(s)
+    # that were already finished when the checkpoint was written.
+    resume_phase: str | None = None
+    resume_phase_skip = 0
+    resume_eval_state: dict | None = None
+    resume_train_loss = resume_train_r2 = None
+    resume_val_loss = resume_val_r2 = None
+    _PHASE_ORDER = ["train", "val", "test"]
 
     if cfg.resume:
         ckpt = torch.load(cfg.resume, map_location=device)
@@ -1008,19 +1088,44 @@ def _worker(rank: int, cfg: RunConfig):
         # "val_loss", so fall back to that for backward compatibility.
         best_val = ckpt.get("best_val", ckpt.get("val_loss", float("inf")))
         saved_bi = ckpt.get("batch_idx", -1)
-        if (
-            saved_bi is None or saved_bi < 0
-        ):  # checkpoint sat at an epoch boundary
-            start_epoch = ckpt["epoch"] + 1
-        else:  # mid-epoch checkpoint → redo this epoch from saved_bi+1
+        # Older checkpoints (pre phase-machine) never wrote "phase" - they
+        # only ever checkpointed mid-training, so "train" is the correct
+        # default read for them too.
+        saved_phase = ckpt.get("phase", "train")
+        if saved_bi is not None and saved_bi >= 0:
+            # mid-phase checkpoint → redo saved_phase this same epoch from
+            # saved_bi+1. For "val"/"test" this also carries forward the
+            # partial accumulator and any earlier phases' already-computed
+            # scalar results, so those phases are not redone.
             start_epoch = ckpt["epoch"]
-            resume_skip = saved_bi + 1
+            resume_phase = saved_phase
+            resume_phase_skip = saved_bi + 1
+            resume_eval_state = ckpt.get("eval_state")
+            resume_train_loss = ckpt.get("train_loss")
+            resume_train_r2 = ckpt.get("train_r2")
+            resume_val_loss = ckpt.get("val_loss")
+            resume_val_r2 = ckpt.get("val_r2")
+        else:
+            # saved_phase fully completed as of this checkpoint.
+            phase_i = _PHASE_ORDER.index(saved_phase)
+            if phase_i == len(_PHASE_ORDER) - 1:  # "test" done → epoch done
+                start_epoch = ckpt["epoch"] + 1
+            else:
+                start_epoch = ckpt["epoch"]
+                resume_phase = _PHASE_ORDER[phase_i + 1]
+                resume_train_loss = ckpt.get("train_loss")
+                resume_train_r2 = ckpt.get("train_r2")
+                resume_val_loss = ckpt.get("val_loss")
+                resume_val_r2 = ckpt.get("val_r2")
+        if resume_phase == "train":
+            resume_skip = resume_phase_skip
+            resume_phase = None  # training loop needs no phase-skip logic
         if rank == 0:
             resumed_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"resumed from {cfg.resume} (epoch {ckpt['epoch']}, "
-                f"batch_idx {saved_bi}, best_val {best_val:.4f}, "
-                f"lr {resumed_lr:.4g})",
+                f"phase {saved_phase}, batch_idx {saved_bi}, "
+                f"best_val {best_val:.4f}, lr {resumed_lr:.4g})",
             )
         del ckpt
 
@@ -1139,20 +1244,54 @@ def _worker(rank: int, cfg: RunConfig):
         eps_msgp=cfg.eps_msgp,
     )
 
-    def _save_resume(ep: int, batch_idx: int):
+    def _save_resume(
+        ep: int,
+        batch_idx: int,
+        phase: str = "train",
+        eval_state: dict | None = None,
+        train_loss: float | None = None,
+        train_r2: float | None = None,
+        val_loss: float | None = None,
+        val_r2: float | None = None,
+    ):
         """Write the resume checkpoint (weights, optimizer, position) and
         push it off-box.
 
         Both TP ranks hold identical weights, so rank 0's state_dict is
         complete.
 
+        Covers all three per-epoch stages, not just training: `phase`
+        records which stage this checkpoint belongs to ("train", "val",
+        "test"), so a resume can skip straight to wherever the run was
+        actually interrupted instead of always redoing training. Val/test
+        are thousands of batches long too (see `evaluate`/`save_epoch_plots`
+        in Train/eval_plots.py), so losing a whole pass to a late timeout
+        used to be as costly as losing the training tail - this closes that
+        gap the same way the mid-epoch train checkpoint already does.
+
         Parameters
         ----------
         ep : int
             Current epoch number.
         batch_idx : int
-            Batch index within the epoch; -1 marks an epoch boundary,
-            >= 0 marks a mid-epoch save at that batch.
+            Batch index within `phase`; -1 marks `phase` as complete for
+            this epoch (the phase-machine advances to the next phase, or to
+            the next epoch if `phase` is "test"), >= 0 marks a mid-phase
+            save at that batch.
+        phase : str
+            Which stage this checkpoint belongs to: "train", "val", or
+            "test" (test also covers the diagnostic-plots pass).
+        eval_state : dict or None
+            Mid-phase accumulator state for `phase` in ("val", "test") -
+            see `evaluate`'s `ckpt_cb` (val) or `save_epoch_plots`'s
+            `ckpt_cb` (test). None when `phase` is "train", or when
+            `batch_idx` is -1 (phase already folded into its scalar
+            result below).
+        train_loss, train_r2, val_loss, val_r2 : float or None
+            This epoch's already-computed scalar results, carried forward
+            so a resume into "val" or "test" phase doesn't need to redo
+            earlier phases just to reconstruct the printed summary line
+            and this epoch's metrics.json.
 
         Returns
         -------
@@ -1160,12 +1299,18 @@ def _worker(rank: int, cfg: RunConfig):
         """
         os.makedirs(cfg.ckpt_dir, exist_ok=True)
         batch_tag = "final" if batch_idx < 0 else str(batch_idx)
-        ckpt_name = f"checkpoint_{ep}_{batch_tag}.pt"
+        ckpt_name = f"checkpoint_{ep}_{phase}_{batch_tag}.pt"
         ckpt_path = os.path.join(cfg.ckpt_dir, ckpt_name)
         torch.save(
             {
                 "epoch": ep,
                 "batch_idx": batch_idx,
+                "phase": phase,
+                "eval_state": eval_state,
+                "train_loss": train_loss,
+                "train_r2": train_r2,
+                "val_loss": val_loss,
+                "val_r2": val_r2,
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
@@ -1191,6 +1336,16 @@ def _worker(rank: int, cfg: RunConfig):
         _rclone_push(cfg.data_dir, cfg.data_rclone_dest)
 
     for epoch in range(start_epoch, start_epoch + cfg.epochs):
+        # Only the very first iteration of this loop can be a resume target -
+        # every later epoch starts fresh regardless of what interrupted the
+        # previous run.
+        is_resumed_epoch = epoch == start_epoch
+        skip_train_entirely = is_resumed_epoch and resume_phase in (
+            "val",
+            "test",
+        )
+        skip_val_entirely = is_resumed_epoch and resume_phase == "test"
+
         # Seed before iteration so all ranks shuffle train_loader identically.
         torch.manual_seed(cfg.batcher_seed + epoch)
 
@@ -1215,7 +1370,16 @@ def _worker(rank: int, cfg: RunConfig):
         # is the same molecule group as in the interrupted run. train_sampler
         # excludes the skipped indices outright (see _ResumableSampler), so
         # this costs nothing regardless of where in the epoch we resume.
-        skip = resume_skip if epoch == start_epoch else 0
+        # skip_train_entirely means training already finished for this epoch
+        # (the interrupted run got as far as val or test) - skipping every
+        # index costs nothing for the same reason, and this epoch's actual
+        # train_loss/train_r2 are carried forward from that earlier run's
+        # checkpoint instead of being recomputed.
+        skip = (
+            len(train_set)
+            if skip_train_entirely
+            else (resume_skip if is_resumed_epoch else 0)
+        )
         resume_skip = 0
         train_sampler.skip = skip
 
@@ -1484,16 +1648,77 @@ def _worker(rank: int, cfg: RunConfig):
         if cfg.profiler:
             break  # diagnostic run: stop after profiling, no eval/checkpoint
 
-        train_loss = train_loss_sum / train_mols
-        train_ss_tot = train_sum_y2 - train_sum_y**2 / train_n_elem
-        train_r2 = (
-            1.0 - train_ss_res / train_ss_tot if train_ss_tot > 0 else 0.0
-        )
+        if skip_train_entirely:
+            train_loss, train_r2 = resume_train_loss, resume_train_r2
+        else:
+            train_loss = train_loss_sum / train_mols
+            train_ss_tot = train_sum_y2 - train_sum_y**2 / train_n_elem
+            train_r2 = (
+                1.0 - train_ss_res / train_ss_tot if train_ss_tot > 0 else 0.0
+            )
+            if rank == 0:
+                # Marks training done for this epoch, so a crash during val
+                # or test resumes straight into that phase instead of
+                # redoing the training loop.
+                _save_resume(
+                    epoch,
+                    -1,
+                    phase="train",
+                    train_loss=train_loss,
+                    train_r2=train_r2,
+                )
 
-        val_loss, val_r2 = evaluate(
-            val_loader, model, cfg, device, rank, "val"
-        )
-        torch.cuda.empty_cache()
+        if skip_val_entirely:
+            val_loss, val_r2 = resume_val_loss, resume_val_r2
+        else:
+            val_start = (
+                resume_phase_skip
+                if (is_resumed_epoch and resume_phase == "val")
+                else 0
+            )
+            val_state = (
+                resume_eval_state
+                if (is_resumed_epoch and resume_phase == "val")
+                else None
+            )
+            val_sampler.skip = val_start
+            val_loss, val_r2 = evaluate(
+                val_loader,
+                model,
+                cfg,
+                device,
+                rank,
+                "val",
+                start_batch=val_start,
+                resume_state=val_state,
+                ckpt_cb=(
+                    (
+                        lambda st, bi: _save_resume(
+                            epoch,
+                            bi,
+                            phase="val",
+                            eval_state=st,
+                            train_loss=train_loss,
+                            train_r2=train_r2,
+                        )
+                    )
+                    if rank == 0
+                    else None
+                ),
+            )
+            torch.cuda.empty_cache()
+            if rank == 0:
+                # Marks val done for this epoch, so a crash during test
+                # resumes straight into test instead of redoing val.
+                _save_resume(
+                    epoch,
+                    -1,
+                    phase="val",
+                    train_loss=train_loss,
+                    train_r2=train_r2,
+                    val_loss=val_loss,
+                    val_r2=val_r2,
+                )
 
         # Test set is walked exactly once per epoch. When diagnostic plots are
         # on,
@@ -1510,6 +1735,33 @@ def _worker(rank: int, cfg: RunConfig):
         # plots pass runs on every rank (TP-forced forward needs all ranks); it
         # gates
         # file-writing to rank 0 but returns identical loss/R2 on every rank.
+        test_start = (
+            resume_phase_skip
+            if (is_resumed_epoch and resume_phase == "test")
+            else 0
+        )
+        test_state = (
+            resume_eval_state
+            if (is_resumed_epoch and resume_phase == "test")
+            else None
+        )
+        test_sampler.skip = test_start
+
+        def _test_ckpt_cb(st: dict, bi: int) -> None:
+            """Write a mid-test-phase resume checkpoint, carrying this
+            epoch's already-known train/val results forward.
+            """
+            _save_resume(
+                epoch,
+                bi,
+                phase="test",
+                eval_state=st,
+                train_loss=train_loss,
+                train_r2=train_r2,
+                val_loss=val_loss,
+                val_r2=val_r2,
+            )
+
         if cfg.data_dir:
             from Train.eval_plots import save_batch_loss_plot, save_epoch_plots
 
@@ -1526,6 +1778,10 @@ def _worker(rank: int, cfg: RunConfig):
                 lambda_6=cfg.lambda_6,
                 lambda_7=cfg.lambda_7,
                 verbose=cfg.verbosity in ("batch", "diagnostic"),
+                start_batch=test_start,
+                resume_state=test_state,
+                ckpt_cb=_test_ckpt_cb if rank == 0 else None,
+                ckpt_interval_sec=cfg.ckpt_interval_sec,
             )
             torch.cuda.empty_cache()
             # cheap: uses batch_losses collected during the loop, no forward
@@ -1534,7 +1790,15 @@ def _worker(rank: int, cfg: RunConfig):
                 save_batch_loss_plot(batch_losses, cfg.data_dir, epoch)
         else:
             test_loss, test_r2 = evaluate(
-                test_loader, model, cfg, device, rank, "test"
+                test_loader,
+                model,
+                cfg,
+                device,
+                rank,
+                "test",
+                start_batch=test_start,
+                resume_state=test_state,
+                ckpt_cb=_test_ckpt_cb if rank == 0 else None,
             )
             torch.cuda.empty_cache()
 
@@ -1588,7 +1852,10 @@ def _worker(rank: int, cfg: RunConfig):
                 _rclone_push(cfg.data_dir, cfg.data_rclone_dest)
 
             # update best BEFORE the resume save so the latter records the
-            # current best_val
+            # current best_val. val_loss/val_r2 are always floats by this
+            # point (either just computed, or carried forward from a
+            # checkpoint written after val phase completed - never None).
+            assert val_loss is not None
             if val_loss < best_val:
                 best_val = val_loss
                 torch.save(
@@ -1605,7 +1872,26 @@ def _worker(rank: int, cfg: RunConfig):
                 _rclone_push(cfg.ckpt_best, cfg.ckpt_rclone_dest)
                 print(f"  saved best checkpoint (val {val_loss:.4f})")
 
-            _save_resume(epoch, -1)  # batch_idx=-1 marks the epoch as complete
+            # phase="test", batch_idx=-1: test done -> whole epoch complete,
+            # matching the phase-machine's terminal state (see the resume
+            # block's _PHASE_ORDER walk).
+            _save_resume(
+                epoch,
+                -1,
+                phase="test",
+                train_loss=train_loss,
+                train_r2=train_r2,
+                val_loss=val_loss,
+                val_r2=val_r2,
+            )
+
+        # This epoch's resume-phase carryover is now fully consumed - later
+        # epochs always start fresh.
+        resume_phase = None
+        resume_phase_skip = 0
+        resume_eval_state = None
+        resume_train_loss = resume_train_r2 = None
+        resume_val_loss = resume_val_r2 = None
 
         # Every rank steps identically (pure function of epoch count, no
         # rank-dependent state), so the LR stays in lockstep across TP/DP

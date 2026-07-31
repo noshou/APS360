@@ -86,9 +86,10 @@ class RunConfig:
         Where to save the checkpoint w/ the lowest validation loss.
     ckpt_dir : str
         Directory to save numbered resume checkpoints into. Each
-        mid-epoch/epoch-boundary save writes its own file
-        (checkpoint_<epoch>_<batch>.pt, with "final" for epoch
-        boundaries) instead of overwriting a single fixed path.
+        mid-phase/phase-boundary save writes its own file
+        (checkpoint_<epoch>_<phase>_<batch>.pt, with "final" for phase
+        boundaries; phase is "train"/"val"/"test") instead of overwriting
+        a single fixed path. See README's Checkpoint and Resume section.
     resume : str or None
         Path to a checkpoint to resume (None = train from scratch).
 

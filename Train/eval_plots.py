@@ -2,7 +2,7 @@ import glob
 import json
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from dataclasses import replace as dc_replace
 
@@ -48,6 +48,8 @@ class ScatterNetBaseline(Baseline):
         progress: bool = False,
         n_batch: int = 0,
         dtype: torch.dtype = torch.float16,
+        start_seen: int = 0,
+        resume_loss_state: dict | None = None,
     ) -> None:
         """Store the model and precision/device settings used at call time.
 
@@ -89,6 +91,14 @@ class ScatterNetBaseline(Baseline):
             concern than it would be for training, but still worth spot-
             checking predictions against the fp16/fp32 path before trusting
             a bf16 comparison run's accuracy numbers, not just its speed.
+        start_seen : int
+            Number of molecules-batches already processed before this call
+            (> 0 on a mid-pass resume), used only to label the progress
+            line correctly.
+        resume_loss_state : dict or None
+            loss/R2 accumulator state from an earlier checkpoint (see
+            `loss_state()`), folded in before this pass's own batches are
+            added. None for a fresh pass.
 
         Returns
         -------
@@ -103,7 +113,8 @@ class ScatterNetBaseline(Baseline):
         self._progress = progress
         self._n_batch = n_batch
         self._dtype = dtype
-        self._seen = 0
+        self._seen = start_seen
+        self._start_seen = start_seen
         self._last_printed = -1
         self._t0 = time.time()
         # loss/R2 accumulators (only used if compute_loss given)
@@ -113,6 +124,28 @@ class ScatterNetBaseline(Baseline):
         self._sum_y = 0.0
         self._sum_y2 = 0.0
         self._n_elem = 0.0
+        if resume_loss_state:
+            self._loss_sum = resume_loss_state["loss_sum"]
+            self._mols = resume_loss_state["mols"]
+            self._ss_res = resume_loss_state["ss_res"]
+            self._sum_y = resume_loss_state["sum_y"]
+            self._sum_y2 = resume_loss_state["sum_y2"]
+            self._n_elem = resume_loss_state["n_elem"]
+
+    def loss_state(self) -> dict:
+        """Return the loss/R2 accumulator state, for mid-pass checkpointing.
+
+        Inverse of `resume_loss_state` in `__init__` - round-trips through
+        `loss_r2()`'s inputs exactly.
+        """
+        return {
+            "loss_sum": self._loss_sum,
+            "mols": self._mols,
+            "ss_res": self._ss_res,
+            "sum_y": self._sum_y,
+            "sum_y2": self._sum_y2,
+            "n_elem": self._n_elem,
+        }
 
     def loss_r2(self) -> tuple[float, float]:
         """Return (mean composite loss, log1p R2) accumulated over all calls.
@@ -190,7 +223,7 @@ class ScatterNetBaseline(Baseline):
             and self._seen != self._last_printed
         ):
             self._last_printed = self._seen
-            rate = self._seen / (time.time() - self._t0)
+            rate = (self._seen - self._start_seen) / (time.time() - self._t0)
             print(
                 f"  [test/plots] batch {self._seen:5d}/{self._n_batch}",
                 f"  {rate} batch/s",
@@ -243,6 +276,10 @@ def save_epoch_plots(
     lambda_6: float | None = None,
     lambda_7: float | None = None,
     verbose: bool = False,
+    start_batch: int = 0,
+    resume_state: dict | None = None,
+    ckpt_cb: "Callable[[dict, int], None] | None" = None,
+    ckpt_interval_sec: float = 0,
 ) -> tuple[float, float]:
     """
     Evaluate `model` on `loader`, write this epoch's diagnostic plots, and
@@ -303,6 +340,23 @@ def save_epoch_plots(
         Loss weights, required when `compute_loss` is True.
     verbose : bool
         Print a progress line every 20 batches (rank 0 only).
+    start_batch : int
+        Global batch index of the first batch `loader` will yield (0
+        normally; > 0 on a mid-pass resume, where `loader`'s sampler
+        already skips the batches before this index).
+    resume_state : dict or None
+        Combined checkpoint state from an earlier `ckpt_cb` call: keys
+        "eval" (Baselines.run.metrics.evaluate's accumulator, see its
+        docstring) and "loss" (ScatterNetBaseline's loss/R2 accumulator,
+        see `ScatterNetBaseline.loss_state`). None for a fresh pass.
+    ckpt_cb : callable or None
+        If given, called periodically as `ckpt_cb(state, batch_idx)` with
+        the combined state (same shape as `resume_state`) and the last-
+        processed global batch index, so the caller can write a resumable
+        checkpoint for this long-running pass.
+    ckpt_interval_sec : float
+        Minimum wall-clock seconds between `ckpt_cb` calls. 0 (default)
+        disables checkpointing even if `ckpt_cb` is given.
 
     Returns
     -------
@@ -318,10 +372,33 @@ def save_epoch_plots(
         lambda_6=lambda_6,
         lambda_7=lambda_7,
         progress=verbose and rank == 0,
-        n_batch=len(loader),  # type: ignore[arg-type]
+        n_batch=start_batch + len(loader),  # type: ignore[arg-type]
+        start_seen=start_batch,
+        resume_loss_state=(
+            resume_state["loss"] if resume_state else None
+        ),
     )
+
+    def _ckpt_cb(eval_state: dict, batch_idx: int) -> None:
+        """Bundle metrics.evaluate's accumulator with the baseline's
+        loss/R2 accumulator into one checkpoint payload.
+        """
+        assert ckpt_cb is not None
+        ckpt_cb(
+            {"eval": eval_state, "loss": baseline.loss_state()}, batch_idx
+        )
+
     with _force_tp(model):
-        result = _bl_evaluate(baseline, loader, q_grid, "ScatterNet")
+        result = _bl_evaluate(
+            baseline,
+            loader,
+            q_grid,
+            "ScatterNet",
+            start_batch=start_batch,
+            resume_state=resume_state["eval"] if resume_state else None,
+            ckpt_cb=_ckpt_cb if ckpt_cb is not None else None,
+            ckpt_interval_sec=ckpt_interval_sec,
+        )
     if rank == 0:
         epoch_dir = os.path.join(data_dir, f"epoch_{epoch:03d}")
         # bar_chart_png=False: only one result (ScatterNet) is ever plotted
