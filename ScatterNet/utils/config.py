@@ -153,6 +153,11 @@ class RunConfig:
     eps_embd : float
         Numerical floor in the Embed module (avoids division by
         zero).
+    sigma_max : float
+        Cap on Embed's 1/q sigma envelope, in Angstroms. Default 100.0.
+    sigma_floor : float
+        Lower clamp on sigma, in Angstroms (Embed). Default 0.5. Replaces the
+        1e-3 floor `eps_msgp` applied at message_pass.py:426.
     eps_msgp : float
         Numerical floor in MessagePass sigma clamping and aggregate
         denominator.
@@ -161,23 +166,21 @@ class RunConfig:
     lambda_6 : float
         Weight on the form-factor penalty term.
     lambda_7 : float
-        Weight on the sigma L2 penalty (prevents RFF bandwidth
-        blowup). The penalty is weighted by ~q^2 across the q-grid
-        (normalised to mean 1, so this value keeps the meaning it had
-        under the old flat penalty), which leaves the kernel range
-        long where low q needs it. See ScatterNet/scatter_net.py's
-        ScatterNet.compute_loss.
+        Weight on the sigma L2 penalty, q^2-weighted across the grid
+        (normalised to mean 1). 0.0 (default) disables it; see the field
+        comment. See ScatterNet/scatter_net.py's ScatterNet.compute_loss.
 
     Training
     lr : float
         Adam learning rate (this is the epoch-1 value; see lr_gamma).
     lr_gamma : float
         Per-epoch multiplicative LR decay (ExponentialLR): lr at epoch N
-        (1-indexed) is lr * lr_gamma^(N-1). 1.0 = no decay. Applied once
-        per epoch, keyed off the absolute epoch number (ckpt["epoch"]),
-        not a saved scheduler counter -- so a crash-resume (this run
-        restarts often; see ckpt_interval_sec) lands on the correct LR
-        automatically without needing scheduler state in the checkpoint.
+        (1-indexed) is lr * lr_gamma^(N-1). 1.0 = no decay (the default;
+        see the field comment). Applied once per epoch, keyed off the
+        absolute epoch number (ckpt["epoch"]) rather than a saved scheduler
+        counter, so a crash-resume (this run restarts often; see
+        ckpt_interval_sec) lands on the correct LR without needing scheduler
+        state in the checkpoint.
         cfg.epochs is the epoch count for THIS invocation, not the
         run's total horizon (a resume runs cfg.epochs MORE epochs from
         wherever it left off), so a horizon-based schedule (cosine,
@@ -282,14 +285,27 @@ class RunConfig:
     amp_init_scale: float = 1024.0  # GradScaler starting loss scale (amp only)
     eps_embd: float = 1e-8
     eps_msgp: float = 1e-3
+    sigma_max: float = 100.0
+    sigma_floor: float = 0.5
+    sigma_init_gain: float = 0.1
 
     # loss
     lambda_6: float = 1.0
-    lambda_7: float = 0.15
+    # 0.0 = sigma penalty off. Was 0.15. It penalises sigma^2, and sigma is
+    # now exp(z + log(1/q)), reaching ~100 A at low q instead of a flat
+    # ~0.7 A, so the term grew ~1e4x and would dominate the loss. It was also
+    # inert for all 11 epochs of the previous run (gradient underflowed to
+    # zero). Re-tune against the new sigma scale only if sigma blows up.
+    lambda_7: float = 0.0
 
     # training
     lr: float = 1.3e-4
-    lr_gamma: float = 0.7  # per-epoch ExponentialLR decay factor
+    # 1.0 = constant LR. Was 0.7. Per-epoch decay assumes an epoch is a
+    # fixed amount of work, but dataset_frac scales its step count: at
+    # frac=0.05 an epoch is ~1/20 the steps, so 0.7/epoch decays ~20x faster
+    # per step. The old schedule reached lr=5.2e-6 by epoch 11. Re-anneal
+    # once the model trains, keyed off total steps rather than epochs.
+    lr_gamma: float = 1.0
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     epochs: int = 20
@@ -336,6 +352,9 @@ class RunConfig:
             "amp_init_scale",
             "eps_embd",
             "eps_msgp",
+            "sigma_max",
+            "sigma_floor",
+            "sigma_init_gain",
             "lambda_6",
             "lambda_7",
             "lr",

@@ -53,7 +53,8 @@ eps_msgp: 1.0e-3
 # loss (RunConfig.__post_init__ coerces these to float, so an int like `1` won't
 # crash later inside the beartype-guarded Loss.loss() call -- still write 1.0, not 1)
 lambda_6: 1.0
-lambda_7: 0.15
+# 0.0 = sigma penalty off; see RunConfig.lambda_7.
+lambda_7: 0.0
 
 # optimiser / training loop
 lr:            1.3e-4

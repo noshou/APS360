@@ -125,6 +125,9 @@ class ScatterNet(nn.Module):
         energy: float,
         eps_embd: float,
         eps_msgp: float,
+        sigma_max: float = 100.0,
+        sigma_floor: float = 0.5,
+        sigma_init_gain: float = 0.1,
         dp_atom_threshold: int = 0,
         compile: bool = False,
     ) -> None:
@@ -157,7 +160,15 @@ class ScatterNet(nn.Module):
         eps_embd : float
             Numerical floor used inside Embed.
         eps_msgp : float
-            Numerical floor used inside MessagePass.
+            Numerical floor for the kernel-weight sum at
+            message_pass.py:614. The sigma floor it also used to serve now
+            lives in Embed as `sigma_floor`.
+        sigma_max : float, optional
+            Cap on Embed's 1/q sigma envelope, in Angstroms. Default 100.0.
+        sigma_floor : float, optional
+            Lower clamp on sigma, in Angstroms. Default 0.5.
+        sigma_init_gain : float, optional
+            Multiplier on Embed's `_sigma` init. Default 0.1.
         dp_atom_threshold : int, optional
             Atom-count threshold below which training batches may be
             routed to the data-parallel path instead of tensor-parallel.
@@ -173,7 +184,14 @@ class ScatterNet(nn.Module):
 
         super().__init__()
         q_points = qgrid.shape[0]
-        self._emb = Embed(lambda_1, q_points, compile=compile)
+        self._emb = Embed(
+            lambda_1,
+            qgrid,
+            sigma_max=sigma_max,
+            sigma_floor=sigma_floor,
+            sigma_init_gain=sigma_init_gain,
+            compile=compile,
+        )
         self._msg = MessagePass(
             lambda_1,
             lambda_2,

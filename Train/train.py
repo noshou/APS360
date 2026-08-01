@@ -986,6 +986,9 @@ def _worker(rank: int, cfg: RunConfig):
         energy=energy,
         eps_embd=cfg.eps_embd,
         eps_msgp=cfg.eps_msgp,
+        sigma_max=cfg.sigma_max,
+        sigma_floor=cfg.sigma_floor,
+        sigma_init_gain=cfg.sigma_init_gain,
         dp_atom_threshold=cfg.dp_atom_threshold,
         compile=cfg.compile,
     ).to(device)
