@@ -399,7 +399,10 @@ def _parse_args():
 
     # training
     p.add_argument("--lr", type=float, default=None)
-    p.add_argument("--lr_gamma", type=float, default=None)
+    p.add_argument("--lr_factor", type=float, default=None)
+    p.add_argument("--lr_patience", type=int, default=None)
+    p.add_argument("--lr_threshold", type=float, default=None)
+    p.add_argument("--lr_min", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
     p.add_argument("--grad_clip", type=float, default=None)
     p.add_argument("--epochs", type=int, default=None)
@@ -1050,13 +1053,20 @@ def _worker(rank: int, cfg: RunConfig):
             f"(init_scale={cfg.amp_init_scale}, RFF+Debye kept fp32)",
         )
 
-    # Per-epoch LR decay. ExponentialLR.step() (this torch version) multiplies
-    # the optimizer's CURRENT lr by gamma rather than recomputing from a
-    # fixed base, so a resumed run just keeps decaying from the restored LR
-    # with no extra bookkeeping. Constructed here (before the resume block)
-    # so its state_dict can be restored below alongside the optimizer.
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(
-        optimizer, gamma=cfg.lr_gamma
+    # LR decay on validation plateau, stepped once per epoch with val loss.
+    # Constructed here (before the resume block) so its state_dict can be
+    # restored below alongside the optimizer. Unlike the previous
+    # ExponentialLR, this schedule is path-dependent: `best` and
+    # `num_bad_epochs` cannot be recomputed from the epoch number, so the
+    # checkpoint's scheduler state is load-bearing, not an optimization.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=cfg.lr_factor,
+        patience=cfg.lr_patience,
+        threshold=cfg.lr_threshold,
+        threshold_mode="rel",
+        min_lr=cfg.lr_min,
     )
 
     start_epoch = 1
@@ -1076,9 +1086,11 @@ def _worker(rank: int, cfg: RunConfig):
     if cfg.resume:
         ckpt = torch.load(cfg.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
-        # optimizer.state_dict() mutates param_groups["lr"] in place on every
-        # ExponentialLR.step(), so the true current LR is captured here same
-        # as the weights - no separate fast-forwarding needed.
+        # ReduceLROnPlateau mutates param_groups["lr"] in place, so the true
+        # current LR is captured in optimizer.state_dict() same as the
+        # weights. The scheduler's OWN state (best, num_bad_epochs) is
+        # path-dependent and restored separately just below - unlike the old
+        # ExponentialLR, it cannot be recomputed from the epoch number.
         optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
@@ -1902,12 +1914,20 @@ def _worker(rank: int, cfg: RunConfig):
         resume_train_loss = resume_train_r2 = None
         resume_val_loss = resume_val_r2 = None
 
-        # Every rank steps identically (pure function of epoch count, no
-        # rank-dependent state), so the LR stays in lockstep across TP/DP
-        # ranks same as the model weights.
-        scheduler.step()
-        if rank == 0:
-            print(f"  lr -> {scheduler.get_last_lr()[0]:.3g}")
+        # Every rank steps identically, so the LR stays in lockstep across
+        # TP/DP ranks same as the model weights. That used to hold because
+        # the step was a pure function of the epoch count; with the plateau
+        # scheduler it holds because val_loss itself is rank-identical:
+        # evaluate() all_reduces its stat accumulators on DP-split batches,
+        # and on the TP path every rank sees the same batch and the same
+        # all-reduced I(q). Feeding a rank-LOCAL metric here would silently
+        # desync the LR across ranks mid-run.
+        assert val_loss is not None
+        prev_lr = optimizer.param_groups[0]["lr"]
+        scheduler.step(val_loss)
+        new_lr = optimizer.param_groups[0]["lr"]
+        if rank == 0 and new_lr != prev_lr:
+            print(f"  val loss plateaued, lr {prev_lr:.3g} -> {new_lr:.3g}")
 
     if is_dist:
         dist.destroy_process_group()
@@ -1961,7 +1981,10 @@ def main(cfg: RunConfig | None = None):
             lambda_6=A.lambda_6,
             lambda_7=A.lambda_7,
             lr=A.lr,
-            lr_gamma=A.lr_gamma,
+            lr_factor=A.lr_factor,
+            lr_patience=A.lr_patience,
+            lr_threshold=A.lr_threshold,
+            lr_min=A.lr_min,
             weight_decay=A.weight_decay,
             grad_clip=A.grad_clip,
             epochs=A.epochs,

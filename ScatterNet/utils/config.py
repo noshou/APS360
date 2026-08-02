@@ -166,26 +166,37 @@ class RunConfig:
     lambda_6 : float
         Weight on the form-factor penalty term.
     lambda_7 : float
-        Weight on the sigma L2 penalty, q^2-weighted across the grid
-        (normalised to mean 1). 0.0 (default) disables it; see the field
-        comment. See ScatterNet/scatter_net.py's ScatterNet.compute_loss.
+        Weight on the sigma penalty, an L2 on z = log(sigma) - log(env)
+        where env(q) = min(1/q, sigma_max) is Embed's envelope. Reads as
+        the precision of a log-normal prior on sigma centred on that
+        envelope: lambda_7 = 1/(2s^2), so the default 0.5 gives a 1-sigma
+        width of s = 1.0. 0.0 disables it; see the field comment. See
+        ScatterNet/scatter_net.py's ScatterNet.compute_loss.
 
     Training
     lr : float
-        Adam learning rate (this is the epoch-1 value; see lr_gamma).
-    lr_gamma : float
-        Per-epoch multiplicative LR decay (ExponentialLR): lr at epoch N
-        (1-indexed) is lr * lr_gamma^(N-1). 1.0 = no decay (the default;
-        see the field comment). Applied once per epoch, keyed off the
-        absolute epoch number (ckpt["epoch"]) rather than a saved scheduler
-        counter, so a crash-resume (this run restarts often; see
-        ckpt_interval_sec) lands on the correct LR without needing scheduler
-        state in the checkpoint.
-        cfg.epochs is the epoch count for THIS invocation, not the
-        run's total horizon (a resume runs cfg.epochs MORE epochs from
-        wherever it left off), so a horizon-based schedule (cosine,
-        step-to-a-target) isn't safe here; exponential per-epoch decay
-        needs no known endpoint.
+        Adam learning rate (this is the starting value; see lr_factor).
+    lr_factor : float
+        Multiplier applied to the LR when validation loss plateaus
+        (ReduceLROnPlateau, stepped once per epoch on val loss). 1.0
+        disables decay.
+    lr_patience : int
+        Epochs of no improvement tolerated before the LR is cut.
+    lr_threshold : float
+        Relative improvement required to count as progress: an epoch
+        counts as better only if val_loss < best * (1 - lr_threshold).
+    lr_min : float
+        Floor the LR is never reduced below.
+
+        Plateau decay rather than a horizon schedule because cfg.epochs is
+        the epoch count for THIS invocation, not the run's total horizon (a
+        resume runs cfg.epochs MORE epochs from wherever it left off), so
+        cosine or step-to-a-target has no endpoint to key off. Unlike the
+        previous ExponentialLR, the schedule is path-dependent and CANNOT be
+        reconstructed from the epoch number, so a crash-resume (this run
+        restarts often; see ckpt_interval_sec) relies on the scheduler
+        state_dict saved in the checkpoint, which carries `best`,
+        `num_bad_epochs`, and `cooldown_counter`.
     weight_decay : float
         Adam L2 weight decay coefficient.
     grad_clip : float
@@ -291,21 +302,34 @@ class RunConfig:
 
     # loss
     lambda_6: float = 1.0
-    # 0.0 = sigma penalty off. Was 0.15. It penalises sigma^2, and sigma is
-    # now exp(z + log(1/q)), reaching ~100 A at low q instead of a flat
-    # ~0.7 A, so the term grew ~1e4x and would dominate the loss. It was also
-    # inert for all 11 epochs of the previous run (gradient underflowed to
-    # zero). Re-tune against the new sigma scale only if sigma blows up.
-    lambda_7: float = 0.0
+    # Weight on L2(z), z = log(sigma) - log(env). Read it as the precision
+    # of a log-normal prior on sigma centred on the 1/q envelope:
+    # lambda_7 = 1/(2s^2), so s = 1/sqrt(2*lambda_7) is the 1-sigma width
+    # in log space. 0.5 gives s = 1.0, i.e. sigma is free to sit within
+    # e^(+-1) ~ 2.7x of the envelope before the term bites, and contributes
+    # ~0.5 against an MSLE around 6.7 (~7%). Values near 0.05 give s = 3.2,
+    # i.e. a 24x deviation is still only 1 sigma - too loose to keep z off
+    # Embed's clamp boundaries, which sit at |z| ~ 1.4 at high q. 0.0 = off.
+    lambda_7: float = 0.5
 
     # training
     lr: float = 1.3e-4
-    # 1.0 = constant LR. Was 0.7. Per-epoch decay assumes an epoch is a
-    # fixed amount of work, but dataset_frac scales its step count: at
-    # frac=0.05 an epoch is ~1/20 the steps, so 0.7/epoch decays ~20x faster
-    # per step. The old schedule reached lr=5.2e-6 by epoch 11. Re-anneal
-    # once the model trains, keyed off total steps rather than epochs.
-    lr_gamma: float = 1.0
+    # ReduceLROnPlateau on val loss. Replaces ExponentialLR(gamma): an
+    # unconditional per-epoch decay assumes an epoch is a fixed amount of
+    # work, but dataset_frac scales its step count (at frac=0.05 an epoch is
+    # ~1/20 the steps, so gamma=0.7/epoch decayed ~20x faster per step and
+    # reached lr=5.2e-6 by epoch 11 whether or not the model had stopped
+    # improving). Plateau decay keys off measured progress instead, so it
+    # never decays while the model is still improving, and needs no known
+    # horizon (cfg.epochs is a per-invocation count, not the run's total).
+    # It is NOT fully scale-free though: lr_patience and lr_threshold are
+    # counted in epochs, so a small dataset_frac shortens each epoch, puts
+    # less progress in it, and makes a fixed relative threshold harder to
+    # clear -> earlier cuts in step-terms. Loosen them when frac is small.
+    lr_factor: float = 0.5
+    lr_patience: int = 2
+    lr_threshold: float = 1e-3  # relative; val loss must beat best by this
+    lr_min: float = 1e-6
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     epochs: int = 20
@@ -358,7 +382,9 @@ class RunConfig:
             "lambda_6",
             "lambda_7",
             "lr",
-            "lr_gamma",
+            "lr_factor",
+            "lr_threshold",
+            "lr_min",
             "weight_decay",
             "grad_clip",
             "dataset_frac",

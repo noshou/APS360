@@ -19,8 +19,24 @@ class OutputHead(nn.Module):
     Collapses per-atom contributions into a predicted I(q) curve.
 
     For each atom, combines its embedding with its form factor magnitude
-    via a bilinear layer, passes the result through an MLP, weights
-    by f_mags^2, and sums over atoms to produce I(q) per molecule.
+    via a bilinear layer and passes the result through an MLP, which emits
+    two per-atom, per-q channels (w, c). These are summed over atoms into
+    the two limits of the Debye sum:
+
+        I(q) = (sum_j w_j f_j)^2 + sum_j c_j f_j^2
+
+    The squared term is the coherent limit: at q -> 0 every sinc(q r_ij)
+    goes to 1 and the Debye double sum factorizes to (sum_j f_j)^2, which
+    scales like M^2. The linear term is the incoherent limit: at high q the
+    off-diagonal pairs oscillate away leaving sum_j f_j^2, which scales
+    like M. Squaring a sum over atoms *is* the pairwise double sum, so the
+    coherent term costs one O(M) pass, not O(M^2).
+
+    Both channels stay O(1) at every q; the M^2 scaling comes from the
+    squaring op rather than from learned magnitude. A single linear
+    sum-of-f^2 head cannot reach (sum f)^2 at any parameter setting, and
+    could only fake it by inflating its per-atom weights to ~M, which is
+    what previously made low q converge far slower than high q.
 
     The forward pass is chunked to avoid storing the
     (N, M, Q, lambda_3) bilinear output tensor.
@@ -78,8 +94,10 @@ class OutputHead(nn.Module):
         self._bilinear = NoTrilinBilin(lambda_1, 1, lambda_3)
 
         dims = [lambda_3 // 2**i for i in range(lambda_4 + 1)]
-        if dims[-1] != 1:
-            dims.append(1)
+        if dims[-1] == 1:
+            dims[-1] = 2
+        elif dims[-1] != 2:
+            dims.append(2)
 
         ldicts = OrderedDict()
         for i in range(len(dims) - 1):
@@ -87,6 +105,12 @@ class OutputHead(nn.Module):
             if i < len(dims) - 2:
                 ldicts[f"activation_{i}"] = nn.Mish()
         self._mlp = nn.Sequential(ldicts)
+
+        # terminal layer emits (w, c);
+        # softplus(0.5413) = 1.0 so both channels start
+        # at unity, making I(0) = (Σf)² and high-q = Σf² correct at init.
+        nn.init.constant_(self._mlp[-1].bias, 0.5413) # type: ignore
+
         self._fwd_fn = (
             torch.compile(self._forward_fn, dynamic=True, fullgraph=True)
             if compile
@@ -100,8 +124,11 @@ class OutputHead(nn.Module):
         emb_c: torch.Tensor,
         fmag_c: torch.Tensor,
         mask_c: torch.Tensor
-    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
-        """Compute the Debye-sum I(q) contribution for one atom chunk.
+    ) -> Tuple[
+        Float[torch.Tensor, "N Q"],  # noqa: F722
+        Float[torch.Tensor, "N Q"],  # noqa: F722
+    ]:
+        """Compute the coherent and incoherent partial sums for one chunk.
 
         Parameters
         ----------
@@ -109,8 +136,8 @@ class OutputHead(nn.Module):
             Bilinear layer combining atom embedding and form factor
             magnitude.
         mlp : torch.nn.Sequential
-            Compression MLP mapping the bilinear output down to a scalar
-            per atom per q-point.
+            Compression MLP mapping the bilinear output down to two
+            scalars (w, c) per atom per q-point.
         emb_c : torch.Tensor
             Atom embeddings for this chunk, shape (N, Mc, Q, lambda_1).
         fmag_c : torch.Tensor
@@ -121,25 +148,27 @@ class OutputHead(nn.Module):
         Returns
         -------
         torch.Tensor
-            Partial I(q) contribution summed over this chunk's atoms,
-            shape (N, Q).
+            `coh_c`, coherent partial sum(w * f) over this chunk's atoms,
+            shape (N, Q). NOT squared here; see `forward`.
+        torch.Tensor
+            `inc_c`, incoherent partial sum(c * f^2) over this chunk's
+            atoms, shape (N, Q).
         """
 
         # (N,M,Q, λ₁) x (N,M,Q,1) -> (N,M,Q,λ₃)
         atomic = F.mish(bilinear(emb_c, fmag_c))
 
-        # MLP compression -> (N,M,Q,1) -> Squeeze to (N,M,Q)
-        contribs = F.softplus(mlp(atomic)).squeeze(-1)
+        # MLP compression -> (N,M,Q,2), split into the two channels
+        chans = F.softplus(mlp(atomic))
+        w, c = chans[..., 0], chans[..., 1]  # (N,M,Q) each
 
-        # Debye weighting + atom-sum forced to fp32 (autocast disabled):
-        # fmc**2 is the squared form factor (up to ~1e4 for heavy atoms)
-        # and this reduces over M atoms, so in fp16 (amp) the sum and its
-        # GradScaler-amplified backward overflow 65504.
+        # fmc**2 is the squared form factor and this reduces over M atoms.
         with torch.autocast(device_type=emb_c.device.type, enabled=False):
             fmc = fmag_c.squeeze(-1).float()  # (N, Mc, Q)
-            return (contribs.float() * fmc**2 * mask_c.float()).sum(
-                dim=1
-            )  # (N, Q), fp32
+            maskf = mask_c.float()
+            coh_c = (w.float() * fmc * maskf).sum(dim=1)  # f¹, (N, Q) fp32
+            inc_c = (c.float() * fmc**2 * maskf).sum(dim=1)  # (N, Q) fp32
+            return coh_c, inc_c
 
     @jaxtyped(typechecker=beartype)
     def forward(
@@ -148,11 +177,16 @@ class OutputHead(nn.Module):
         msg_head: LayerHead,
     ) -> Tuple[
             Float[torch.Tensor, "N Q"],   # noqa: F722
+            Float[torch.Tensor, "N Q"],   # noqa: F722
             Float[torch.Tensor, "N M Q"], # noqa: F722
             Float[torch.Tensor, "N M Q"], # noqa: F722
         ]:
 
-        """Accumulate the Debye sum over atom chunks to predict I(q).
+        """Accumulate the two Debye limits over atom chunks.
+
+        Returns the coherent sum UNSQUARED. Callers must reduce it over
+        every atom of the molecule and only then call `combine`. See that
+        method for why the square cannot happen here.
 
         Parameters
         ----------
@@ -165,7 +199,11 @@ class OutputHead(nn.Module):
         Returns
         -------
         torch.Tensor
-            `iq_accum`, predicted I(q), shape (N, Q).
+            `coh_accum`, coherent sum(w * f) over this call's atoms, shape
+            (N, Q). NOT squared; see `combine`.
+        torch.Tensor
+            `inc_accum`, incoherent sum(c * f^2) over this call's atoms,
+            shape (N, Q).
         torch.Tensor
             `f_mags`, per-atom form factor magnitudes, shape (N, M, Q).
         torch.Tensor
@@ -178,10 +216,11 @@ class OutputHead(nn.Module):
             batch.padding_mask().unsqueeze(-1).to(msg_head.embeds.dtype)
         )  # (N, M, 1)
 
-        # accumulate the Debye sum over atom-chunks.
-        iq_accum = torch.zeros(
+        # accumulate both Debye limits over atom-chunks.
+        coh_accum = torch.zeros(
             N, Q, device=msg_head.embeds.device, dtype=torch.float32
         )
+        inc_accum = torch.zeros_like(coh_accum)
 
         # 2. Accumulate over chunks
         for mol1 in range(0, M, self._out_chunk):
@@ -190,15 +229,57 @@ class OutputHead(nn.Module):
             # vary by mol1 (which chunk), and torch.compile guards on
             # stride()/storage_offset() in addition to shape causing
             # extra recompiles beyond the intended chunk-size guard.
-            iq_accum += self._fwd_fn(
+            coh_c, inc_c = self._fwd_fn(
                 self._bilinear,
                 self._mlp,
                 msg_head.embeds[:, mol1:mol2].contiguous(),
                 msg_head.f_mags[:, mol1:mol2].contiguous(),
                 mask[:, mol1:mol2].contiguous(),
             )
+            coh_accum += coh_c
+            inc_accum += inc_c
 
-        # 3. return output head
+        # 3. return output head. coh_accum stays UNSQUARED: under tensor
+        # parallelism this call only saw one rank's atom shard, so the
+        # square has to wait until every shard has been reduced in.
         f_mags = msg_head.f_mags.squeeze(-1)
         sigmas = msg_head.sigmas.squeeze(-1)
-        return iq_accum, f_mags, sigmas
+        return coh_accum, inc_accum, f_mags, sigmas
+
+    @staticmethod
+    @jaxtyped(typechecker=beartype)
+    def combine(
+        coh: Float[torch.Tensor, "N Q"],  # noqa: F722
+        inc: Float[torch.Tensor, "N Q"],  # noqa: F722
+    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
+        """Square the coherent sum and add the incoherent one.
+
+        `coh` MUST already cover every atom of each molecule before this
+        is called. Squaring a partial sum computes sum_parts (sum_j)^2
+        instead of (sum_parts sum_j)^2, which silently drops every atom
+        pair split across the partition. That applies at both levels the
+        atom dimension gets split:
+
+        - the `_out_chunk` loop in `forward`, handled by accumulating
+          over all chunks before returning
+        - the TP atom shard in `ScatterNet.forward`, handled by
+          all-reducing across ranks before calling this
+
+        Neither failure raises. Both still train and still lower the
+        loss, they just fit a systematically wrong low-q limit, so the
+        chunk- and rank-invariance tests are the only things that catch
+        them.
+
+        Parameters
+        ----------
+        coh : torch.Tensor
+            Fully reduced coherent sum(w * f), shape (N, Q).
+        inc : torch.Tensor
+            Fully reduced incoherent sum(c * f^2), shape (N, Q).
+
+        Returns
+        -------
+        torch.Tensor
+            Predicted I(q), shape (N, Q).
+        """
+        return coh**2 + inc

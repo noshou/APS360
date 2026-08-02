@@ -117,7 +117,7 @@ class Embed(nn.Module):
         env = torch.where(
             q > 0, 1.0 / q.clamp(min=q_min), torch.full_like(q, sigma_max)
         ).clamp(max=sigma_max)
-        # persistent=False matches _q_weights_/_s_weights_: derived from the
+        # persistent=False matches _q_weights_/_log_env_: derived from the
         # q-grid, not learned, so it stays out of the checkpoint.
         self.register_buffer(
             "_log_sigma_env", env.log().view(1, 1, -1), persistent=False

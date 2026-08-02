@@ -35,6 +35,7 @@ GNN that predicts X-ray powder scattering curves I(q) from atomic coordinates an
 - [Appendix](#appendix)
   - [A1. mol_chunk and atm_chunk optimizations](#a1-mol_chunk-and-atm_chunk-optimizations)
   - [A2. dp_atom_threshold optimizations](#a2-dp_atom_threshold-optimizations)
+  - [Low-q coherent limit](#low-q-coherent-limit)
 
 ---
 
@@ -49,10 +50,10 @@ GNN that predicts X-ray powder scattering curves I(q) from atomic coordinates an
 | λ₁    | atom embedding dimension (`lambda_1`, default 128)                         |
 | λ₂    | message-passing rounds (`lambda_2`, default 4)                             |
 | λ₃    | OutputHead MLP starting width (`lambda_3`, default 64)                     |
-| λ₄    | OutputHead MLP halving steps (`lambda_4`, default 4)                       |
+| λ₄    | OutputHead MLP halving steps (`lambda_4`, default 4; ladder ends at width 2) |
 | λ₅    | Random Fourier Features count (`lambda_5`, default 128)                    |
 | λ₆    | form-factor penalty weight (`lambda_6`, default 1.0)                       |
-| λ₇    | sigma L2 penalty weight (`lambda_7`, default 0.5; penalty is q²-weighted) |
+| λ₇    | sigma penalty weight (`lambda_7`, default 0.5; L2 on `log σ - log env`)   |
 | Nc      | molecules per N-chunk (`mol_chunk`)                                        |
 | mc      | atoms per M-chunk (`atm_chunk`)                                            |
 | V       | VOCAB size = len(VOCAB) + 1 (row 0 is padding)                             |
@@ -143,7 +144,7 @@ Bilinear sigma: `NoTrilinBilin(λ₁, Q, Q)` (an `nn.Bilinear`-equivalent that a
 
 PReLU: channel-wise PReLU allows each embedding channel to independently learn its negative slope, giving more expressivity in the first non-linearity than a fixed activation.
 
-Asymmetric masking: `f_mags` and `sigmas` are multiplied by the padding mask; `embeds` is not. Zeroing f_mags is sufficient to exclude padding atoms since intensity contributions are gated by f_mag^2.
+Asymmetric masking: `f_mags` and `sigmas` are multiplied by the padding mask; `embeds` is not. Zeroing f_mags is sufficient to exclude padding atoms since every intensity contribution carries a factor of f_mag (f_mag in the coherent term, f_mag^2 in the incoherent one).
 
 ε is passed at forward time rather than fixed at construction, allowing the numerical floor to be tuned without changing the model.
 
@@ -423,7 +424,7 @@ After the AllReduce, `features` and `chem_env` are divided by the per-molecule r
   ```
 
   `_sigbilin` is `nn.Bilinear(λ₁, Q, 1)`. The bilinear coupling `e^T W f` makes the sigma delta depend on the interaction between the atom's learned representation and its scattering strength.
-  Tanhshrink is unbounded by design: for large bilinear outputs sigma can shift significantly. The sigma L2 penalty in the loss (λ₇ · w(q) · σ², w ∝ q² - see [§8](#8-loss)) is the actual blowup prevention mechanism; its gradient grows with σ and pulls it back down. The two reach equilibrium where the bilinear delta just balances the MSLE gradient against the penalty. The maximum cumulative sigma change is also bounded by λ₂ rounds being small (default 5).
+  Tanhshrink is unbounded by design: for large bilinear outputs sigma can shift significantly. Embed's `clamp` on the sigma exponent is the actual blowup prevention mechanism; the loss's sigma penalty (λ₇ · z², z = log σ - log env - see [§8](#8-loss)) is a soft prior that keeps σ near its 1/q envelope and off those clamp boundaries, where the gradient would be exactly zero. The maximum cumulative sigma change is also bounded by λ₂ rounds being small (default 5).
   The sticky property near zero (tanhshrink ≈ 0, gradient = `1 - sech²(x)` = 0 at x=0) is a beneficial side effect: early in training when the bilinear has weak outputs, sigmas stay stable rather than wandering, then move more freely as the bilinear gains signal.
   Softplus wraps the whole update to maintain σ > 0, since division by σ in the RFF step cannot encounter zero.
 
@@ -431,7 +432,16 @@ After the AllReduce, `features` and `chem_env` are divided by the per-molecule r
 
 ## 6. `OutputHead`
 
-Collapses per-atom representations into a predicted I(q) curve per molecule. Each atom's contribution is weighted by f_mag² before summing, mirroring the diagonal terms of the Debye equation.  In the full Debye equation `I(q) = sum_j sum_k f_j f_k sinc(q r_jk)`, diagonal terms (j=k) contribute `sum_j f_j²`. The model learns a per-atom correction `contribs_m(q)` weighted by the form factor, so each atom contributes `contribs_m(q) * f_m(q)²`. Summing over atoms gives a Debye-inspired I(q) without the O(M²) pair sum.
+Collapses per-atom representations into a predicted I(q) curve per molecule, as a sum of the two limits of the Debye equation:
+
+```{rtf}
+I(q) = (sum_j w_j(q) f_j(q))²  +  sum_j c_j(q) f_j(q)²
+        \-- coherent --/           \-- incoherent --/
+```
+
+The MLP emits two per-atom, per-q channels (w, c) instead of one. In the full Debye equation `I(q) = sum_j sum_k f_j f_k sinc(q r_jk)`, the two terms above are its endpoints. At q -> 0 every `sinc(q r_jk) -> 1`, so the double sum factorizes to `(sum_j f_j)²`, which scales like M². At high q the off-diagonal pairs oscillate away, leaving the diagonal `sum_j f_j²`, which scales like M. Squaring a sum over atoms *is* the pairwise double sum, so the coherent term is recovered from one O(M) pass rather than an O(M²) pair sum.
+
+Both channels stay O(1) at every q; the M² scaling comes from the squaring op, not from learned magnitude. This matters because a single linear sum-of-f² head (the previous design) cannot reach `(sum f)²` at any parameter setting. It could only approximate low q by inflating its per-atom weights to ~M, which from standard init left high q roughly correct immediately while low q started M-fold low and converged far slower. See [Appendix: low-q coherent limit](#low-q-coherent-limit) for the full diagnosis.
 
 ### `OutputHead` Layers
 
@@ -442,16 +452,16 @@ Collapses per-atom representations into a predicted I(q) curve per molecule. Eac
 | ------------------------- | ----------------- | ------------------------------------------------------ |
 | `_bilinear.weight`      | (λ₃, λ₁, 1) | Bilinear: (embedding, f_mag scalar) -> λ₃ features |
 | `_bilinear.bias`        | (λ₃,)         |                                                      |
-| `_mlp / layer_i.weight` | varies          | MLP linear layers (halving pyramid)                  |
+| `_mlp / layer_i.weight` | varies          | MLP linear layers (halving pyramid, terminal width 2) |
 | `_mlp / layer_i.bias`   | varies          |                                                      |
 
   MLP with `lambda_3=64, lambda_4=4`:
 
 ```{rtf}
-  Linear(64->32) -> Mish -> Linear(32->16) -> Mish -> Linear(16->8) -> Mish -> Linear(8->4) -> Mish -> Linear(4->1)
+  Linear(64->32) -> Mish -> Linear(32->16) -> Mish -> Linear(16->8) -> Mish -> Linear(8->4) -> Mish -> Linear(4->2)
 ```
 
-  No Mish after the final linear; `softplus` is applied to the MLP output.
+  The ladder always terminates at width 2, one channel each for w and c. No Mish after the final linear; `softplus` is applied to the MLP output. The final layer's bias is initialized to `0.5413`, since `softplus(0.5413) = 1.0` puts both channels at unity at step 0, making `I(0) = (sum f)²` and the high-q limit `sum f²` correct in order of magnitude before any training.
 2. **Forward Pass**
 
 ```{rtf}
@@ -461,7 +471,8 @@ Collapses per-atom representations into a predicted I(q) curve per molecule. Eac
   msg_head.sigmas  (N, M, Q, 1)
 
   mask             (N, M, 1)    padding_mask().unsqueeze(-1), float
-  iq_accum         (N, Q)       zeros
+  coh_accum        (N, Q)       zeros
+  inc_accum        (N, Q)       zeros
 
   # per M-chunk:
   emb_c    (N, mc, Q, λ₁)
@@ -470,19 +481,28 @@ Collapses per-atom representations into a predicted I(q) curve per molecule. Eac
 
   bilinear(emb_c, fmag_c)      (N, mc, Q, λ₃)  λ₁-vec x 1-scalar -> λ₃ features
   F.mish(...)                  (N, mc, Q, λ₃)
-  _mlp(...)                    (N, mc, Q, 1)   halving pyramid
-  F.softplus(...)              (N, mc, Q, 1)   positivity constraint
-    .squeeze(-1)               (N, mc, Q)      per-atom scattering scalar (contribs)
+  _mlp(...)                    (N, mc, Q, 2)   halving pyramid
+  F.softplus(...)              (N, mc, Q, 2)   positivity constraint
+    [..., 0], [..., 1]         (N, mc, Q)      per-atom channels w, c
 
-  contribs * fmag_c.squeeze(-1)^2 * mask_c  (N, mc, Q)  Debye-weighted contribution
-  iq_accum += (...).sum(dim=1)               (N, Q)
+  w * fmag_c.squeeze(-1)   * mask_c  (N, mc, Q)  coherent, f¹ (NOT squared here)
+  c * fmag_c.squeeze(-1)^2 * mask_c  (N, mc, Q)  incoherent, f²
+  coh_accum += (...).sum(dim=1)       (N, Q)
+  inc_accum += (...).sum(dim=1)       (N, Q)
 
-  # return:
-  iq_accum           (N, Q)    predicted I(q)
+  # return (coh_accum is NOT squared here - see note below):
+  coh_accum          (N, Q)    coherent partial, sum(w * f)
+  inc_accum          (N, Q)    incoherent partial, sum(c * f²)
   f_mags.squeeze(-1) (N, M, Q)
   sigmas.squeeze(-1) (N, M, Q)
+
+  # the caller finishes it, once the sums cover every atom:
+  OutputHead.combine(coh, inc) -> coh**2 + inc   (N, Q)   predicted I(q)
 ```
 
+  **Why `forward` returns the coherent sum unsquared.** Squaring a *partial* sum computes `sum_parts (sum_j w_j f_j)²` where the correct quantity is `(sum_parts sum_j w_j f_j)²`. The two differ by every cross-part pair term, so every atom pair whose members land in different parts is silently dropped from the coherent sum, and the head degrades toward the incoherent-only behaviour it was written to replace.
+  The atom dimension gets split at two independent levels, and the invariant has to hold at both. Inside `forward`, the `out_chunk` loop splits it, handled by accumulating over all chunks before returning. One level up, the tensor-parallel path (see [§7](#tensor-parallel-forward)) shards it across ranks, so `forward` cannot square at all: it hands back `coh_accum` and `inc_accum` raw, and each caller in `ScatterNet.forward` calls `OutputHead.combine` only once its sums cover every atom of the molecule. The single-GPU and DP paths combine immediately (both hold whole molecules); the TP path stacks the two partials, all-reduces them in one collective, and combines after.
+  Nothing in a normal run surfaces a violation. The truncated model is still a smooth function of the parameters, so it still trains and the loss still goes down; it just converges to a different (chunk- or rank-dependent) function than intended, and no loss curve, R², or per-q plot distinguishes the two. The only reliable checks are explicit invariance tests: forward the same batch at `out_chunk = M` (no cross-chunk pairs to lose) and at `out_chunk = 1` (every pair is cross-chunk), and separately at world sizes 1 and 2, asserting I(q) matches in both. Measured, squaring before the rank reduction gives a 48% error at world size 2 while passing every other diagnostic in the repo.
 3. **Activations**
 
 
@@ -490,7 +510,7 @@ Collapses per-atom representations into a predicted I(q) curve per molecule. Eac
 | -------------- | -------------------- | ---------------------------------------------------------- |
 | `F.mish`     | After bilinear     | Applied to bilinear features before the MLP.             |
 | `nn.Mish`    | Between MLP layers | Between each pair of linear layers except the last.      |
-| `F.softplus` | After full MLP     | Ensures per-atom scattering scalar is strictly positive. |
+| `F.softplus` | After full MLP     | Ensures both per-atom channels (w, c) are strictly positive. |
 
 ---
 
@@ -570,15 +590,20 @@ Step 3: MessagePass on shard (each rank processes its atoms)
         msg_head: embeds (N, m1-m0, Q, λ₁), sigmas updated
 
 Step 4: OutputHead on shard
-        iq_partial    (N, Q)       I(q) sum over this rank's atoms only
+        coh_partial   (N, Q)       sum(w*f)  over this rank's atoms only
+        inc_partial   (N, Q)       sum(c*f²) over this rank's atoms only
         f_mags_shard  (N, m1-m0, Q)
         sigmas_shard  (N, m1-m0, Q)
 
 Step 5: Gather
-        _DistributedSum(iq_partial)  -> iq      (N, Q)     global sum
-        _AllGatherDim1(f_mags_shard) -> f_mags  (N, M, Q)  cat along dim=1
-        _AllGatherDim1(sigmas_shard) -> sigmas  (N, M, Q)
+        stack((coh_partial, inc_partial), -1)      (N, Q, 2)  one collective
+        _DistributedSum(...)         -> parts     (N, Q, 2)  global sums
+        OutputHead.combine(parts[...,0], parts[...,1]) -> iq (N, Q)
+        _AllGatherDim1(f_mags_shard) -> f_mags    (N, M, Q)  cat along dim=1
+        _AllGatherDim1(sigmas_shard) -> sigmas    (N, M, Q)
 ```
+
+The reduce must precede the square. `OutputHead.forward` therefore returns both partials unsquared and never calls `combine` itself; only `ScatterNet.forward` does, once the sums span every atom. Squaring per rank would compute `sum_ranks (sum_j w_j f_j)²` and drop every atom pair straddling a shard boundary, measured at a 48% error on 2 ranks. See [§6](#6-outputhead) for the full argument. The two partials are stacked so this stays a single collective rather than two.
 
 ### Custom Autograd Functions
 
@@ -610,7 +635,7 @@ Step 5: Gather
 | --------------- | -------- | ------------------------------------------------------------------------ |
 | `_fmag_table` | (V, Q) | Reference form factor magnitudes from xraydb. Row 0 = zeros (padding). |
 | `_q_weights_` | (1, Q) | Kratky weights`(1 + q²)` per q-point.                                 |
-| `_s_weights_` | (1, Q) | Sigma-penalty weights,`q²` normalised to mean 1 over the grid.        |
+| `_log_env_`   | (1, Q) | log of Embed's sigma envelope,`log(min(1/q, sigma_max))`. Subtracted from `log σ` to give `z`. |
 
 Form factor table construction: `q -> s = q/(4π)` converts to crystallographic s (sinθ/λ used by xraydb), then `|f(q)| = hypot(f0 + f1_chantler, f2_chantler)`. Transuranics: f0 only.
 
@@ -632,22 +657,29 @@ L_ff(n, q) = λ₆ * (1/n_atoms) * sum_m mask * (log1p(f_hat_m(q)) - log1p(f_ref
 
 Anchors predicted per-atom form factors to xraydb reference values, preventing the model from learning arbitrary f_mags that fit I(q) via cancellation. Atom-count normalisation makes the penalty size-independent.
 
-**Term 3: q-weighted sigma L2 penalty** (`_sg_penalty`):
+**Term 3: sigma log-deviation penalty** (`_sg_penalty`):
 
 ```{Latex}
-L_sigma(n, q) = λ₇ * w(q) * (1/n_atoms) * sum_m mask * σ_m(q)²,    w(q) ∝ q², mean_q w = 1
+z_m(q)        = log σ_m(q) - log env(q),          env(q) = min(1/q, sigma_max)
+L_sigma(n, q) = λ₇ * (1/n_atoms) * sum_m mask * z_m(q)²
 ```
 
-Primary mechanism preventing sigma blowup. The penalty gradient grows with σ, pulling large bandwidths back down. Combined with tanhshrink's unbounded delta in MessagePass, the system reaches equilibrium where the bilinear delta balances the MSLE gradient against the penalty.
+`z` is the log-space deviation of the learned bandwidth from Embed's 1/q envelope: `z = 0` sits exactly on the physical prior, `|z| = 1` is an e-fold off it. Read `λ₇` as the precision of a log-normal prior on σ centred on that envelope, `λ₇ = 1/(2s²)`, so the 1-σ width is `s = 1/√(2λ₇)`. The default `λ₇ = 0.5` gives `s = 1.0`.
 
-The `w(q) ∝ q²` weighting exists because σ is a *real-space range* (MessagePass scales coordinates by `r/σ`, so large σ = long-range aggregation), while the real-space distances a given q is sensitive to scale as `1/q`. A flat L2 penalty on σ therefore applies the same absolute pressure at every q, which is far too much at low q: low q is exactly where large-scale structure lives, so a flat penalty crushes the kernel range precisely where I(q) needs it. Weighting by q² penalises `(q·σ)²` instead - σ measured against the length scale q itself probes, which is dimensionless and scale-free. Long-range σ stays cheap at low q and stays regularised at high q.
+**This replaced a q²-weighted L2 on σ itself, which had become inert.** That weighting was written when σ was flat in q, to stop a uniform penalty from crushing the long-range bandwidth at low q. Embed then moved the `1/q` envelope inside σ (`σ = exp(clamp(z + log env))`), and with `σ ~ exp(z)/q` the old penalty becomes
 
-Two consequences worth knowing:
+```{Latex}
+λ₇ * (q²/mean q²) * σ²  =  λ₇ * exp(2z) / mean(q²)
+```
 
-- At `q = 0` the weight is exactly zero (the grid starts there), so σ is unconstrained at that one q-point. This is deliberate and harmless: `I(0)` is the forward-scattering limit, where every `sin(qr)/(qr) → 1` and the intensity collapses to `(Σ_m f_m)²` - independent of the coordinates, and therefore of the kernel range.
-- The weights are normalised to mean 1 over the q-grid, so `λ₇` keeps roughly the strength it had under the old flat penalty. The change **redistributes** the penalty across q rather than scaling it up or down, and λ₇ = 0.5 remains a sensible default. (This matters here because the grid is `q ∈ [0, 0.5] Å⁻¹`: an un-normalised q² weight would have shrunk the whole penalty by ~12x.)
+The q² weight cancels the 1/q² inside σ² exactly, within the clamp range, so the q-dependence the weight existed to provide no longer did anything. Penalising z² is better on two counts:
 
-If I(q) is poor at low q but healthy at high q, a σ crushed to the `eps_msgp` floor is the first thing to check - that was the symptom this weighting is designed to fix.
+- **Symmetric.** σ² punishes only *large* σ, dragging z toward Embed's clamp floor, which is the boundary it should be staying away from. z² penalises both directions equally.
+- **Scale-free.** σ² spans 0.25 to ~1e4 Å² across the clamp range, so a single λ₇ cannot mean the same thing at both ends of the grid. z is a dimensionless log-ratio, O(1) everywhere.
+
+**Its job is gradient flow, not bounding.** Embed's `clamp(z + log env, log floor, log max)` already bounds σ hard, so the penalty is redundant as a safety rail. What the clamp cannot do is recover: it has exactly zero gradient outside its range, so a σ driven past a boundary pins there permanently. Keeping z near 0 keeps it off those boundaries. In practice the term is near-silent while σ tracks the envelope (measured at ~0.03 on a loss of ~26 at init, mean z² ≈ 0.07) and only bites once z drifts to O(1).
+
+Note this is a soft prior, not the primary blowup guard, which is now the clamp. It is **not**, however, the explanation for I(q) being poor at low q while healthy at high q: that symptom was root-caused to the old `OutputHead` being structurally incapable of representing `(Σf)²`, and neither σ nor the `(1 + q²)` Kratky weight had anything to do with it. See [Appendix: low-q coherent limit](#low-q-coherent-limit).
 
 **Total:**
 
@@ -669,17 +701,25 @@ Standard Adam (not AdamW; weight decay is applied inside the gradient update, no
 
 ### Learning Rate Schedule
 
-`torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=lr_gamma)`, stepped once per epoch (not per batch): fires unconditionally regardless of how training is going. `lr_gamma=1.0` disables it.
+`torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=lr_factor, patience=lr_patience, threshold=lr_threshold, threshold_mode="rel", min_lr=lr_min)`, stepped once per epoch (not per batch) on the **validation** loss. An epoch counts as progress only if `val_loss < best * (1 - lr_threshold)`; after `lr_patience` consecutive non-improving epochs the LR is multiplied by `lr_factor`, floored at `lr_min`. `lr_factor=1.0` disables decay.
+
+Validation, not train loss (which is averaged over the epoch and so lags the current weights) and not test (which would leak the test split into the training procedure).
 
 **AMP is off, and should stay off on T4.** In the previous run `GradScaler` was built with `init_scale=1024` but collapsed inside epoch 1 and sat at 0.0078-0.125 for all 11 epochs. A loss scale below 1 divides gradients rather than multiplying them, so anything under ~9.5e-7 flushed to exactly zero in the fp16 backward. Measured: `exp_avg` was bit-zero for all of `_msg.*`, `_emb._sigma.weight` and `_out._bilinear`, so the entire geometry pathway received no gradient for 11 epochs and stayed at init. The cliff lands where the arithmetic predicts, with `_out._mlp.layer_0` at 6.7e-7 and everything behind it at 0.
 
-It kept backing off because something overflows fp16 even at scale 2⁻⁴. Unconfirmed candidates: the backward of `contribs * fmc**2` in `OutputHead` (~1e4 amplification) and `locality / weights.clamp(min=eps_msgp)` in `MessagePass` (a `1/weights²` backward term). The root issue is that this model's gradient range is wider than fp16's exponent, so some regions overflow at scale 1 while others underflow below it and no single scale works. T4 has no bf16, so fp32 is the only correct option; `amp=False` sidesteps the overflow rather than fixing it.
+It kept backing off because something overflows fp16 even at scale 2⁻⁴. Unconfirmed candidates: the backward of `OutputHead`'s two accumulators, `c * fmc**2` (incoherent, ~1e4 amplification) and `w * fmc` (coherent), and `locality / weights.clamp(min=eps_msgp)` in `MessagePass` (a `1/weights²` backward term). The two-channel head made this **worse**, not better: unlike the per-atom quantities, `coh_accum = sum_j w_j f_j` is an M-scale sum, and it is then squared, so the forward reaches ~M²·f² and the backward through the square carries a `2·coh_accum` factor that is itself M-scale. The old single-channel head had no operation anywhere that squared a sum over atoms, so it never produced either. The root issue is that this model's gradient range is wider than fp16's exponent, so some regions overflow at scale 1 while others underflow below it and no single scale works. T4 has no bf16, so fp32 is the only correct option; `amp=False` sidesteps the overflow rather than fixing it.
 
-**`lr_gamma` now defaults to 1.0 (constant LR).** Per-epoch decay assumes an epoch is a fixed amount of work, and `dataset_frac` breaks that: at `dataset_frac=0.15` an epoch is ~1/7 the optimiser steps, so the old `0.7`/epoch decayed that much faster *per step*. There is also no evidence for any decay rate here, since the run only ever used the one schedule and annealed to `lr=5.2e-6` by epoch 11 while MessagePass was receiving zero gradient throughout. The plateau (`best_val` frozen at 2.1816 from epoch 4) therefore says nothing about whether the LR was right. Re-anneal once the model trains, keyed off total steps rather than epochs.
+**Why plateau rather than exponential.** `ExponentialLR(gamma)` fires unconditionally, regardless of how training is going, and it assumes an epoch is a fixed amount of work. `dataset_frac` breaks that assumption: at `dataset_frac=0.15` an epoch is ~1/7 the optimiser steps, so the old `gamma=0.7`/epoch decayed ~7x faster *per step* than the same number implied at `frac=1.0`. It annealed to `lr=5.2e-6` by epoch 11 whether or not the model was still improving, and in that run it was not improving for an unrelated reason (MessagePass received zero gradient throughout under fp16, see above), so `best_val` freezing at 2.1816 from epoch 4 said nothing about whether the LR was right. Keying the cut off measured validation progress fixes the unconditional part: the LR now never decays while the model is still improving, and the schedule needs no known horizon, which matters because `cfg.epochs` is a per-invocation count rather than the run's total.
+
+It is **not** fully scale-free, though, and it is worth being precise about that. `lr_patience` and `lr_threshold` are counted in *epochs*, so shrinking `dataset_frac` shortens each epoch, puts less progress in it, and makes a fixed relative-improvement threshold proportionally harder to clear, cutting the LR earlier in step-terms. Going from `frac=0.15` to `frac=0.05` triples that effect, which is why the notebook loosens `lr_patience` to 3 and `lr_threshold` to 5e-4 rather than using the `RunConfig` defaults. At `frac=0.05` with `epochs=20` the entire run is roughly one pass over the full dataset, so per-epoch plateau detection is inherently noisy regardless.
+
+This is also why a horizon-based schedule (cosine, step-to-a-target) is not usable here: a resume runs `cfg.epochs` MORE epochs from wherever it left off, so there is no known endpoint to anneal toward.
 
 A reactive mid-epoch cut (windowed train-loss plateau detection, `plateau_window`/`plateau_patience`/`plateau_factor`) previously ran alongside this. It was removed: on a live run it kept firing well past the point where per-parameter gradient magnitudes (Adam's `exp_avg`/`exp_avg_sq`) had stopped shrinking, cutting lr ~150x below its starting value over two epochs while gradients were still very much alive - the windowed detector was reacting to batch-to-batch noise, not real stalls, and throttled training far more aggressively than the per-epoch decay alone would have.
 
-**Resume**: `lr_gamma`'s schedule is keyed off the absolute epoch number rather than a saved scheduler counter - `start_epoch` already correctly encodes epochs-completed-so-far across both epoch-boundary and mid-epoch resumes (see `Train/train.py`'s resume block), so a horizon-based schedule (cosine annealing, etc.) can't be used safely here anyway, since `cfg.epochs` is only the current invocation's epoch count, not the run's total horizon (a resume runs `cfg.epochs` MORE epochs from wherever it left off). `ExponentialLR.step()` mutates `optimizer.param_groups["lr"]` in place, so a checkpoint saved by this code already has the *true* current lr baked into `optimizer.state_dict()`. On resume, `optimizer.load_state_dict(ckpt["optimizer"])` runs **before** `scheduler.load_state_dict(ckpt["scheduler"])`, and the latter only restores the scheduler's own bookkeeping (`last_epoch`, `_last_lr`) - it never touches `optimizer.param_groups`. So the lr actually used after a resume always comes from the checkpoint, never from `RunConfig.lr`; `cfg.lr` only matters for a fresh (non-resumed) run. The checkpoint also saves the current lr as an explicit top-level `lr` field (redundant with `optimizer.state_dict()`, but avoids having to dig into the optimizer state just to inspect it, e.g. when auditing a batch of checkpoints).
+**Rank lockstep.** `ReduceLROnPlateau.step(metric)` makes the LR a function of the metric rather than of the epoch count, so a rank-*local* metric here would silently desync the LR across ranks mid-run. It is safe because `val_loss` is rank-identical: `evaluate()` all-reduces its six stat accumulators on DP-split batches (`Train/train.py`), and on the TP path every rank sees the same batch and the same all-reduced I(q). Anything fed to `scheduler.step()` must preserve that property.
+
+**Resume**: unlike `ExponentialLR`, this schedule is **path-dependent**. `best`, `num_bad_epochs`, and `cooldown_counter` cannot be reconstructed from the epoch number, so the checkpoint's `"scheduler"` state is load-bearing rather than an optimisation. The LR itself still rides in the optimizer: `ReduceLROnPlateau` mutates `optimizer.param_groups["lr"]` in place, so a checkpoint already has the true current lr baked into `optimizer.state_dict()`. On resume, `optimizer.load_state_dict(ckpt["optimizer"])` runs **before** `scheduler.load_state_dict(ckpt["scheduler"])`, and the latter only restores the scheduler's own bookkeeping, never touching `optimizer.param_groups`. So the lr used after a resume always comes from the checkpoint, never from `RunConfig.lr`; `cfg.lr` only matters for a fresh run. The checkpoint also saves the current lr as an explicit top-level `lr` field (redundant with `optimizer.state_dict()`, but avoids digging into optimizer state to inspect it).
 
 The scheduler's `state_dict()` and the AMP `GradScaler`'s `state_dict()` are both saved in every resume checkpoint too (`"scheduler"`, `"scaler"` keys) and restored on resume. Neither is needed to reconstruct the correct lr (see above), but skipping the `GradScaler` restore meant every resume reset its adaptive loss scale back to `amp_init_scale`, which could cause a burst of skipped/inf-grad steps right after a resume; saving it makes resumes bit-for-bit resume the scaler's adapted state instead. Old checkpoints saved before this change lack both keys - the resume code guards on `"scheduler" in ckpt` / `"scaler" in ckpt` so loading them still works, it just starts the scheduler/scaler fresh.
 
@@ -750,11 +790,11 @@ If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remo
 | --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `lambda_1`          | 128     | Atom embedding dimension. Width of the per-atom vector throughout MessagePass.                                                                                                                                                           |
 | `lambda_2`          | 4       | Message-passing rounds. Also bounds the maximum cumulative sigma change.                                                                                                                                                                 |
-| `lambda_3`          | 64      | OutputHead MLP starting width. Must satisfy`lambda_3 >= 2^lambda_4`.                                                                                                                                                                     |
-| `lambda_4`          | 4       | OutputHead halving steps. With defaults: 64->32->16->8->4->1.                                                                                                                                                                            |
+| `lambda_3`          | 64      | OutputHead MLP starting width (bilinear output width, MLP input). Must satisfy`lambda_3 >= 2^lambda_4`.                                                                                                                                   |
+| `lambda_4`          | 4       | OutputHead halving steps. The ladder always terminates at width 2 (the w and c channels), appending a step if the halvings do not land there. With defaults: 64->32->16->8->4->2.                                                         |
 | `lambda_5`          | 128     | RFF count. More = tighter kernel approximation, higher memory cost.                                                                                                                                                                      |
 | `lambda_6`          | 1.0     | Form-factor penalty weight.                                                                                                                                                                                                              |
-| `lambda_7`          | 0.0     | Sigma L2 penalty weight. **Off.** σ is now built as `exp(z + log(1/q))` and reaches ~100 Å at low q rather than a flat ~0.7 Å, so this σ² term grew ~1e4x and would dominate the loss. Also inert for all 11 epochs of the previous run. |
+| `lambda_7`          | 0.5     | Sigma penalty weight: L2 on `z = log(σ) - log(env)`, the log-space deviation from Embed's 1/q envelope. Read as the precision of a log-normal prior on σ, `lambda_7 = 1/(2s²)`, so 0.5 gives a 1-σ width of `s = 1.0` (σ free within ~2.7x of the envelope). 0.0 = off. Replaced a q²-weighted L2 on σ itself, which became inert; see below. |
 | `msg_seed`          | 42      | Seed for fixed RFF frequency matrix Ω.                                                                                                                                                                                                  |
 | `atm_chunk`         | 512     | Atoms per M-chunk. Reduce to lower VRAM.                                                                                                                                                                                                 |
 | `mol_chunk`         | 256     | Molecules per N-chunk. Reduce to lower VRAM on large molecules.                                                                                                                                                                          |
@@ -764,8 +804,11 @@ If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remo
 | `amp_init_scale`    | 1024    | GradScaler starting loss scale when`amp` is on. Lower than torch's 65536 because activations are ~O(1) after mean-normalization.                                                                                                         |
 | `eps_embd`          | 1e-8    | Numerical floor in Embed (softplus, hypot).                                                                                                                                                                                              |
 | `eps_msgp`          | 1e-3    | Numerical floor in MessagePass (sigma clamp, aggregate denominator).                                                                                                                                                                     |
-| `lr`                | 1.3e-4  | Adam learning rate (epoch-1 value; see`lr_gamma`).                                                                                                                                                                                       |
-| `lr_gamma`          | 1.0     | Per-epoch ExponentialLR decay factor:`lr * lr_gamma ** (epoch - 1)`. 1.0 = no decay (current default; see below).                                                                                                                        |
+| `lr`                | 1.3e-4  | Adam learning rate (starting value; see`lr_factor`).                                                                                                                                                                                     |
+| `lr_factor`         | 0.5     | ReduceLROnPlateau decay factor, applied when val loss stops improving. 1.0 = no decay.                                                                                                                                                   |
+| `lr_patience`       | 2       | Consecutive non-improving epochs tolerated before the LR is cut.                                                                                                                                                                         |
+| `lr_threshold`      | 1e-3    | Relative improvement needed to count as progress:`val_loss < best * (1 - lr_threshold)`.                                                                                                                                                 |
+| `lr_min`            | 1e-6    | Floor the LR is never reduced below.                                                                                                                                                                                                     |
 | `weight_decay`      | 0.1     | Adam L2 weight decay.                                                                                                                                                                                                                    |
 | `grad_clip`         | 1.0     | Max gradient L2 norm before clipping.                                                                                                                                                                                                    |
 | `epochs`            | 20      | Training epochs.                                                                                                                                                                                                                         |
@@ -826,16 +869,20 @@ Batch
   └─ OutputHead
        └─ [per M-chunk]
             └─ bilinear(embeds, f_mags) -> (N,mc,Q,λ₃)
-            └─ Mish -> MLP -> softplus  -> (N,mc,Q)
-            └─ * f_mags² * mask -> sum over atoms
-       └─ iq_accum (N, Q)
+            └─ Mish -> MLP -> softplus  -> (N,mc,Q,2) -> w, c
+            └─ w * f_mags  * mask -> sum over atoms -> coh_accum (N,Q)
+            └─ c * f_mags² * mask -> sum over atoms -> inc_accum (N,Q)
+       └─ returns coh_accum, inc_accum UNSQUARED  (N,Q) each
 
-  [Distributed: _DistributedSum(iq), _AllGatherDim1(f_mags, sigmas)]
+  [Distributed: _DistributedSum(stack(coh, inc)), _AllGatherDim1(f_mags, sigmas)]
+
+  └─ OutputHead.combine(coh, inc) = coh² + inc  (N, Q)
+       [square happens HERE, after every chunk AND every rank is summed in]
 
 Loss
   └─ _kratky_MSLE:  (1+q²)*(log1p(Î)-log1p(I))²    (N,Q)
   └─ _ff_penalty:   λ₆*(log1p(f̂)-log1p(f_ref))²/n  (N,Q)
-  └─ _sg_penalty:   λ₇*w(q)*σ²/n_atoms, w ∝ q²      (N,Q)
+  └─ _sg_penalty:   λ₇*(log σ - log env)²/n_atoms    (N,Q)
   └─ .mean() -> scalar
 
 Optimizer: Adam(SUM-reduced grads, clip at grad_clip) -> parameter update
@@ -980,5 +1027,24 @@ Worst-rank = the epoch-limiting rank (always rank 1 here, see the TP shard-imbal
 | 2000                | 22.2               | 14.51G        | 62s             | eliminated                     |
 | 3000                | 22.4               | 14.51G        | 62s             | eliminated                     |
 | 4000                | 22.4               | 14.51G        | 62s             | eliminated                     |
+
+---
+
+### Low-q coherent limit
+
+**Symptom**: percent error at low q climbing off the chart epoch after epoch while high q converged normally. The Kratky diagnostic plot hid it: `q²·I(q)` multiplies the low-q region by ~0 and so suppresses exactly the band where the amplitude was broken, which is why the curves looked healthier than the error numbers.
+
+**Root cause**: the old `OutputHead` could not represent the low-q limit at any parameter setting. Ground truth is the Debye sum `I(q) = sum_i sum_j f_i f_j sinc(q r_ij)`, and its two endpoints behave very differently in atom count M:
+
+- At `q -> 0` every `sinc(q r_ij) -> 1`, so the double sum factorizes to `(sum_j f_j)²`. Both the diagonal and all M² - M off-diagonal pairs contribute, so `I(0)` scales like **M²**.
+- At high q the off-diagonal pairs oscillate with `r_ij` and average away, leaving only the M diagonal terms `sum_j f_j²`, which scales like **M**.
+
+The old head computed `I(q) = sum_j contribs_j(q) · f_j(q)²`: a single sum over atoms, linear in the per-atom contributions, with no operation anywhere that squares a sum over atoms. That is structurally the incoherent (high-q) limit and nothing else. `(sum f)²` was not in its function class for *any* weights, since a linear functional of the per-atom terms cannot produce the M² - M cross terms. The only way it could approach the right magnitude at low q was to inflate `contribs_j` itself to ~M, which is a fundamentally different (and molecule-size-dependent) thing for the MLP to learn than a well-conditioned O(1) per-atom weight.
+
+That explains the asymmetry in the observed convergence exactly. From standard init the per-atom contributions sit at O(1), which is already right for the high-q limit, so high q was roughly correct immediately. Low q started M-fold low and could only climb by driving the MLP output up by a factor that grows with molecule size, which is slow, size-dependent, and fights the form-factor penalty. Nothing about the optimiser, the learning rate, or the loss weighting was going to fix a term that is absent from the model's function class.
+
+**Fix**: the two-channel coherent + incoherent head, `I(q) = (sum_j w_j f_j)² + sum_j c_j f_j²` (see [§6](#6-outputhead)). Squaring a sum over atoms *is* the pairwise double sum, so the M² term is recovered from one O(M) pass, both channels stay O(1) at every q, and the M-scaling comes from the architecture rather than from learned magnitude.
+
+**Retracted**: an earlier version of this document blamed the `(1 + q²)` Kratky loss weight for starving low-q gradient, with a secondary story about σ being crushed at low q. Both are wrong and are withdrawn. The q-grid here is `q ∈ [0, 0.5] Å⁻¹`, so `1 + q²` spans 1.00 at `q = 0` to 1.25 at `q = 0.5`: a 25% spread across the entire grid. A weight that varies by a quarter cannot starve anything, let alone produce an error gap of orders of magnitude, and the arithmetic should have ruled it out before it was written down. The σ penalty in [§8](#8-loss) was never the cause of this failure either. Its q² weighting has since been removed for an unrelated reason: it went inert once Embed moved the `1/q` envelope inside σ.
 
 ---

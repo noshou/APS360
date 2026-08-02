@@ -93,9 +93,9 @@ class ScatterNet(nn.Module):
         q-point, shape (V, Q) where V = len(VOCAB) + 1.
     _q_weights_ : torch.Tensor
         Kratky weighting (1 + q^2), shape (1, Q).
-    _s_weights_ : torch.Tensor
-        q-dependent weighting for the sigma penalty, shape (1, Q).
-        Proportional to q^2, normalised to mean 1 over the grid (see
+    _log_env_ : torch.Tensor
+        log of Embed's sigma envelope, log(min(1/q, sigma_max)), shape
+        (1, Q). The sigma penalty measures deviation from this (see
         __init__).
     """
 
@@ -108,7 +108,7 @@ class ScatterNet(nn.Module):
     _mol_chunk: int
     _fmag_table: Float[torch.Tensor, "V Q"]  # noqa: F722
     _q_weights_: Float[torch.Tensor, "1 Q"]  # noqa: F722
-    _s_weights_: Float[torch.Tensor, "1 Q"]  # noqa: F722
+    _log_env_: Float[torch.Tensor, "1 Q"]  # noqa: F722
     _fwd_fn: Callable
 
     def __init__(
@@ -248,23 +248,31 @@ class ScatterNet(nn.Module):
             "_q_weights_", (1 + qgrid**2).unsqueeze(0), persistent=False
         )
 
-        # Sigma-penalty weighting, ~q^2. sigma is the message-passing kernel's
-        # range (MessagePass scales coordinates as r/sigma,
-        # so large sigma = long range), and the real-space distances
-        # a scattering vector q is sensitive to go like 1/q.
-        # A flat L2 penalty on sigma fights the model everywhere in the same
-        # units, and since low q is exactly long-range structure info lives,
-        # it crushes the kernel range where I(q) needs it most.
+        # Reference sigma envelope, matching Embed's:
+        # sigma(m,q) = exp(clamp(z + log env)), env(q) = min(1/q, sigma_max).
+        # The penalty measures z = log(sigma) - log(env), the LOG-space
+        # deviation of the learned bandwidth from that 1/q prior.
         #
-        # At q = 0 the weight is exactly 0 (the grid starts there),
-        # i.e. sigma is left unconstrained at that q-point. This works out
-        # since I(0) is the forward-scattering limit, where sin(qr)/(qr) -> 1
-        # and the intensity reduces to (sum of form factors)^2.
-        # This is independent of the coordinates, and thus of the kernel range.
-        s_weights = qgrid**2
-        s_weights = s_weights / s_weights.mean().clamp(min=1e-12)
+        # This replaces a q^2-weighted L2 on sigma itself, which became
+        # inert once Embed moved the 1/q envelope inside sigma: with
+        # sigma ~ exp(z)/q, the penalty q^2 * sigma^2 = exp(2z) cancels its
+        # own weighting exactly, so the q-dependence the weight existed to
+        # provide no longer did anything. Penalising z^2 instead is
+        # - symmetric: sigma^2 only punishes LARGE sigma, dragging z toward
+        #   the clamp floor, which is the boundary it should stay away from
+        # - scale-free: sigma spans 0.25 to 1e4 A^2 across the clamp range,
+        #   so one lambda_7 cannot mean the same thing at both ends of the
+        #   grid; z is a dimensionless log-ratio, O(1) everywhere
+        #
+        # Purpose is gradient flow, not bounding: Embed's clamp already
+        # bounds sigma hard, but clamp has ZERO gradient outside its range,
+        # so a sigma driven past a boundary pins there and cannot recover.
+        # Keeping z near 0 keeps it off those boundaries.
+        log_env = torch.log(
+            torch.clamp(1.0 / qgrid.clamp(min=1e-12), max=sigma_max)
+        )
         self.register_buffer(
-            "_s_weights_", s_weights.unsqueeze(0), persistent=False
+            "_log_env_", log_env.unsqueeze(0), persistent=False
         )
         self._fwd_fn = (
             torch.compile(self._loss_fn, dynamic=True, fullgraph=True)
@@ -276,7 +284,7 @@ class ScatterNet(nn.Module):
     def _loss_fn(  # can't jaxtype here bc of torch.compile graph breaking
         fmag_table: torch.Tensor,
         q_weights: torch.Tensor,
-        s_weights: torch.Tensor,
+        log_env: torch.Tensor,
         output_head: torch.Tensor,
         f_mag_pred: torch.Tensor,
         sigma_pred: torch.Tensor,
@@ -298,8 +306,9 @@ class ScatterNet(nn.Module):
             q-point, shape (V, Q).
         q_weights : torch.Tensor
             Kratky weighting (1 + q^2), shape (1, Q).
-        s_weights : torch.Tensor
-            Sigma-penalty weighting (~q^2, mean 1), shape (1, Q).
+        log_env : torch.Tensor
+            log of the sigma envelope, log(min(1/q, sigma_max)), shape
+            (1, Q). Subtracted from log(sigma) to give z.
         output_head : torch.Tensor
             Predicted I(q), shape (N, Q).
         f_mag_pred : torch.Tensor
@@ -316,7 +325,8 @@ class ScatterNet(nn.Module):
         lambda_6 : float
             Weight on the form-factor penalty term.
         lambda_7 : float
-            Weight on the sigma L2 penalty term (q-weighted; see __init__).
+            Weight on the sigma penalty, an L2 on z = log(sigma) -
+            log(env) (see __init__).
 
         Returns
         -------
@@ -339,11 +349,13 @@ class ScatterNet(nn.Module):
             (lambda_6 * ((f_mag_pred - f_mag_real) ** 2)) * mask_2d
         ).sum(dim=1) / n_atoms  # (N, Q)
 
-        # sigma L2 penalty.
-        sg_sum = (torch.pow(sigma_pred, 2) * mask_2d).sum(
-            dim=1
-        ) / n_atoms  # (N, Q)
-        sg_penalty = lambda_7 * s_weights * sg_sum  # (N, Q)
+        # sigma penalty: L2 on z = log(sigma) - log(env), the log-space
+        # deviation from Embed's 1/q envelope. z = 0 means sigma sits
+        # exactly on the physical prior; |z| = 1 means e-fold off it.
+        # Atom-count-normalized like the form-factor term.
+        z = torch.log(sigma_pred.clamp(min=1e-12)) - log_env.unsqueeze(1)
+        sg_sum = (torch.pow(z, 2) * mask_2d).sum(dim=1) / n_atoms  # (N, Q)
+        sg_penalty = lambda_7 * sg_sum  # (N, Q)
 
         return (msle_loss + ff_penalty + sg_penalty).mean()
 
@@ -375,7 +387,8 @@ class ScatterNet(nn.Module):
         lambda_6 : float
             Weight on the form-factor penalty term.
         lambda_7 : float
-            Weight on the sigma L2 penalty term (q-weighted; see __init__).
+            Weight on the sigma penalty, an L2 on z = log(sigma) -
+            log(env) (see __init__).
 
         Returns
         -------
@@ -389,7 +402,7 @@ class ScatterNet(nn.Module):
         return self._fwd_fn(
             self._fmag_table,
             self._q_weights_,
-            self._s_weights_,
+            self._log_env_,
             output_head.contiguous(),
             f_mag_pred.contiguous(),
             sigma_pred.contiguous(),
@@ -443,7 +456,9 @@ class ScatterNet(nn.Module):
 
         if not dist_on:
             msg_head = self._msg(batch, embed_head, self._eps_msgp)
-            iq, f_mags, sigmas = self._out(batch, msg_head)
+            # whole molecule on one device, so coh already covers every atom
+            coh, inc, f_mags, sigmas = self._out(batch, msg_head)
+            iq = OutputHead.combine(coh, inc)
             return iq, f_mags, sigmas, batch, 1.0
 
         M = embed_head.embeds.shape[1]
@@ -485,7 +500,10 @@ class ScatterNet(nn.Module):
             msg_head = self._msg(
                 local_batch, local_head, self._eps_msgp, use_all_reduce=False
             )
-            iq, f_mags, sigmas = self._out(local_batch, msg_head)
+            # DP splits molecules, not atoms, so each rank holds every atom
+            # of the molecules it owns and coh is already complete.
+            coh, inc, f_mags, sigmas = self._out(local_batch, msg_head)
+            iq = OutputHead.combine(coh, inc)
             return iq, f_mags, sigmas, local_batch, (n1 - n0) / N
 
         rank = dist.get_rank()
@@ -506,9 +524,18 @@ class ScatterNet(nn.Module):
         )
 
         msg_head = self._msg(shard_batch, shard_head, self._eps_msgp)
-        iq, f_mags, sigmas = self._out(shard_batch, msg_head)
+        coh, inc, f_mags, sigmas = self._out(shard_batch, msg_head)
 
-        iq = DistributedSum.apply(iq)  # type: ignore[assignment]
+        # TP shards the ATOM dim, so coh/inc here cover only this rank's
+        # atoms. Both partials must be reduced across ranks BEFORE the
+        # coherent term is squared: squaring first would give
+        # sum_ranks (sum_j w_j f_j)^2 instead of (sum_ranks sum_j w_j f_j)^2,
+        # dropping every atom pair split across the shard boundary. Stacked
+        # into one tensor so this stays a single collective.
+        parts = DistributedSum.apply(  # type: ignore[assignment]
+            torch.stack((coh, inc), dim=-1)
+        )
+        iq = OutputHead.combine(parts[..., 0], parts[..., 1])
         f_mags = AllGatherDim1.apply(f_mags, m0, M)  # type: ignore[assignment]
         sigmas = AllGatherDim1.apply(sigmas, m0, M)  # type: ignore[assignment]
         return iq, f_mags, sigmas, batch, 1.0
