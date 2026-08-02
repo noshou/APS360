@@ -54,6 +54,7 @@ GNN that predicts X-ray powder scattering curves I(q) from atomic coordinates an
 | λ₅    | Random Fourier Features count (`lambda_5`, default 128)                    |
 | λ₆    | form-factor penalty weight (`lambda_6`, default 1.0)                       |
 | λ₇    | sigma penalty weight (`lambda_7`, default 0.5; L2 on `log σ - log env`)   |
+| λ₈    | q-curvature penalty weight (`lambda_8`, default 1.0; L2 on d²/dq² of z and log1p f) |
 | Nc      | molecules per N-chunk (`mol_chunk`)                                        |
 | mc      | atoms per M-chunk (`atm_chunk`)                                            |
 | V       | VOCAB size = len(VOCAB) + 1 (row 0 is padding)                             |
@@ -424,7 +425,7 @@ After the AllReduce, `features` and `chem_env` are divided by the per-molecule r
   ```
 
   `_sigbilin` is `nn.Bilinear(λ₁, Q, 1)`. The bilinear coupling `e^T W f` makes the sigma delta depend on the interaction between the atom's learned representation and its scattering strength.
-  Tanhshrink is unbounded by design: for large bilinear outputs sigma can shift significantly. Embed's `clamp` on the sigma exponent is the actual blowup prevention mechanism; the loss's sigma penalty (λ₇ · z², z = log σ - log env - see [§8](#8-loss)) is a soft prior that keeps σ near its 1/q envelope and off those clamp boundaries, where the gradient would be exactly zero. The maximum cumulative sigma change is also bounded by λ₂ rounds being small (default 5).
+  Tanhshrink is unbounded by design: for large bilinear outputs sigma can shift significantly. Embed's `tanh` saturation on the sigma exponent is the blowup prevention mechanism (it replaced a hard `clamp`; see [The σ ratchet](#the-σ-ratchet-2026-08-02) for why). Note this `softplus(σ + tanhshrink(...))` update is **not** covered by that saturation, which applies only to Embed's round-0 σ, which is why the loss keeps a penalty on the final σ as well as on Embed's pre-saturation exponent. The maximum cumulative sigma change is also bounded by λ₂ rounds being small (default 5).
   The sticky property near zero (tanhshrink ≈ 0, gradient = `1 - sech²(x)` = 0 at x=0) is a beneficial side effect: early in training when the bilinear has weak outputs, sigmas stay stable rather than wandering, then move more freely as the bilinear gains signal.
   Softplus wraps the whole update to maintain σ > 0, since division by σ in the RFF step cannot encounter zero.
 
@@ -666,7 +667,7 @@ L_sigma(n, q) = λ₇ * (1/n_atoms) * sum_m mask * z_m(q)²
 
 `z` is the log-space deviation of the learned bandwidth from Embed's 1/q envelope: `z = 0` sits exactly on the physical prior, `|z| = 1` is an e-fold off it. Read `λ₇` as the precision of a log-normal prior on σ centred on that envelope, `λ₇ = 1/(2s²)`, so the 1-σ width is `s = 1/√(2λ₇)`. The default `λ₇ = 0.5` gives `s = 1.0`.
 
-**This replaced a q²-weighted L2 on σ itself, which had become inert.** That weighting was written when σ was flat in q, to stop a uniform penalty from crushing the long-range bandwidth at low q. Embed then moved the `1/q` envelope inside σ (`σ = exp(clamp(z + log env))`), and with `σ ~ exp(z)/q` the old penalty becomes
+**This replaced a q²-weighted L2 on σ itself, which had become inert.** That weighting was written when σ was flat in q, to stop a uniform penalty from crushing the long-range bandwidth at low q. Embed then moved the `1/q` envelope inside σ (`σ = exp(saturate(z + log env))`), and with `σ ~ exp(z)/q` the old penalty becomes
 
 ```{Latex}
 λ₇ * (q²/mean q²) * σ²  =  λ₇ * exp(2z) / mean(q²)
@@ -677,9 +678,54 @@ The q² weight cancels the 1/q² inside σ² exactly, within the clamp range, so
 - **Symmetric.** σ² punishes only *large* σ, dragging z toward Embed's clamp floor, which is the boundary it should be staying away from. z² penalises both directions equally.
 - **Scale-free.** σ² spans 0.25 to ~1e4 Å² across the clamp range, so a single λ₇ cannot mean the same thing at both ends of the grid. z is a dimensionless log-ratio, O(1) everywhere.
 
-**Its job is gradient flow, not bounding.** Embed's `clamp(z + log env, log floor, log max)` already bounds σ hard, so the penalty is redundant as a safety rail. What the clamp cannot do is recover: it has exactly zero gradient outside its range, so a σ driven past a boundary pins there permanently. Keeping z near 0 keeps it off those boundaries. In practice the term is near-silent while σ tracks the envelope (measured at ~0.03 on a loss of ~26 at init, mean z² ≈ 0.07) and only bites once z drifts to O(1).
+**Its job is gradient flow, not bounding.** Embed already bounds σ, so the penalty is redundant as a safety rail. What a bound cannot do is recover. This was underestimated badly enough to warrant its own section.
 
-Note this is a soft prior, not the primary blowup guard, which is now the clamp. It is **not**, however, the explanation for I(q) being poor at low q while healthy at high q: that symptom was root-caused to the old `OutputHead` being structurally incapable of representing `(Σf)²`, and neither σ nor the `(1 + q²)` Kratky weight had anything to do with it. See [Appendix: low-q coherent limit](#low-q-coherent-limit).
+#### The σ ratchet (2026-08-02)
+
+Embed originally bounded σ with `clamp(z + log env, log floor, log max)`, and the penalty above was computed on the *post-clamp* σ. That combination makes saturation an **absorbing state**: `clamp` has exactly zero gradient outside its range, so the penalty meant to pull z back off a boundary reaches `_emb._sigma` through a derivative of zero for precisely the entries that already left. It is preventative with no restoring force, so the pinned fraction can only rise. Measured on checkpoints from the 2026-08-01 run:
+
+| | `_sigma.weight` std | \|z\| mean | \|z\| p99 | pinned low | pinned high | **live** |
+|---|---|---|---|---|---|---|
+| step 207    | 0.00522 (1.02x init) | 0.379 | 1.58 | 0.34% | 3.71% | **95.9%** |
+| step 10661  | 0.00995 (1.95x init) | 2.358 | 7.78 | 16.9% | 21.5% | **61.5%** |
+| prev run, 213k steps | 0.02560 (5.02x init) | 56.97 | 298.8 | 38.7% | 57.2% | **4.2%** |
+
+`_sigma.weight` is the fastest-growing parameter in the model (‖Δ‖/‖·‖ = 1.709 over that span; next fastest is `_f0f1.weight` at 0.299). The endpoint is σ reduced to a binary floor-or-max switch. Because the 1/q envelope spans only `log(100) − log(2) = 3.9` nats across the grid, a |z| p99 of 7.78 means **z has drowned the envelope**: measured per-q σ went from tracking 1/q at step 207 (95.2, 15.7, 26.6, 19.7, 9.3, 4.6, 2.8 Å) to non-monotone noise by step 10661 (15.7, 8.6, 15.7, 5.1, 21.5, 5.0, 4.8 Å). Since σ sets the RFF kernel radius per q, that turns into grid-frequency oscillation in the predicted I(q).
+
+Two changes fix it, and only the second is load-bearing:
+
+1. **`clamp` → scaled `tanh`** (`σ = exp(mid + half·tanh((z + log env − mid)/half))`). Degrades gracefully instead of switching off. But it is *not* a nonzero-gradient guarantee: `tanh` reaches exactly 1.0 in fp32 once `|u − mid|/half > ~8.7`. Measured `d(σ)/du` at the high-q end: `z=0 → 4.2e-01`, `z=2.36 → 8.7e-02`, `z=7.78 → 1.5e-03`, `z=23 → 0.0`. It widens the usable window over the range this run occupies, nothing more.
+2. **A second penalty term on the PRE-saturation exponent.** Embed now returns its raw `_sigma` bilinear output as `LayerHead.z_sigma`, and the loss penalises it directly, so `d/dz = 2·λ₇·z` regardless of saturation. Verified: driven to |z| ≈ 59, `_emb._sigma.weight.grad` has norm 49.2 at λ₇=0.5 versus **0.067 at λ₇=0.0**, a 735x difference.
+
+The post-saturation term stays, because it is the only one that sees MessagePass's per-round `softplus(σ + tanhshrink(...))` update, which is unbounded above and has no saturation of its own.
+
+> **λ₇ must be non-zero.** `train.yaml` carried `lambda_7: 0.0` (from "killed sigma loss for now", commit 707ffbf) while the runs themselves used 0.5. At 0.0 both terms vanish and σ is completely unconstrained.
+
+#### q-curvature penalty (λ₈)
+
+`_f0f1`, `_f2` and `_sigma` each emit **Q independent output channels** (`nn.Linear(lambda_1, qPoints)` and friends), so nothing couples `q_j` to `q_{j+1}`. But the true I(q) is an orientational average of a bounded object, a finite sum of sinc terms, and therefore analytic in q. The model is free to make adjacent q-points disagree arbitrarily, and it does: measured on the 2026-08-01 run, mean `log1p(I(q))` over 8165 molecules oscillates **±1.5 nats between adjacent grid points** (a ~20x swing) against a perfectly smooth target, and per-q R² crosses zero at q ≈ 0.22 and bottoms at −2.26.
+
+λ₈ adds an L2 on the second difference along q, applied to **z** and to **log1p(f_mag)**. Applied to z rather than `log σ` because `log_env` carries the intended 1/q shape and has real curvature of its own, so penalising `d²(log σ)` would fight the envelope; penalising `d²(z)` asks the learned *deviation* to be smooth and leaves the physical shape alone.
+
+4-seed sweep (40 Adam steps, λ₁=16, synthetic batch), median mean `d²(z)` after training / median MSLE:
+
+| λ₈ | `d²(z)` | MSLE | MSLE range |
+|---|---|---|---|
+| 0.0  | 2.17e+01 | 1.283 | 1.053–1.453 |
+| 1.0  | **3.09e-01** | **1.123** | 0.744–1.399 |
+| 20.0 | 1.79e-02 | 1.454 | 1.142–1.472 |
+
+λ₈=1.0 buys ~70x smoothness at no MSLE cost; 20.0 over-smooths and starts costing fit. The MSLE spreads overlap across seeds, so the roughness column is the signal and the MSLE column is a "does not obviously hurt" check, not a win.
+
+#### Per-q rescaling (`per_q_norm`)
+
+Every q-point enters the MSLE with equal weight but not equal difficulty (R² ≈ 0.85 below q=0.17, negative past q≈0.22). Because the loss is quadratic, the band with the largest residuals also contributes the largest gradient, so the third of the grid the model fits *worst* dominates the update. `per_q_norm` divides each q's residual by that q's running RMS (EMA over `per_q_momentum`, ~100 batches), renormalised to mean 1 so `lr`, λ₆ and λ₇ keep their calibration.
+
+Note this **lowers** the weight on high q rather than raising it. The rationale is that more raw gradient there has demonstrably not helped, so the aim is to stop an ill-conditioned band crowding out the rest, not to push harder on it. **If high-q R² degrades rather than improves, set `per_q_norm: 0.0`** to recover equal weighting. That knob is the whole experiment.
+
+The EMA runs eager in `_per_q_scale`, outside the compiled `_loss_fn` (it mutates a buffer and may issue a collective, either of which breaks a fullgraph capture), updates only in `.training` mode, and is all-reduced across ranks **only on the DP path** (`sync_stats=loss_scale < 1.0`), where each rank holds different molecules. Under TP every rank already holds the same molecules and the same all-reduced `output_head`, so reducing again would double-count.
+
+This is **not** the explanation for I(q) being poor at low q while healthy at high q: that symptom was root-caused to the old `OutputHead` being structurally incapable of representing `(Σf)²`, and neither σ nor the `(1 + q²)` Kratky weight had anything to do with it. See [Appendix: low-q coherent limit](#low-q-coherent-limit).
 
 **Total:**
 
@@ -695,9 +741,28 @@ L_total = mean_{n,q}[ L_kratky(n,q) + L_ff(n,q) + L_sigma(n,q) ]
 
 ### Optimizer
 
-`torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)`
+`torch.optim.Adam(..., lr=lr, decoupled_weight_decay=True)` over **three** parameter groups:
 
-Standard Adam (not AdamW; weight decay is applied inside the gradient update, not decoupled). Single parameter group.
+| group | members | weight decay | lr | betas |
+|---|---|---|---|---|
+| decay    | weight matrices                                              | `weight_decay` | `lr` | (0.9, 0.999) |
+| no-decay | biases, `rms_norm`, `prelu`, `biasterm`, `_mbd`               | 0.0 | `lr` | (0.9, 0.999) |
+| out      | everything under `_out.`                                     | 0.0 | `lr * out_lr_mult` | (0.9, `out_beta2`) |
+
+**Why `_out` is split off.** Its gradient arrives through `coh**2`, so `d(loss)/dw` scales with `coh`, which spans ~4.5 decades across the size range. Combined with size-sorted buckets, that makes the head's gradient wildly heteroscedastic batch to batch. A rare spike loads Adam's `exp_avg_sq` (1/(1−β₂) = 1000-step memory) while `exp_avg` (10-step) decays back to ~0, collapsing the ratio that sets the step size. Measured at step 10661 of the 2026-08-01 run, gradient SNR (`|exp_avg|/sqrt(exp_avg_sq)`, ~0.18 is the pure-noise floor):
+
+| param | step 207 | step 10661 |
+|---|---|---|
+| `_proj_agg.0/.1` | 0.376 / 0.040 | 0.159 / 0.108 |
+| `_proj_agg.2/.3` | 0.033 / 0.035 | **0.0036 / 0.0049** |
+| `_rms_norm.2/.3` | 0.044 / 0.051 | **0.0025 / 0.0028** |
+| entire `_out` stack | 0.024–0.068 | **0.0014–0.0036** |
+
+That is an effective relative update of 2e-6/step for `_out`, about 0.5% over a whole epoch, so the two-channel head was **still sitting on its initialisation after 7 epochs** and could not be evaluated. Lowering β₂ for that group shortens the variance memory to ~100 steps; `out_lr_mult` covers the residual gap. Set `out_lr_mult=1.0, out_beta2=0.999` to recover the old single-LR behaviour. Message-passing rounds 3 and 4 of 4 show the same collapse and are **not** yet addressed.
+
+**Why `_mbd` left the decay group.** The embedding table is indexed, so a vocab entry absent from a batch receives no gradient, while decoupled decay applies every step regardless. The 2026-08-01 run had **52 of 211 rows with `exp_avg_sq == 0`** (never once seen in the data) shrinking monotonically toward zero. Decay is only meaningful for a parameter the loss pushes back on.
+
+> **Resume compatibility.** The third group changes the optimizer `state_dict` layout, and the per-param `state` is keyed by index into the flattened group order, so it cannot be remapped. Pre-2026-08-02 checkpoints raise a `RuntimeError` naming the mismatch rather than silently attaching the wrong Adam moments.
 
 ### Learning Rate Schedule
 
@@ -795,6 +860,9 @@ If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remo
 | `lambda_5`          | 128     | RFF count. More = tighter kernel approximation, higher memory cost.                                                                                                                                                                      |
 | `lambda_6`          | 1.0     | Form-factor penalty weight.                                                                                                                                                                                                              |
 | `lambda_7`          | 0.5     | Sigma penalty weight: L2 on `z = log(σ) - log(env)`, the log-space deviation from Embed's 1/q envelope. Read as the precision of a log-normal prior on σ, `lambda_7 = 1/(2s²)`, so 0.5 gives a 1-σ width of `s = 1.0` (σ free within ~2.7x of the envelope). 0.0 = off. Replaced a q²-weighted L2 on σ itself, which became inert; see below. |
+| `lambda_8`          | 1.0     | q-curvature penalty: L2 on the 2nd difference of `z` and `log1p(f_mag)` along q. `_f0f1`/`_f2`/`_sigma` emit Q independent channels, so nothing couples adjacent q while the true I(q) is analytic in q. 0.0 = off. |
+| `per_q_norm`        | 1.0     | Exponent on the per-q inverse-RMS rescaling of the MSLE term, [0, 1]. 0 = equal weighting (original). Renormalised to mean 1. Lowers the weight on high q; set 0.0 if high-q R² degrades. |
+| `per_q_momentum`    | 0.99    | EMA momentum for the per-q residual variance (~100-batch window).                                                                                                                        |
 | `msg_seed`          | 42      | Seed for fixed RFF frequency matrix Ω.                                                                                                                                                                                                  |
 | `atm_chunk`         | 512     | Atoms per M-chunk. Reduce to lower VRAM.                                                                                                                                                                                                 |
 | `mol_chunk`         | 256     | Molecules per N-chunk. Reduce to lower VRAM on large molecules.                                                                                                                                                                          |
@@ -809,7 +877,9 @@ If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remo
 | `lr_patience`       | 2       | Consecutive non-improving epochs tolerated before the LR is cut.                                                                                                                                                                         |
 | `lr_threshold`      | 1e-3    | Relative improvement needed to count as progress:`val_loss < best * (1 - lr_threshold)`.                                                                                                                                                 |
 | `lr_min`            | 1e-6    | Floor the LR is never reduced below.                                                                                                                                                                                                     |
-| `weight_decay`      | 0.1     | Adam L2 weight decay.                                                                                                                                                                                                                    |
+| `weight_decay`      | 0.1     | AdamW decoupled decay. Applied to weight matrices only: not `_out`, `_mbd`, biases, norm/gain params, or the RFF phases.                                                                                                                  |
+| `out_lr_mult`       | 10.0    | Multiplier on `lr` for OutputHead's own optimizer group. 1.0 disables the split.                                                                                                                                                          |
+| `out_beta2`         | 0.99    | Adam β₂ for OutputHead's group. Below the 0.999 default so its heteroscedastic gradient stops throttling the step size for ~1000 steps after a spike.                                                                                     |
 | `grad_clip`         | 1.0     | Max gradient L2 norm before clipping.                                                                                                                                                                                                    |
 | `epochs`            | 20      | Training epochs.                                                                                                                                                                                                                         |
 | `batcher_seed`      | 0       | Seed for train/val/test split and per-epoch shuffle.                                                                                                                                                                                     |

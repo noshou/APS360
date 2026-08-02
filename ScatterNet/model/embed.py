@@ -26,10 +26,47 @@ class Embed(nn.Module):
 
     Sigma parameterisation
     ----------------------
-        sigma(m,q) = exp(clamp(z + log env, log floor, log max))
+        sigma(m,q) = exp(mid + half * tanh((z + log env - mid) / half))
         env(q)     = min(1/q, sigma_max)
+        mid, half  = midpoint and half-width of [log floor, log max]
 
-    z is `_sigma`'s bilinear output.
+    z is `_sigma`'s bilinear output, returned alongside sigma as
+    `LayerHead.z_sigma` so the loss can penalise it directly.
+
+    tanh, not clamp: a hard clamp has EXACTLY zero gradient outside its
+    range, so an entry driven past a boundary pins there permanently. The
+    sigma penalty in scatter_net.py was meant to keep z away from those
+    boundaries, but it is computed on the post-clamp sigma, so its
+    gradient is zeroed for precisely the entries that already escaped: it
+    is preventative with no restoring force, and pinning becomes an
+    absorbing state. Measured on the 2026-08-01 run, the pinned fraction
+    ratcheted 4.1% (step 207) -> 38.5% (step 10661) and never recovered;
+    the previous run ended at 95.8% pinned with |z| mean 57 against a
+    5.30-nat window, i.e. sigma reduced to a binary floor-or-max switch.
+
+    tanh maps R onto the OPEN interval, so it degrades gracefully instead
+    of switching off. Measured d(sigma)/du against the run's own |z|
+    distribution (mean 2.36, p99 7.78), taken at the high-q end where the
+    envelope pushes hardest:
+
+        z =  0.00 -> 4.2e-01      z = 15.00 -> 6.6e-06
+        z =  2.36 -> 8.7e-02      z = 23.00 -> 0.0
+        z =  7.78 -> 1.5e-03      z = 30.00 -> 0.0
+
+    So this is NOT a guarantee of nonzero gradient: tanh hits exactly 1.0
+    in fp32 once |u - mid|/half exceeds ~8.7, and the previous run's |z|
+    mean of 57 is far past that. It buys a usable gradient across the
+    range this run actually occupies, and nothing beyond it.
+
+    The unconditional part is the paired penalty on `z_sigma` (see
+    ScatterNet._loss_fn), which acts on the raw exponent and so has
+    derivative 2*lambda_7*z no matter how saturated the entry is. That is
+    the term that makes saturation recoverable; this one just widens the
+    window in which it does not have to do all the work.
+
+    Scaled so the map is the identity to first order at the midpoint
+    (d/dz = 1 at z + log env = mid), matching the old clamp's behaviour in
+    the interior where it was already well-behaved.
 
     env ~ 1/q: sigma is the RBF bandwidth (MessagePass forms r/sigma). In
     I(q) = sum_mm' f f' sinc(q r), sinc first vanishes at q r = pi, so q is
@@ -105,6 +142,14 @@ class Embed(nn.Module):
         qPoints = qgrid.shape[0]
         self._log_sigma_floor = math.log(sigma_floor)
         self._log_sigma_max = math.log(sigma_max)
+        # midpoint / half-width of the log-sigma window, for the tanh
+        # saturation that replaced the hard clamp (see class docstring).
+        self._log_sigma_mid = 0.5 * (
+            self._log_sigma_floor + self._log_sigma_max
+        )
+        self._log_sigma_half = 0.5 * (
+            self._log_sigma_max - self._log_sigma_floor
+        )
 
         # 1/q sigma envelope, stored in log space (see class docstring).
         # Before this, the forward never saw q's values at all, only Q, so
@@ -161,12 +206,14 @@ class Embed(nn.Module):
         f2: nn.Linear,
         sigma: NoTrilinBilin,
         log_sigma_env: torch.Tensor,
-        log_sigma_floor: float,
-        log_sigma_max: float,
+        log_sigma_mid: float,
+        log_sigma_half: float,
         vocabs: torch.Tensor,
         mask: torch.Tensor,
         eps: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         """Compute atom embeddings, form factor magnitudes, and sigmas.
 
         Parameters
@@ -186,12 +233,10 @@ class Embed(nn.Module):
         log_sigma_env : torch.Tensor
             Fixed (non-learned) log of the 1/q kernel-range envelope, shape
             (1, 1, Q).
-        log_sigma_floor : float
-            Lower clamp on the sigma exponent, i.e. log of the floor in
-            Angstroms.
-        log_sigma_max : float
-            Upper clamp on the sigma exponent, i.e. log of the cap in
-            Angstroms.
+        log_sigma_mid : float
+            Midpoint of the log-sigma window, (log floor + log max) / 2.
+        log_sigma_half : float
+            Half-width of the log-sigma window, (log max - log floor) / 2.
         vocabs : torch.Tensor
             Atom vocabulary indices, shape (N, M).
         mask : torch.Tensor
@@ -208,6 +253,9 @@ class Embed(nn.Module):
             `f_mags`, form factor magnitudes, shape (N, M, Q, 1).
         torch.Tensor
             `sigmas`, kernel variance bandwidths, shape (N, M, Q, 1).
+        torch.Tensor
+            `z_sigs`, the pre-saturation exponent offset (`sigma`'s raw
+            bilinear output), shape (N, M, Q, 1).
         """
 
         # get embedding: "what is this atom?" → (N, M, λ₁)
@@ -227,15 +275,26 @@ class Embed(nn.Module):
         # get padding mask (N,M) -> (N,M,1)
         masks = mask.unsqueeze(-1)
 
-        # sigmas (N, M, Q, 1): exp(clamp(z + log_env, log floor, log max)).
-        # Clamp is on the SUM; clamping z and log_env separately would
+        # z is the raw exponent OFFSET from the 1/q envelope; it is exactly
+        # what the sigma penalty targets, so it is returned rather than
+        # reconstructed downstream (reconstruction would have to invert the
+        # saturation, which is ill-conditioned near the boundaries).
+        z_sig = sigma(embed, f_mag)  # (N, M, Q)
+
+        # sigmas (N, M, Q, 1): exp(mid + half*tanh((z + log_env - mid)/half)).
+        # Saturation is on the SUM; saturating z and log_env separately would
         # compose their bounds. No `+ eps` needed, unlike softplus: exp is
-        # positive and the lower clamp floors it. See the class docstring.
-        log_sigmas = (sigma(embed, f_mag) + log_sigma_env).clamp(
-            min=log_sigma_floor, max=log_sigma_max
+        # positive and the lower asymptote floors it. See the class docstring
+        # for why this is tanh and not clamp.
+        u = z_sig + log_sigma_env
+        log_sigmas = log_sigma_mid + log_sigma_half * torch.tanh(
+            (u - log_sigma_mid) / log_sigma_half
         )
         # masked last so padding atoms come out at 0, not at sigma_floor.
         sigmas = torch.exp(log_sigmas).unsqueeze(-1) * masks.unsqueeze(-1)
+        # masked for the same reason: padding atoms must not contribute to
+        # the penalty's atom-count-normalised sum.
+        z_sigs = z_sig.unsqueeze(-1) * masks.unsqueeze(-1)
 
         # squeeze padding mask (N,M,1) -> (N,M,1,1)
         masks = masks.unsqueeze(-1)
@@ -245,7 +304,7 @@ class Embed(nn.Module):
         embeds = embed.unsqueeze(-2)
         f_mags = f_mag.unsqueeze(-1) * masks
 
-        return embeds, f_mags, sigmas
+        return embeds, f_mags, sigmas, z_sigs
 
     @jaxtyped(typechecker=beartype)
     def forward(self, batch: Batch, eps: float) -> LayerHead:
@@ -262,21 +321,23 @@ class Embed(nn.Module):
         -------
         LayerHead
             Container with `embeds` (N, M, 1, λ₁), `f_mags` (N, M, Q, 1),
-            and `sigmas` (N, M, Q, 1).
+            `sigmas` (N, M, Q, 1), and `z_sigma` (N, M, Q, 1).
         """
 
-        embeds, f_mags, sigmas = self._fwd_fn(
+        embeds, f_mags, sigmas, z_sigma = self._fwd_fn(
             self._prelu,
             self._mbd,
             self._f0f1,
             self._f2,
             self._sigma,
             self._log_sigma_env,
-            self._log_sigma_floor,
-            self._log_sigma_max,
+            self._log_sigma_mid,
+            self._log_sigma_half,
             batch.vocab,
             batch.padding_mask(),
             eps,
         )
 
-        return LayerHead(embeds=embeds, f_mags=f_mags, sigmas=sigmas)
+        return LayerHead(
+            embeds=embeds, f_mags=f_mags, sigmas=sigmas, z_sigma=z_sigma
+        )

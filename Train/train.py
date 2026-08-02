@@ -534,9 +534,16 @@ def evaluate(
             with torch.autocast(
                 device_type="cuda", dtype=torch.float16, enabled=amp
             ):
-                iq, fmags, sigmas, local_batch, _ = model(batch)
+                iq, fmags, sigmas, zsigs, local_batch, _ = model(batch)
                 loss = model.compute_loss(
-                    iq, fmags, sigmas, local_batch, cfg.lambda_6, cfg.lambda_7
+                    iq,
+                    fmags,
+                    sigmas,
+                    zsigs,
+                    local_batch,
+                    cfg.lambda_6,
+                    cfg.lambda_7,
+                    cfg.lambda_8,
                 )
             iq = iq.float()  # R2/metrics accumulate in fp32 regardless of AMP
             n = local_batch.iqval.shape[0]
@@ -993,6 +1000,8 @@ def _worker(rank: int, cfg: RunConfig):
         sigma_floor=cfg.sigma_floor,
         sigma_init_gain=cfg.sigma_init_gain,
         dp_atom_threshold=cfg.dp_atom_threshold,
+        per_q_norm=cfg.per_q_norm,
+        per_q_momentum=cfg.per_q_momentum,
         compile=cfg.compile,
     ).to(device)
 
@@ -1009,15 +1018,37 @@ def _worker(rank: int, cfg: RunConfig):
     # to true AdamW-style decay (independent of the adaptive normalization),
     # and excluding these params from decay entirely is extra insurance
     # against the same class of parameter dying again.
-    decay_params, no_decay_params = [], []
+    # `_mbd` also sits out weight decay. The embedding table is indexed, so
+    # a vocab entry absent from the batch receives no gradient at all, but
+    # decoupled decay applies every step regardless - the 2026-08-01 run had
+    # 52 of 211 rows with exp_avg_sq == 0 (never once seen in the data)
+    # shrinking monotonically toward zero. Decay is only meaningful for a
+    # param the loss actually pushes back on.
+    #
+    # `_out` gets its own group at `out_lr_mult` x the base LR. Its gradient
+    # arrives through coh**2, so d(loss)/dw scales with coh, which spans
+    # ~4.5 decades across the size range; combined with size-sorted buckets
+    # that makes its gradient wildly heteroscedastic batch to batch. A rare
+    # spike loads Adam's exp_avg_sq (1/(1-beta2) = 1000-step memory) while
+    # exp_avg (10-step) decays back to ~0, so the ratio that sets the step
+    # size collapses. Measured at step 10661: gradient SNR 0.0014-0.0036
+    # against a ~0.18 pure-noise floor, i.e. an effective relative update of
+    # 2e-6/step, ~0.5% over a whole epoch. The head was still sitting on its
+    # initialisation after 7 epochs, which is why the two-channel change
+    # could not be evaluated. beta2 is dropped for this group too, so the
+    # variance estimate forgets a spike in ~100 steps instead of ~1000.
+    decay_params, no_decay_params, out_params = [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if (
+        if name.startswith("_out."):
+            out_params.append(param)
+        elif (
             name.endswith(".bias")
             or "rms_norm" in name
             or "prelu" in name
             or "biasterm" in name
+            or "_mbd" in name
         ):
             no_decay_params.append(param)
         else:
@@ -1027,6 +1058,12 @@ def _worker(rank: int, cfg: RunConfig):
         [
             {"params": decay_params, "weight_decay": cfg.weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
+            {
+                "params": out_params,
+                "weight_decay": 0.0,
+                "lr": cfg.lr * cfg.out_lr_mult,
+                "betas": (0.9, cfg.out_beta2),
+            },
         ],
         lr=cfg.lr,
         decoupled_weight_decay=True,
@@ -1091,6 +1128,22 @@ def _worker(rank: int, cfg: RunConfig):
         # weights. The scheduler's OWN state (best, num_bad_epochs) is
         # path-dependent and restored separately just below - unlike the old
         # ExponentialLR, it cannot be recomputed from the epoch number.
+        # Checkpoints written before OutputHead got its own param group hold
+        # 2 groups, not 3, and torch's error for that is opaque. The state is
+        # not remappable either: `state` is keyed by the param's index in the
+        # flattened group order, and moving _out's params into a third group
+        # shifts every index after them, so a "best effort" partial load would
+        # silently attach the wrong Adam moments to the wrong tensors.
+        n_ckpt = len(ckpt["optimizer"]["param_groups"])
+        n_live = len(optimizer.param_groups)
+        if n_ckpt != n_live:
+            raise RuntimeError(
+                f"optimizer param-group mismatch: checkpoint has {n_ckpt}, "
+                f"this build has {n_live}. {cfg.resume} predates the "
+                "OutputHead param-group split. Adam moments cannot be "
+                "remapped across it. Either start a fresh run, or resume "
+                "weights only by loading ckpt['model'] with cfg.resume unset."
+            )
         optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
@@ -1441,7 +1494,9 @@ def _worker(rank: int, cfg: RunConfig):
                 with torch.autocast(
                     device_type="cuda", dtype=torch.float16, enabled=amp
                 ):
-                    iq, fmags, sigmas, local_batch, loss_scale = model(batch)
+                    iq, fmags, sigmas, zsigs, local_batch, loss_scale = model(
+                        batch
+                    )
             with loop_prof.section("loss", rec):
                 with torch.autocast(
                     device_type="cuda", dtype=torch.float16, enabled=amp
@@ -1451,9 +1506,19 @@ def _worker(rank: int, cfg: RunConfig):
                             iq,
                             fmags,
                             sigmas,
+                            zsigs,
                             local_batch,
                             cfg.lambda_6,
                             cfg.lambda_7,
+                            cfg.lambda_8,
+                            # loss_scale < 1 <=> this batch went down the DP
+                            # path, where each rank holds a DIFFERENT set of
+                            # molecules, so the per-q residual statistic must
+                            # be reduced across ranks or the two ranks drift
+                            # into different q-weightings. TP leaves it at
+                            # 1.0 and needs no reduction (same molecules, and
+                            # iq is already all-reduced).
+                            sync_stats=loss_scale < 1.0,
                         )
                         * loss_scale
                     )
@@ -1798,6 +1863,7 @@ def _worker(rank: int, cfg: RunConfig):
                 compute_loss=True,
                 lambda_6=cfg.lambda_6,
                 lambda_7=cfg.lambda_7,
+                lambda_8=cfg.lambda_8,
                 verbose=cfg.verbosity in ("batch", "diagnostic"),
                 start_batch=test_start,
                 resume_state=test_state,

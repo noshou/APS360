@@ -198,7 +198,16 @@ class RunConfig:
         state_dict saved in the checkpoint, which carries `best`,
         `num_bad_epochs`, and `cooldown_counter`.
     weight_decay : float
-        Adam L2 weight decay coefficient.
+        Adam L2 weight decay coefficient. Applied to neither `_out`,
+        `_mbd`, biases, norm/gain params, nor the RFF phases; see the
+        param-group split in Train/train.py.
+    out_lr_mult : float
+        Multiplier on `lr` for OutputHead's own optimizer group. 1.0
+        disables the split.
+    out_beta2 : float
+        Adam beta2 for OutputHead's group. Lower than the 0.999 default so
+        its heteroscedastic gradient stops throttling the step size for
+        ~1000 steps after a spike.
     grad_clip : float
         Max gradient norm for gradient clipping
         (torch.nn.utils.clip_grad_norm_).
@@ -311,6 +320,33 @@ class RunConfig:
     # i.e. a 24x deviation is still only 1 sigma - too loose to keep z off
     # Embed's clamp boundaries, which sit at |z| ~ 1.4 at high q. 0.0 = off.
     lambda_7: float = 0.5
+    # Weight on the q-curvature penalty: L2 on the second difference of z
+    # and of log1p(f_mag) along the q axis. _f0f1/_f2/_sigma each emit Q
+    # INDEPENDENT channels, so nothing couples q_j to q_{j+1}, while the
+    # true I(q) is analytic in q (a finite sum of sinc terms). The model
+    # exploits that: mean log1p(I(q)) over 8165 molecules oscillates +-1.5
+    # nats between ADJACENT grid points against a smooth target. 0.0 = off.
+    #
+    # 1.0 from a 4-seed sweep (40 Adam steps, lambda_1=16, synthetic batch),
+    # median mean d2(z) after training / median MSLE:
+    #     0.0 -> 2.17e+01 / 1.283      1.0 -> 3.09e-01 / 1.123
+    #    20.0 -> 1.79e-02 / 1.454
+    # i.e. 1.0 buys a ~70x roughness reduction at no MSLE cost, while 20.0
+    # over-smooths and starts costing fit. The MSLE spreads overlap across
+    # seeds, so treat the ordering of the roughness column as the signal and
+    # the MSLE column as a "does not obviously hurt" check, not a win.
+    lambda_8: float = 1.0
+    # Exponent on the per-q inverse-RMS rescaling of the MSLE term, [0, 1].
+    # 0 = every q weighted equally (original behaviour); 1 = each q's
+    # residual divided by that q's running RMS, making the objective a
+    # balanced multi-task one. Weights are renormalised to mean 1 so lr and
+    # the other lambdas keep their calibration. NOTE this LOWERS the weight
+    # on high q, where residuals are largest; the rationale is that the
+    # extra gradient there has not helped (per-q R2 is negative past
+    # q~0.22), so the goal is to stop that band crowding out the rest. Set
+    # to 0.0 if high-q R2 degrades.
+    per_q_norm: float = 1.0
+    per_q_momentum: float = 0.99  # EMA window ~1/(1-m) = 100 batches
 
     # training
     lr: float = 1.3e-4
@@ -331,6 +367,21 @@ class RunConfig:
     lr_threshold: float = 1e-3  # relative; val loss must beat best by this
     lr_min: float = 1e-6
     weight_decay: float = 0.1
+    # OutputHead gets its own optimizer group. Its gradient arrives through
+    # coh**2, so d(loss)/dw scales with coh, which spans ~4.5 decades across
+    # the size range; with size-sorted buckets that makes the head's gradient
+    # wildly heteroscedastic batch to batch. A rare spike loads Adam's
+    # exp_avg_sq (1000-step memory at beta2=0.999) while exp_avg (10-step)
+    # decays back to ~0, collapsing the ratio that sets the step size.
+    # Measured at step 10661 of the 2026-08-01 run: gradient SNR
+    # 0.0014-0.0036 against a ~0.18 pure-noise floor, an effective relative
+    # update of 2e-6/step (~0.5% per epoch). The head was still on its
+    # initialisation after 7 epochs. out_beta2 shortens the variance memory
+    # to ~100 steps so a spike stops throttling ~10x sooner; out_lr_mult
+    # covers the residual gap. Set out_lr_mult=1.0 and out_beta2=0.999 to
+    # restore the single-group behaviour.
+    out_lr_mult: float = 10.0
+    out_beta2: float = 0.99
     grad_clip: float = 1.0
     epochs: int = 20
     batcher_seed: int = 0
@@ -381,11 +432,16 @@ class RunConfig:
             "sigma_init_gain",
             "lambda_6",
             "lambda_7",
+            "lambda_8",
+            "per_q_norm",
+            "per_q_momentum",
             "lr",
             "lr_factor",
             "lr_threshold",
             "lr_min",
             "weight_decay",
+            "out_lr_mult",
+            "out_beta2",
             "grad_clip",
             "dataset_frac",
             "ckpt_interval_sec",

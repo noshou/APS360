@@ -45,6 +45,7 @@ class ScatterNetBaseline(Baseline):
         compute_loss: bool = False,
         lambda_6: float | None = None,
         lambda_7: float | None = None,
+        lambda_8: float = 0.0,
         progress: bool = False,
         n_batch: int = 0,
         dtype: torch.dtype = torch.float16,
@@ -67,7 +68,7 @@ class ScatterNetBaseline(Baseline):
             batch this baseline is called on (see class docstring). If False
             (default), no loss stats are collected and `loss_r2()` returns
             NaNs.
-        lambda_6, lambda_7 : float, optional
+        lambda_6, lambda_7, lambda_8 : float, optional
             Loss weights forwarded to `model.compute_loss`; required when
             `compute_loss` is True.
         progress : bool
@@ -110,6 +111,7 @@ class ScatterNetBaseline(Baseline):
         self._compute_loss = compute_loss
         self._lambda_6 = lambda_6
         self._lambda_7 = lambda_7
+        self._lambda_8 = lambda_8
         self._progress = progress
         self._n_batch = n_batch
         self._dtype = dtype
@@ -188,7 +190,7 @@ class ScatterNetBaseline(Baseline):
         with torch.autocast(
             device_type="cuda", dtype=self._dtype, enabled=self._amp
         ):
-            iq, fmags, sigmas, local_batch, _ = self._model(batch)
+            iq, fmags, sigmas, zsigs, local_batch, _ = self._model(batch)
             # Composite loss/R2 as a side effect, in the same forward pass, so
             # plots eval doubles as the test loss/R2 eval. Computed inside
             # autocast + with the raw (unclamped) iq, matching
@@ -202,9 +204,11 @@ class ScatterNetBaseline(Baseline):
                     iq,
                     fmags,
                     sigmas,
+                    zsigs,
                     local_batch,
                     lambda_6,
                     lambda_7,
+                    self._lambda_8,
                 )
                 iqf = iq.float()
                 n = local_batch.iqval.shape[0]
@@ -275,6 +279,7 @@ def save_epoch_plots(
     compute_loss: bool = False,
     lambda_6: float | None = None,
     lambda_7: float | None = None,
+    lambda_8: float = 0.0,
     verbose: bool = False,
     start_batch: int = 0,
     resume_state: dict | None = None,
@@ -336,7 +341,7 @@ def save_epoch_plots(
         If True, the pass also returns (test_loss, test_r2). If False
         (default), the return value is (nan, nan) and only plots are
         produced.
-    lambda_6, lambda_7 : float, optional
+    lambda_6, lambda_7, lambda_8 : float, optional
         Loss weights, required when `compute_loss` is True.
     verbose : bool
         Print a progress line every 20 batches (rank 0 only).
@@ -371,6 +376,7 @@ def save_epoch_plots(
         compute_loss=compute_loss,
         lambda_6=lambda_6,
         lambda_7=lambda_7,
+        lambda_8=lambda_8,
         progress=verbose and rank == 0,
         n_batch=start_batch + len(loader),  # type: ignore[arg-type]
         start_seen=start_batch,
@@ -676,7 +682,7 @@ _CFG_SECTIONS: list[tuple[str, tuple[str, ...]]] = [
             "eps_msgp",
         ),
     ),
-    ("Loss", ("lambda_6", "lambda_7")),
+    ("Loss", ("lambda_6", "lambda_7", "lambda_8")),
     (
         "Training",
         (
