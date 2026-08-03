@@ -537,7 +537,6 @@ def evaluate(
                 loss = model.compute_loss(
                     iq,
                     fmags,
-                    sigmas,
                     local_batch,
                     cfg.lambda_6,
                 )
@@ -1494,7 +1493,6 @@ def _worker(rank: int, cfg: RunConfig):
                         model.compute_loss(
                             iq,
                             fmags,
-                            sigmas,
                             local_batch,
                             cfg.lambda_6,
                         )
