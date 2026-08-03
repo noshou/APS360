@@ -180,7 +180,6 @@ class OutputHead(nn.Module):
             Float[torch.Tensor, "N Q"],   # noqa: F722
             Float[torch.Tensor, "N M Q"], # noqa: F722
             Float[torch.Tensor, "N M Q"], # noqa: F722
-            Float[torch.Tensor, "N M Q"], # noqa: F722
         ]:
 
         """Accumulate the two Debye limits over atom chunks.
@@ -209,10 +208,6 @@ class OutputHead(nn.Module):
             `f_mags`, per-atom form factor magnitudes, shape (N, M, Q).
         torch.Tensor
             `sigmas`, per-atom kernel bandwidth, shape (N, M, Q).
-        torch.Tensor
-            `z_sigma`, Embed's pre-saturation sigma exponent offset, shape
-            (N, M, Q). Passed straight through from Embed for the loss's
-            sigma penalty; nothing in this module reads it.
         """
 
         # 1. initialize values
@@ -249,13 +244,7 @@ class OutputHead(nn.Module):
         # square has to wait until every shard has been reduced in.
         f_mags = msg_head.f_mags.squeeze(-1)
         sigmas = msg_head.sigmas.squeeze(-1)
-        # z_sigma survives MessagePass's _replace untouched, so it is always
-        # populated here; assert rather than silently emitting zeros, which
-        # would disable the sigma penalty without failing.
-        if msg_head.z_sigma is None:
-            raise ValueError("msg_head.z_sigma is None; Embed must set it")
-        z_sigma = msg_head.z_sigma.squeeze(-1)
-        return coh_accum, inc_accum, f_mags, sigmas, z_sigma
+        return coh_accum, inc_accum, f_mags, sigmas
 
     @staticmethod
     @jaxtyped(typechecker=beartype)
@@ -272,9 +261,9 @@ class OutputHead(nn.Module):
         atom dimension gets split:
 
         - the `_out_chunk` loop in `forward`, handled by accumulating
-          over all chunks before returning
+        over all chunks before returning
         - the TP atom shard in `ScatterNet.forward`, handled by
-          all-reducing across ranks before calling this
+        all-reducing across ranks before calling this
 
         Neither failure raises. Both still train and still lower the
         loss, they just fit a systematically wrong low-q limit, so the

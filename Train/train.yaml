@@ -15,7 +15,7 @@ ckpt_best: scatternet_best.pt
 ckpt_dir:  checkpoints
 
 # Everything the run records, per epoch, under {data_dir}/epoch_{N:03d}/: metrics.json
-# (that epoch's train/val/test loss + R2), loss_per_batch.png, loss_per_epoch.png, and
+# (that epoch's train/val/test loss + R2), loss_per_epoch.png, and
 # baseline-style diagnostic plots on the test set (per-q R2, per-q percent error, Kratky
 # overlay, residual histogram, error-vs-atom-count). The diagnostic plots reuse
 # Baselines/metrics.py unmodified (see Train/eval_plots.py) so they are directly
@@ -58,36 +58,10 @@ eps_msgp: 1.0e-3
 # loss (RunConfig.__post_init__ coerces these to float, so an int like `1` won't
 # crash later inside the beartype-guarded Loss.loss() call -- still write 1.0, not 1)
 lambda_6: 1.0
-# 0.0 = sigma penalty off; see RunConfig.lambda_7. MUST stay non-zero: this
-# weights BOTH sigma terms, including the pre-saturation one that is the only
-# thing able to pull a runaway z back off Embed's tanh tails. With it at 0.0
-# sigma is unconstrained and ratchets toward the tails monotonically (measured
-# on the 2026-08-01 run: 4.1% of (atom, q) pairs saturated at step 207, 38.5%
-# at step 10661, 95.8% by the end of the run before it).
-lambda_7: 0.5
-# q-curvature penalty: L2 on the second difference of z and log1p(f_mag) along
-# the q axis. _f0f1/_f2/_sigma emit Q INDEPENDENT channels, so nothing couples
-# q_j to q_{j+1}, while the true I(q) is analytic in q. The model exploits that:
-# mean log1p(I(q)) over 8165 molecules swings +-1.5 nats (~20x) between ADJACENT
-# grid points against a smooth target. 0.0 = off.
-# 1.0 from a 4-seed sweep: 0.0 -> mean d2(z) 2.17e+01, 1.0 -> 3.09e-01 (~70x
-# smoother, no MSLE cost), 20.0 -> 1.79e-02 but MSLE degrades. See RunConfig.
-lambda_8: 1.0
-
-# Per-q inverse-RMS rescaling of the MSLE term, exponent in [0, 1]. 0 = every
-# q weighted equally (original); 1 = full normalisation, renormalised to mean 1
-# so lr and the lambdas keep their calibration. This LOWERS the weight on high
-# q, where residuals are largest -- deliberately, since the extra gradient there
-# has not helped (per-q R2 goes negative past q~0.22). Set to 0.0 to revert.
-per_q_norm:     1.0
-per_q_momentum: 0.99   # EMA window ~100 batches
 
 # optimiser / training loop
 lr:            1.3e-4
 weight_decay:  0.1
-# OutputHead's own group; see RunConfig.out_lr_mult / out_beta2.
-out_lr_mult:   10.0
-out_beta2:     0.99
 grad_clip:     1.0
 epochs:        20
 batcher_seed:  0

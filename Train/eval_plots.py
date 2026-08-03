@@ -44,8 +44,6 @@ class ScatterNetBaseline(Baseline):
         device: str,
         compute_loss: bool = False,
         lambda_6: float | None = None,
-        lambda_7: float | None = None,
-        lambda_8: float = 0.0,
         progress: bool = False,
         n_batch: int = 0,
         dtype: torch.dtype = torch.float16,
@@ -68,8 +66,8 @@ class ScatterNetBaseline(Baseline):
             batch this baseline is called on (see class docstring). If False
             (default), no loss stats are collected and `loss_r2()` returns
             NaNs.
-        lambda_6, lambda_7, lambda_8 : float, optional
-            Loss weights forwarded to `model.compute_loss`; required when
+        lambda_6 : float, optional
+            Loss weight forwarded to `model.compute_loss`; required when
             `compute_loss` is True.
         progress : bool
             Print a progress line every 20 batches.
@@ -110,8 +108,6 @@ class ScatterNetBaseline(Baseline):
         self._device = device
         self._compute_loss = compute_loss
         self._lambda_6 = lambda_6
-        self._lambda_7 = lambda_7
-        self._lambda_8 = lambda_8
         self._progress = progress
         self._n_batch = n_batch
         self._dtype = dtype
@@ -190,25 +186,21 @@ class ScatterNetBaseline(Baseline):
         with torch.autocast(
             device_type="cuda", dtype=self._dtype, enabled=self._amp
         ):
-            iq, fmags, sigmas, zsigs, local_batch, _ = self._model(batch)
+            iq, fmags, sigmas, local_batch, _ = self._model(batch)
             # Composite loss/R2 as a side effect, in the same forward pass, so
             # plots eval doubles as the test loss/R2 eval. Computed inside
             # autocast + with the raw (unclamped) iq, matching
             # train.py evaluate() exactly.
             if self._compute_loss:
-                lambda_6, lambda_7 = self._lambda_6, self._lambda_7
-                assert lambda_6 is not None and lambda_7 is not None, (
-                    "lambda_6/lambda_7 required when compute_loss is True"
+                lambda_6 = self._lambda_6
+                assert lambda_6 is not None, (
+                    "lambda_6 required when compute_loss is True"
                 )
                 loss = self._model.compute_loss(
                     iq,
                     fmags,
-                    sigmas,
-                    zsigs,
                     local_batch,
                     lambda_6,
-                    lambda_7,
-                    self._lambda_8,
                 )
                 iqf = iq.float()
                 n = local_batch.iqval.shape[0]
@@ -278,8 +270,6 @@ def save_epoch_plots(
     rank: int,
     compute_loss: bool = False,
     lambda_6: float | None = None,
-    lambda_7: float | None = None,
-    lambda_8: float = 0.0,
     verbose: bool = False,
     start_batch: int = 0,
     resume_state: dict | None = None,
@@ -341,8 +331,8 @@ def save_epoch_plots(
         If True, the pass also returns (test_loss, test_r2). If False
         (default), the return value is (nan, nan) and only plots are
         produced.
-    lambda_6, lambda_7, lambda_8 : float, optional
-        Loss weights, required when `compute_loss` is True.
+    lambda_6 : float, optional
+        Loss weight, required when `compute_loss` is True.
     verbose : bool
         Print a progress line every 20 batches (rank 0 only).
     start_batch : int
@@ -375,8 +365,6 @@ def save_epoch_plots(
         device,
         compute_loss=compute_loss,
         lambda_6=lambda_6,
-        lambda_7=lambda_7,
-        lambda_8=lambda_8,
         progress=verbose and rank == 0,
         n_batch=start_batch + len(loader),  # type: ignore[arg-type]
         start_seen=start_batch,
@@ -423,73 +411,6 @@ def save_epoch_plots(
             flush=True,
         )
     return baseline.loss_r2()
-
-
-def save_batch_loss_plot(
-    batch_losses: list[tuple[int, float]], data_dir: str, epoch: int
-) -> None:
-    """Plot this epoch's per-batch training loss into the epoch's plot dir.
-
-    Cheap: `batch_losses` is data already collected in the training loop (no
-    extra forward passes, no model call). On a mid-epoch resume the
-    list starts at the resume point, so the recorded batch index (not the list
-    position) drives the x-axis - the pre-resume stretch is left honestly blank
-    rather than shifting the whole curve left.
-
-    Also writes `loss_per_batch.json` (the exact `batch_losses` this plot
-    draws from) alongside the PNG, so the raw per-batch numbers survive
-    independent of the image.
-
-    Parameters
-    ----------
-    batch_losses : list of (int, float)
-        (global batch index, training loss) for each batch trained this epoch.
-    data_dir : str
-        Root plots directory; files are written to
-        `{data_dir}/epoch_{epoch:03d}/loss_per_batch.{png,json}`, alongside
-        the epoch's diagnostic plots.
-    epoch : int
-        Current epoch number.
-
-    Returns
-    -------
-    None
-    """
-    import matplotlib.pyplot as plt
-
-    from Baselines.run.metrics import (
-        TEXT_PRIMARY,
-        _configure_mpl,
-        _style_axes,
-        _write_json,
-    )
-
-    if not batch_losses:
-        return
-    _configure_mpl()
-    epoch_dir = os.path.join(data_dir, f"epoch_{epoch:03d}")
-    os.makedirs(epoch_dir, exist_ok=True)
-
-    xs = [b for b, _ in batch_losses]
-    ys = [loss for _, loss in batch_losses]
-
-    json_path = os.path.join(epoch_dir, "loss_per_batch.json")
-    _write_json({"batch": xs, "loss": ys}, json_path)
-    print(f"  [plots] wrote {json_path}", flush=True)
-
-    fig, ax = plt.subplots(figsize=(11, 6))
-    ax.plot(xs, ys, color=TEXT_PRIMARY, linewidth=1.2)
-    ax.set_yscale(
-        "log"
-    )  # loss spans well over an order of magnitude within an epoch
-    ax.set_xlabel("batch", color=TEXT_PRIMARY)
-    ax.set_ylabel("training loss", color=TEXT_PRIMARY)
-    _style_axes(ax)
-    fig.tight_layout()
-    out_path = os.path.join(epoch_dir, "loss_per_batch.png")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
-    plt.close(fig)
-    print(f"  [plots] wrote {out_path}", flush=True)
 
 
 def save_epoch_metrics(record: dict, data_dir: str, epoch: int) -> None:
@@ -682,7 +603,7 @@ _CFG_SECTIONS: list[tuple[str, tuple[str, ...]]] = [
             "eps_msgp",
         ),
     ),
-    ("Loss", ("lambda_6", "lambda_7", "lambda_8")),
+    ("Loss", ("lambda_6",)),
     (
         "Training",
         (

@@ -395,7 +395,6 @@ def _parse_args():
 
     # loss
     p.add_argument("--lambda_6", type=float, default=None)
-    p.add_argument("--lambda_7", type=float, default=None)
 
     # training
     p.add_argument("--lr", type=float, default=None)
@@ -470,7 +469,7 @@ def evaluate(
     model : ScatterNet
         Model to evaluate; called in `eval()` mode.
     cfg : RunConfig
-        Run configuration, used for `lambda_6` and `lambda_7`.
+        Run configuration, used for `lambda_6`.
     device : str
         Torch device to move batch tensors to.
     rank : int
@@ -534,16 +533,13 @@ def evaluate(
             with torch.autocast(
                 device_type="cuda", dtype=torch.float16, enabled=amp
             ):
-                iq, fmags, sigmas, zsigs, local_batch, _ = model(batch)
+                iq, fmags, sigmas, local_batch, _ = model(batch)
                 loss = model.compute_loss(
                     iq,
                     fmags,
                     sigmas,
-                    zsigs,
                     local_batch,
                     cfg.lambda_6,
-                    cfg.lambda_7,
-                    cfg.lambda_8,
                 )
             iq = iq.float()  # R2/metrics accumulate in fp32 regardless of AMP
             n = local_batch.iqval.shape[0]
@@ -675,7 +671,7 @@ def _worker(rank: int, cfg: RunConfig):
         print(
             f"lr={cfg.lr}  epochs={cfg.epochs}  λ1={cfg.lambda_1}  "
             f"λ2={cfg.lambda_2}  λ3={cfg.lambda_3}  λ4={cfg.lambda_4}  "
-            f"λ5={cfg.lambda_5}  λ6={cfg.lambda_6}  λ7={cfg.lambda_7}"
+            f"λ5={cfg.lambda_5}  λ6={cfg.lambda_6}"
         )
 
     # data
@@ -1000,8 +996,6 @@ def _worker(rank: int, cfg: RunConfig):
         sigma_floor=cfg.sigma_floor,
         sigma_init_gain=cfg.sigma_init_gain,
         dp_atom_threshold=cfg.dp_atom_threshold,
-        per_q_norm=cfg.per_q_norm,
-        per_q_momentum=cfg.per_q_momentum,
         compile=cfg.compile,
     ).to(device)
 
@@ -1024,26 +1018,11 @@ def _worker(rank: int, cfg: RunConfig):
     # 52 of 211 rows with exp_avg_sq == 0 (never once seen in the data)
     # shrinking monotonically toward zero. Decay is only meaningful for a
     # param the loss actually pushes back on.
-    #
-    # `_out` gets its own group at `out_lr_mult` x the base LR. Its gradient
-    # arrives through coh**2, so d(loss)/dw scales with coh, which spans
-    # ~4.5 decades across the size range; combined with size-sorted buckets
-    # that makes its gradient wildly heteroscedastic batch to batch. A rare
-    # spike loads Adam's exp_avg_sq (1/(1-beta2) = 1000-step memory) while
-    # exp_avg (10-step) decays back to ~0, so the ratio that sets the step
-    # size collapses. Measured at step 10661: gradient SNR 0.0014-0.0036
-    # against a ~0.18 pure-noise floor, i.e. an effective relative update of
-    # 2e-6/step, ~0.5% over a whole epoch. The head was still sitting on its
-    # initialisation after 7 epochs, which is why the two-channel change
-    # could not be evaluated. beta2 is dropped for this group too, so the
-    # variance estimate forgets a spike in ~100 steps instead of ~1000.
-    decay_params, no_decay_params, out_params = [], [], []
+    decay_params, no_decay_params = [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if name.startswith("_out."):
-            out_params.append(param)
-        elif (
+        if (
             name.endswith(".bias")
             or "rms_norm" in name
             or "prelu" in name
@@ -1058,12 +1037,6 @@ def _worker(rank: int, cfg: RunConfig):
         [
             {"params": decay_params, "weight_decay": cfg.weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
-            {
-                "params": out_params,
-                "weight_decay": 0.0,
-                "lr": cfg.lr * cfg.out_lr_mult,
-                "betas": (0.9, cfg.out_beta2),
-            },
         ],
         lr=cfg.lr,
         decoupled_weight_decay=True,
@@ -1110,6 +1083,10 @@ def _worker(rank: int, cfg: RunConfig):
     best_val = float("inf")
     # batches to skip in the first resumed epoch (exact mid-epoch resume)
     resume_skip = 0
+    # (batch_idx, grad_norm) already recorded for the interrupted epoch,
+    # carried across the resume so the distribution isn't fragmented by
+    # restarts (this run checkpoints every ckpt_interval_sec).
+    resume_grad_norms: list[tuple[int, float]] = []
     # which stage of start_epoch to resume into: None (fresh epoch, run
     # train → val → test as normal), or "val"/"test" to skip the stage(s)
     # that were already finished when the checkpoint was written.
@@ -1128,21 +1105,23 @@ def _worker(rank: int, cfg: RunConfig):
         # weights. The scheduler's OWN state (best, num_bad_epochs) is
         # path-dependent and restored separately just below - unlike the old
         # ExponentialLR, it cannot be recomputed from the epoch number.
-        # Checkpoints written before OutputHead got its own param group hold
-        # 2 groups, not 3, and torch's error for that is opaque. The state is
-        # not remappable either: `state` is keyed by the param's index in the
-        # flattened group order, and moving _out's params into a third group
-        # shifts every index after them, so a "best effort" partial load would
-        # silently attach the wrong Adam moments to the wrong tensors.
+        # The optimizer param-group layout has changed twice: a third group
+        # for _out was added, then removed again. torch's error for a group
+        # count mismatch is opaque, and the state is not remappable either,
+        # since `state` is keyed by the param's index in the flattened group
+        # order, so adding or removing a group shifts every index after it
+        # and a "best effort" partial load would silently attach the wrong
+        # Adam moments to the wrong tensors.
         n_ckpt = len(ckpt["optimizer"]["param_groups"])
         n_live = len(optimizer.param_groups)
         if n_ckpt != n_live:
             raise RuntimeError(
                 f"optimizer param-group mismatch: checkpoint has {n_ckpt}, "
-                f"this build has {n_live}. {cfg.resume} predates the "
-                "OutputHead param-group split. Adam moments cannot be "
-                "remapped across it. Either start a fresh run, or resume "
-                "weights only by loading ckpt['model'] with cfg.resume unset."
+                f"this build has {n_live}. {cfg.resume} was written under a "
+                "different param-group layout (OutputHead's separate group "
+                "was added, then removed). Adam moments cannot be remapped "
+                "across it. Either start a fresh run, or resume weights only "
+                "by loading ckpt['model'] with cfg.resume unset."
             )
         optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
@@ -1188,6 +1167,7 @@ def _worker(rank: int, cfg: RunConfig):
         if resume_phase == "train":
             resume_skip = resume_phase_skip
             resume_phase = None  # training loop needs no phase-skip logic
+        resume_grad_norms = list(ckpt.get("grad_norms", []))
         if rank == 0:
             resumed_lr = optimizer.param_groups[0]["lr"]
             print(
@@ -1390,6 +1370,7 @@ def _worker(rank: int, cfg: RunConfig):
                 "scheduler": scheduler.state_dict(),
                 "scaler": scaler.state_dict(),
                 "best_val": best_val,
+                "grad_norms": batch_grad_norms,
                 "lr": optimizer.param_groups[0]["lr"],
                 "q_grid": q_grid,
                 "energy": energy,
@@ -1430,8 +1411,18 @@ def _worker(rank: int, cfg: RunConfig):
         train_sum_y = 0.0
         train_sum_y2 = 0.0
         train_n_elem = 0
-        # (batch_idx, loss) for this epoch's per-batch loss plot
-        batch_losses: list[tuple[int, float]] = []
+        # (batch_idx, grad_norm) PRE-clip, for this epoch. Recorded because
+        # grad_clip is only meaningful relative to the norms actually seen:
+        # at grad_clip=1.0 against a measured |g| of 10-18 the clip fires on
+        # every step, which is gradient normalisation rather than a safety
+        # valve, and the clip factor then varies with molecule size (buckets
+        # are size-sorted), systematically downweighting large molecules.
+        # Set grad_clip off the p99 of this series. inf entries are real:
+        # that is an fp16 overflow batch that GradScaler then skipped.
+        batch_grad_norms: list[tuple[int, float]] = (
+            resume_grad_norms if is_resumed_epoch else []
+        )
+        resume_grad_norms = []
 
         torch.cuda.empty_cache()
 
@@ -1494,9 +1485,7 @@ def _worker(rank: int, cfg: RunConfig):
                 with torch.autocast(
                     device_type="cuda", dtype=torch.float16, enabled=amp
                 ):
-                    iq, fmags, sigmas, zsigs, local_batch, loss_scale = model(
-                        batch
-                    )
+                    iq, fmags, sigmas, local_batch, loss_scale = model(batch)
             with loop_prof.section("loss", rec):
                 with torch.autocast(
                     device_type="cuda", dtype=torch.float16, enabled=amp
@@ -1506,19 +1495,8 @@ def _worker(rank: int, cfg: RunConfig):
                             iq,
                             fmags,
                             sigmas,
-                            zsigs,
                             local_batch,
                             cfg.lambda_6,
-                            cfg.lambda_7,
-                            cfg.lambda_8,
-                            # loss_scale < 1 <=> this batch went down the DP
-                            # path, where each rank holds a DIFFERENT set of
-                            # molecules, so the per-q residual statistic must
-                            # be reduced across ranks or the two ranks drift
-                            # into different q-weightings. TP leaves it at
-                            # 1.0 and needs no reduction (same molecules, and
-                            # iq is already all-reduced).
-                            sync_stats=loss_scale < 1.0,
                         )
                         * loss_scale
                     )
@@ -1683,7 +1661,7 @@ def _worker(rank: int, cfg: RunConfig):
             batch_loss = loss.item()
             train_loss_sum += batch_loss * n
             train_mols += n
-            batch_losses.append((_bi, batch_loss))
+            batch_grad_norms.append((_bi, grad_norm.item()))
             with torch.no_grad():
                 log_pred = torch.log1p(iq)
                 log_target = torch.log1p(local_batch.iqval)
@@ -1849,7 +1827,7 @@ def _worker(rank: int, cfg: RunConfig):
             )
 
         if cfg.data_dir:
-            from Train.eval_plots import save_batch_loss_plot, save_epoch_plots
+            from Train.eval_plots import save_epoch_plots
 
             test_loss, test_r2 = save_epoch_plots(
                 model,
@@ -1862,8 +1840,6 @@ def _worker(rank: int, cfg: RunConfig):
                 rank,
                 compute_loss=True,
                 lambda_6=cfg.lambda_6,
-                lambda_7=cfg.lambda_7,
-                lambda_8=cfg.lambda_8,
                 verbose=cfg.verbosity in ("batch", "diagnostic"),
                 start_batch=test_start,
                 resume_state=test_state,
@@ -1871,10 +1847,6 @@ def _worker(rank: int, cfg: RunConfig):
                 ckpt_interval_sec=cfg.ckpt_interval_sec,
             )
             torch.cuda.empty_cache()
-            # cheap: uses batch_losses collected during the loop, no forward
-            # passes
-            if rank == 0:
-                save_batch_loss_plot(batch_losses, cfg.data_dir, epoch)
         else:
             test_loss, test_r2 = evaluate(
                 test_loader,
@@ -2045,8 +2017,7 @@ def main(cfg: RunConfig | None = None):
             eps_embd=A.eps_embd,
             eps_msgp=A.eps_msgp,
             lambda_6=A.lambda_6,
-            lambda_7=A.lambda_7,
-            lr=A.lr,
+                lr=A.lr,
             lr_factor=A.lr_factor,
             lr_patience=A.lr_patience,
             lr_threshold=A.lr_threshold,
