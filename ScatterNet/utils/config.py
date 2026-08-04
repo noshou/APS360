@@ -197,7 +197,14 @@ class RunConfig:
         split in Train/train.py.
     grad_clip : float
         Max gradient norm for gradient clipping
-        (torch.nn.utils.clip_grad_norm_).
+        (torch.nn.utils.clip_grad_norm_). Default 5.0; set it from the p99
+        of train.py's recorded pre-clip `batch_grad_norms`, since a clip
+        below the norms actually seen normalises every step rather than
+        catching outliers.
+    adam_eps : float
+        Adam's denominator epsilon. Default 1e-12 rather than torch's
+        1e-8, so parameters whose gradient RMS is small are not frozen by
+        the epsilon dominating sqrt(v) in the update.
     epochs : int
         Number of full passes over all batches.
     batcher_seed : int
@@ -294,7 +301,9 @@ class RunConfig:
     eps_msgp: float = 1e-3
     sigma_max: float = 100.0
     sigma_floor: float = 0.5
-    sigma_init_gain: float = 0.1
+    # 1.0, not 0.1: NoTrilinBilin now inits from the true fan-in in1*in2
+    # rather than in1, which already divides the bound by sqrt(Q) = 7.14.
+    sigma_init_gain: float = 1.0
 
     # loss
     lambda_6: float = 1.0
@@ -318,7 +327,20 @@ class RunConfig:
     lr_threshold: float = 1e-3  # relative; val loss must beat best by this
     lr_min: float = 1e-6
     weight_decay: float = 0.1
-    grad_clip: float = 1.0
+    # 5.0, not 1.0. train.py records PRE-clip norms in `batch_grad_norms`
+    # precisely because a clip below the norms actually seen is gradient
+    # NORMALISATION, not a safety valve: at 1.0 against a measured |g| of
+    # 10-18 it fired on every step, and since buckets are size-sorted the
+    # clip factor then varied with molecule size, systematically
+    # downweighting large molecules. Retune from the p99 of that series.
+    grad_clip: float = 5.0
+    # Adam eps. 1e-12, not torch's 1e-8: the update is g/(sqrt(v) + eps), so
+    # any parameter whose gradient RMS falls below eps has its step scaled by
+    # g/eps instead of ~1 and is effectively frozen. Measured on the previous
+    # tree, the sigma pathway ran at a per-element grad RMS of 9.4e-13 while
+    # the form-factor heads ran at ~1e0, which froze 59% of the parameters.
+    # The init fixes removed most of that imbalance; this is the insurance.
+    adam_eps: float = 1e-12
     epochs: int = 20
     batcher_seed: int = 0
     atom_size_ceil: int = -1
@@ -373,6 +395,7 @@ class RunConfig:
             "lr_min",
             "weight_decay",
             "grad_clip",
+            "adam_eps",
             "dataset_frac",
             "ckpt_interval_sec",
         ):

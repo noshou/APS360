@@ -11,7 +11,15 @@ from Preprocess import VOCAB
 
 from ..batching import Batch
 from ..utils.no_trilin_bilin import NoTrilinBilin
+from ..utils.sigma_window import arctan_log_sigma_window
 from .layer_head import LayerHead
+
+# Multiplier on `_f0f1`/`_f2`'s default weight init when a physical
+# `f_init` bias is supplied. See `Embed`'s "Form-factor init" docstring
+# section for how this number was chosen; it is a constant rather than a
+# constructor keyword because `Embed.__init__`'s signature is a fixed
+# contract with `ScatterNet.__init__`.
+_F_INIT_WEIGHT_GAIN = 0.05
 
 
 class Embed(nn.Module):
@@ -56,11 +64,6 @@ class Embed(nn.Module):
     less extreme sigma than tanh would (61% of the window vs 71% at the
     run's mean |z| = 2.36); `_sigma`'s weights absorb that.
 
-    This bounds Embed's sigma only. MessagePass then applies
-    `softplus(sig + tanhshrink(...))` per round, which is free to leave
-    [sigma_floor, sigma_max] in either direction, so the window is NOT
-    enforced on the sigma that reaches the kernel or the loss.
-
     env ~ 1/q: sigma is the RBF bandwidth (MessagePass forms r/sigma). In
     I(q) = sum_mm' f f' sinc(q r), sinc first vanishes at q r = pi, so q is
     sensitive to separations O(1/q). Low q sees global geometry, high q
@@ -85,6 +88,30 @@ class Embed(nn.Module):
     Bounds come from the grid: q=0.01 probes 1/q = 100 A (longest resolvable
     scale), q=0.5 probes 2 A. floor=0.5 leaves margin and caps the -r/sigma^2
     term in r/sigma's backward at ~4, versus ~1e6 at the old 1e-3.
+
+    MessagePass re-applies this same window (via the shared
+    `arctan_log_sigma_window`) on every round, so the bound holds on the
+    sigma that actually reaches the kernel and the loss, not just on
+    Embed's output.
+
+    Form-factor init
+    ----------------
+    With ordinary random init the untrained `_f0f1`/`_f2` emit
+    f_mag ~ 0.5 while the physical value is ~7 (vocab mean over the
+    xraydb table). Both OutputHead channels are homogeneous of degree 2
+    in f, so d log I / d log f_mag = 2 exactly, and a 14x error in f is a
+    ~200x error in I(q). At init that single mismatch was 99.5% of the
+    whole gradient norm (`_f0f1` and `_f2` measured at |g| = 96 and 102,
+    against 0.10 for the largest MessagePass weight), which is what the
+    global-norm clip was almost entirely spending itself on.
+
+    Passing `f_init` puts `_f0f1.bias` at the physical curve and
+    `_f2.bias` at zero, so f_mag starts at the right magnitude and the
+    layers only have to learn the per-element correction. The weights are
+    additionally scaled by `_F_INIT_WEIGHT_GAIN = 0.05` so the random part
+    (std ~0.58 at lambda_1 = 128) sits well under the ~7 bias rather than
+    swamping it. The gain does not slow learning: for a linear layer
+    dL/dW = dL/dy * x, which is independent of W's magnitude.
     """
 
     _mbd: nn.Embedding      # atom identity in learned space
@@ -100,7 +127,8 @@ class Embed(nn.Module):
         qgrid: torch.Tensor,
         sigma_max: float = 100.0,
         sigma_floor: float = 0.5,
-        sigma_init_gain: float = 0.1,
+        sigma_init_gain: float = 1.0,
+        f_init: "torch.Tensor | None" = None,
         compile: bool = False
     ) -> None:
         """Construct the embedding, form-factor, and sigma-estimation layers.
@@ -121,8 +149,14 @@ class Embed(nn.Module):
             kernel-weight sum at `message_pass.py:614`, so raising the shared
             constant would have changed the aggregation normalisation too.
         sigma_init_gain : float, optional
-            Multiplier on `_sigma`'s default init. Default 0.1. See the note
+            Multiplier on `_sigma`'s default init. Default 1.0. See the note
             at the call site.
+        f_init : torch.Tensor, optional
+            Physical form-factor magnitudes to bias `_f0f1` toward, shape
+            (Q,). If given, `_f0f1.bias` is set to it and `_f2.bias` to
+            zero so an untrained `Embed` emits `f_mag ~ f_init` instead of
+            a random O(0.5) value. See the "Form-factor init" section of
+            the class docstring. Default None (ordinary random init).
         compile : bool, optional
             If True, torch.compile `_forward_fn`. Default is False.
 
@@ -167,6 +201,14 @@ class Embed(nn.Module):
         self._f2 = nn.Linear(lambda_1, qPoints)
         self._prelu = nn.PReLU(lambda_1)
 
+        # Form-factor init: see the class docstring section of the same name.
+        if f_init is not None:
+            with torch.no_grad():
+                self._f0f1.weight.mul_(_F_INIT_WEIGHT_GAIN)
+                self._f2.weight.mul_(_F_INIT_WEIGHT_GAIN)
+                self._f0f1.bias.copy_(f_init.to(self._f0f1.bias.dtype))
+                self._f2.bias.zero_()
+
         # The F.bilinear op dispatches to aten::_trilinear,
         # which profiled as a top CUDA op here (741ms / 12 calls) and forces
         # a torch.compile graph break. NoTrilinBilin is mathematically
@@ -175,11 +217,17 @@ class Embed(nn.Module):
         self._sigma = NoTrilinBilin(lambda_1, qPoints, qPoints)
 
         # Shrink _sigma's init. Under exp, z is in log-sigma units, so its
-        # init spread is a spread in orders of magnitude: the default gives a
-        # pre-activation std of ~3, i.e. a ~400x spread of kernel range at
-        # step 0, parking many entries against the clamp where the gradient
-        # is zero. The gain puts z near 0, so sigma starts near the envelope.
+        # init spread is a spread in orders of magnitude: a pre-activation
+        # std of ~3 is a ~400x spread of kernel range at step 0, parking
+        # many entries against the window where the gradient is smallest.
+        # The gain puts z near 0, so sigma starts near the envelope.
         # Softplus did not need this, being linear for large z.
+        #
+        # Default is 1.0, not the old 0.1, because NoTrilinBilin's init now
+        # uses the true fan-in `in1*in2` instead of `in1`. That divides the
+        # bound by sqrt(in2) = sqrt(Q) = 7.14 on its own, so gain 1.0 here
+        # reproduces the old 0.1-with-wrong-fan-in scale to within 40%
+        # (0.1/sqrt(128) = 8.8e-3 vs 1.0/sqrt(128*51) = 1.2e-2).
         with torch.no_grad():
             self._sigma.weight.mul_(sigma_init_gain)
             if self._sigma.bias is not None:
@@ -278,10 +326,8 @@ class Embed(nn.Module):
         # would compose their bounds. No `+ eps` needed, unlike softplus:
         # exp is positive and the lower asymptote floors it.
         u = z_sig + log_sigma_env
-        log_sigmas = log_sigma_mid + log_sigma_half * (2.0 / math.pi) * (
-            torch.atan(
-                (math.pi / 2.0) * (u - log_sigma_mid) / log_sigma_half
-            )
+        log_sigmas = arctan_log_sigma_window(
+            u, log_sigma_mid, log_sigma_half
         )
         # masked last so padding atoms come out at 0, not at sigma_floor.
         sigmas = torch.exp(log_sigmas).unsqueeze(-1) * masks.unsqueeze(-1)

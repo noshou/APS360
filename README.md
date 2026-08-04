@@ -192,7 +192,8 @@ Converts each atom's VOCAB index into three tensors that feed the rest of the pi
 
   # sigma: per-atom per-q RFF bandwidth
   _sigma(embed, f_mag)                  (N, M, Q)    bilinear(λ₁, Q) -> Q
-  softplus(...) + ε_e                   (N, M, Q)    strictly positive
+  arctan window(... + log_env)          (N, M, Q)    log σ into (log floor, log max)
+  exp(...)                              (N, M, Q)    strictly positive
     .unsqueeze(-1) * mask.unsqueeze(-1) (N, M, Q, 1) zero padding atoms
   -> sigma                              (N, M, Q, 1)
 
@@ -208,7 +209,7 @@ Converts each atom's VOCAB index into three tensors that feed the rest of the pi
 | Activation        | Location               | Behaviour                                                                        |
 | ------------------- | ------------------------ | ---------------------------------------------------------------------------------- |
 | `nn.PReLU(λ₁)`* | After embedding lookup | Learnable per-channel negative slope. Acts on dim=1, hence the double-transpose. |
-| `F.softplus`      | On sigma logits        | `log(1 + exp(x))`, smooth positive-enforcing.                                    |
+| `arctan_log_sigma_window` | On sigma logits | Squashes log σ into `(log sigma_floor, log sigma_max)`; `exp` then makes it positive. Shared with MessagePass. |
 
 **Comparison of `PReLU`  to other activation functions:*
 
@@ -397,10 +398,10 @@ After the AllReduce, `features` and `chem_env` are divided by the per-molecule r
   # residual embedding update
   new_emb        (Nc, mc, Q, λ₁)  emb_slice + gate
 
-  # sigma update
-  f_in           (Nc, mc, Q, 1)   ffs_slice expanded to Q
-  delta          (Nc, mc, Q, 1)   tanhshrink(sigbilin(new_emb, f_in))
-  new_sig        (Nc, mc, Q, 1)   softplus(sig_slice + delta)
+  # sigma update (rounds 0 .. λ₂-2 only; the last round has no sigma head)
+  f_in           (Nc, mc, Q)      ffs_slice.squeeze(-1), no expand needed
+  delta          (Nc, mc, Q, 1)   ptanhshrink(qdiag(RMSNorm(new_emb), f_in))
+  new_sig        (Nc, mc, Q, 1)   exp(window(log sig_slice + delta)) * mask
 ```
 
 3. **Activations**
@@ -411,21 +412,26 @@ After the AllReduce, `features` and `chem_env` are divided by the per-molecule r
 | `cos`              | RFF feature computation | Core of the RFF kernel approximation.                                                              |
 | `F.mish` (p2 path) | MishGLU gate            | `x*tanh(softplus(x))`. Near zero when p2 << 0 (gate closed); near-linear when p2 >> 0 (gate open). |
 | `nn.RMSNorm`       | After locality/weights  | Normalises aggregate magnitude, preventing residual stream from compounding across rounds.         |
-| `F.tanhshrink`     | Sigma delta             | `x - tanh(x)`. Near zero, output ≈ 0 (sticky region). For large                                   |
-| `F.softplus`       | Sigma output            | Ensures σ > 0 always.                                                                             |
+| `PTanhShrink`      | Sigma delta             | `y - c*tanh(y/c)` with a bounded learned width `c`. Cubic near 0 (sticky region); `f' = tanh²(y/c)`. |
+| `arctan_log_sigma_window` | Sigma output     | Squashes log σ back into `(sigma_floor, sigma_max)` every round. Same function Embed uses.        |
 
 - MishGLU Gate
   `_proj_agg` is `nn.Linear(λ₁, 2λ₁)`. The output is split into p1 (value path) and p2 (gate path). `gate = p1 * Mish(p2)` is added to the atom embedding as a residual. The final `* mask` zeroes contributions from padding atoms.
   The GLU pattern lets the network decide per-channel and per-q-point whether to incorporate the neighbourhood context, rather than always adding the full aggregate.
 - Sigma Update
   ```{rtf}
-  σ_new = softplus( σ_old + tanhshrink( bilinear(e_updated, f_mag) ) )
+  σ_new = exp( window( log σ_old + ptanhshrink( qdiag(RMSNorm(e_updated), f_mag) ) ) )
   ```
 
-  `_sigbilin` is `nn.Bilinear(λ₁, Q, 1)`. The bilinear coupling `e^T W f` makes the sigma delta depend on the interaction between the atom's learned representation and its scattering strength.
-  Tanhshrink is unbounded by design: for large bilinear outputs sigma can shift significantly. Embed's `arctan` saturation on the sigma exponent is the blowup prevention mechanism (it replaced a hard `clamp`; see [The σ ratchet](#the-σ-ratchet-2026-08-02) for why). Note this `softplus(σ + tanhshrink(...))` update is **not** covered by that saturation, which applies only to Embed's round-0 σ, so the `[sigma_floor, sigma_max]` window is not enforced on the σ that reaches the kernel or the loss. The maximum cumulative sigma change is also bounded by λ₂ rounds being small (default 5).
-  The sticky property near zero (tanhshrink ≈ 0, gradient = `1 - sech²(x)` = 0 at x=0) is a beneficial side effect: early in training when the bilinear has weak outputs, sigmas stay stable rather than wandering, then move more freely as the bilinear gains signal.
-  Softplus wraps the whole update to maintain σ > 0, since division by σ in the RFF step cannot encounter zero.
+  `_sigbilin[r]` is a `PTanhShrink` wrapping a `QDiagBilin(λ₁, Q, q_points=Q)`: one weight matrix **per q-point**, so the sigma delta at q depends on that q's embedding coupled against the atom's whole form-factor spectrum. That is `Q * λ₁ * Q` weights per round rather than `λ₁ * Q`, a 51x capacity increase in the sigma path. It costs nothing in memory because the output index and the input's q axis are the same index: contracting λ₁ first gives `(Nc, mc, Q, Q)` and never materializes the `(Nc, mc, Q, Q, Q)` a generic bilinear would (1.012 GiB vs 20.3 MiB at `(4, 512, 51)`).
+
+  The update is additive in **log** space and is squashed back into `(sigma_floor, sigma_max)` by the same `arctan_log_sigma_window` Embed uses, so the window now binds the σ that actually reaches the kernel and the loss, not just Embed's round-0 σ. This is load-bearing: σ is the RBF bandwidth and the kernel forms `r/σ`, so `d(kernel)/dσ` carries a `σ^-2` pole. The previous `squareplus(σ + tanhshrink(...))` was unbounded below (it asymptotes to `b/(4|x|) -> 0⁺`), which discarded the window on round 1: measured `min σ = 0.0107` with **41% of entries under Embed's 0.5 floor**, and `|dL/dσ|` reaching 1.5e8 at σ = 0.002 against 2.4e3 at the floor, an exact `σ^-2` scaling. Under a global-norm clip that rescaled every other parameter's gradient toward zero, which is what made the σ pathway untrainable.
+
+  The head reads `RMSNorm(new_emb)`, not the raw residual. It was the only unnormalized linear map in the block, with a pre-activation std of `sqrt(Q/3)*std(e)*f_rms` ≈ 25-90, which in log-σ units saturates the window immediately.
+
+  The sticky property near zero is retained and is now explicit: `PTanhShrink` is cubic near the origin (`f(y) ≈ y³/3c²`, `f' = tanh²(y/c)`), so early in training when the bilinear has weak outputs sigmas stay stable rather than wandering. Its width `c` is **bounded** rather than free, because `dg/dc` has the same sign for every `y`: a free `c` has a strictly monotone incentive to grow (measured 1 -> 30 in 600 SGD steps, still climbing), which both closes the layer and makes `dg/dlog_c -> -c` unbounded.
+
+  The last round (`r = λ₂-1`) has **no** sigma head at all. σ feeds the *next* round's kernel and `OutputHead` ignores σ entirely, so that round's σ weights had no path to the loss and measured `grad = None`.
 
 ---
 
@@ -460,7 +466,16 @@ Both channels stay O(1) at every q; the M² scaling comes from the squaring op, 
   Linear(64->32) -> Mish -> Linear(32->16) -> Mish -> Linear(16->8) -> Mish -> Linear(8->4) -> Mish -> Linear(4->2)
 ```
 
-  The ladder always terminates at width 2, one channel each for w and c. No Mish after the final linear; `softplus` is applied to the MLP output. The final layer's bias is initialized to `0.5413`, since `softplus(0.5413) = 1.0` puts both channels at unity at step 0, making `I(0) = (sum f)²` and the high-q limit `sum f²` correct in order of magnitude before any training.
+  The ladder always terminates at width 2, one channel each for w and c. No Mish after the final linear; the two channels then take **different** activations, because the two Debye limits have different sign requirements (see [Why w is signed](#why-w-is-signed)):
+
+  - `c` (incoherent) goes through `SqrP`, square-plus, `(x + sqrt(x² + b))/2` with a learned `b`. It weights `sum_j c_j f_j²`, a sum of squares, so it must stay positive.
+  - `w` (coherent) goes through `PBId`, a bent identity, and is **signed**. `coh` is squared afterwards, so `I(q) >= 0` holds either way.
+
+  The final layer's **weight is scaled by 0.05 and its bias zeroed**, and each channel is given a constant offset solving `PBId(x) = 1` and `SqrP(x) = 1`, so both start at unity at step 0: `I(0) = (sum f)²` is correct before any training. At the default `b = 4` the incoherent offset is exactly `x = 0`, where `SqrP'(0) = 1/2` is at its maximum.
+
+  The offsets are **constants**, and in particular contain no `M`. An intermediate version targeted `w = c = 1/sqrt(M)` instead; that makes `coh = sqrt(M)*f` and so `I(0) = M*f²`, a factor of M *below* the true `(sum f)² = M²*f²` (measured `I_pred/I_true` = 1.7e-2 at M=64 down to 3.0e-4 at M=3426), which in a log-space loss is a multi-nat residual that does not shrink with training. It also computed `M` from the **chunk** mask rather than the molecule's, so identical weights on the same batch gave I values spanning 82x across `atm_chunk` in {64 … 1024}. With the constant offsets, `I_pred/I_true = 1.09` at init and chunk-invariance is exact to fp32 accumulation order (5e-7 relative).
+
+  Note this init is correct at `q -> 0` **only**. With `w = c = 1` at every q the head emits `(sum f)² + sum f²` across the whole grid, so the high-q limit starts too large by a factor of ~M (measured on real geometries: 351% error at 28 atoms, 33 047% at 3 426, 96 985% at 5 436). Reaching `sum f²` requires `w -> 1/sqrt(M)` at high q, which is what the signed channel exists to make reachable.
 2. **Forward Pass**
 
 ```{rtf}
@@ -481,8 +496,8 @@ Both channels stay O(1) at every q; the M² scaling comes from the squaring op, 
   bilinear(emb_c, fmag_c)      (N, mc, Q, λ₃)  λ₁-vec x 1-scalar -> λ₃ features
   F.mish(...)                  (N, mc, Q, λ₃)
   _mlp(...)                    (N, mc, Q, 2)   halving pyramid
-  F.softplus(...)              (N, mc, Q, 2)   positivity constraint
-    [..., 0], [..., 1]         (N, mc, Q)      per-atom channels w, c
+  _pbid([..., :1]).squeeze(-1) (N, mc, Q)      w, coherent   - SIGNED
+  SqrP([..., 1] + inc_offset)  (N, mc, Q)      c, incoherent - positive
 
   w * fmag_c.squeeze(-1)   * mask_c  (N, mc, Q)  coherent, f¹ (NOT squared here)
   c * fmag_c.squeeze(-1)^2 * mask_c  (N, mc, Q)  incoherent, f²
@@ -509,7 +524,18 @@ Both channels stay O(1) at every q; the M² scaling comes from the squaring op, 
 | -------------- | -------------------- | ---------------------------------------------------------- |
 | `F.mish`     | After bilinear     | Applied to bilinear features before the MLP.             |
 | `nn.Mish`    | Between MLP layers | Between each pair of linear layers except the last.      |
-| `F.softplus` | After full MLP     | Ensures both per-atom channels (w, c) are strictly positive. |
+| `SqrP` | On MLP channel 1   | Square-plus `(x + sqrt(x² + b))/2`, learned `b`. Keeps the incoherent channel `c` strictly positive; it weights a sum of squares. Note its negative tail decays as `b/(4|x|)`, not exponentially, so it cannot switch a channel fully off. |
+| `PBId`       | On MLP channel 0   | Bent identity, `w·(sqrt(x²+1)-1)/2 + x + b`. Leaves the coherent channel `w` **signed**. |
+
+#### Why w is signed
+
+`c` weights `sum_j c_j f_j²`, the diagonal term, so it has to be positive. `w` does not: `coh = sum_j w_j f_j` is squared before it reaches `I(q)`, so non-negativity is guaranteed by the architecture rather than by the activation.
+
+Forcing `w > 0` costs the head the only cheap route to the high-q limit. A sum of M strictly-positive terms satisfies `coh >= M · min_j(w_j f_j)`, so it can shrink only if *every* `w_j` shrinks together, toward the molecule-size-dependent value `1/sqrt(M)` (0.577 at M=3, 0.080 at M=156, 0.013 at M=6046). Under `softplus` those sit at pre-activations of −0.25, −2.48 and −4.35, where the derivative has fallen to 0.44, 0.077 and 0.0128 — so the head must learn a size-dependent envelope while its gradient is being suppressed by up to 34x.
+
+A signed `w` reaches the same place by **destructive interference**: the `sqrt(M)` reduction falls out of random-phase cancellation with no size envelope to learn. That is also the physical mechanism. The coherent amplitude is `sum_j f_j exp(i q · r_j)`, and it decays at high q because the phases cancel, not because the atomic amplitudes shrink, so `w_j(q)` acts as a per-atom stand-in for the `cos(q · r_j)` phase factor.
+
+`PBId` rather than a bare identity, `PReLU`, or `Mish`: all four are signed, but the channel's job is to *cross zero cleanly*, and only the first two do. `Mish` has its minimum at `x = −1.1924` where the derivative is 8.3e-6, is non-monotonic on the negatives (each value is reachable from two pre-activations), and clamps them at −0.309 while leaving the positives unbounded. `PReLU`'s kink sits exactly at the crossing point. `PBId` is monotone with `f'(0) = 1` and `f' ∈ (1 − |w|/2, 1 + |w|/2)`, and its learned bend `w` interpolates between the exact identity (`w = 0`) and the standard bent identity (`w = 1`). It is left unconstrained; past `|w| = 2` it loses monotonicity and folds, so bound it with `2·tanh` if a run drives it there.
 
 ---
 
@@ -852,7 +878,7 @@ If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remo
 | `compile`           | True    | torch.compile Embed/MessagePass/OutputHead's checkpointed step functions (fullgraph=True, dynamic=True).                                                                                                                                 |
 | `amp`               | False   | fp16 autocast + GradScaler (CUDA only). **Leave off.** The GradScaler collapsed below 1.0 in the previous run and silently zeroed every gradient upstream of `_out._bilinear`; see the AMP note below.                                   |
 | `amp_init_scale`    | 1024    | GradScaler starting loss scale when`amp` is on. Lower than torch's 65536 because activations are ~O(1) after mean-normalization.                                                                                                         |
-| `eps_embd`          | 1e-8    | Numerical floor in Embed (softplus, hypot).                                                                                                                                                                                              |
+| `eps_embd`          | 1e-8    | Numerical floor in Embed (hypot, form factors).                                                                                                                                                                                              |
 | `eps_msgp`          | 1e-3    | Numerical floor in MessagePass (sigma clamp, aggregate denominator).                                                                                                                                                                     |
 | `lr`                | 1.3e-4  | Adam learning rate (starting value; see`lr_factor`).                                                                                                                                                                                     |
 | `lr_factor`         | 0.5     | ReduceLROnPlateau decay factor, applied when val loss stops improving. 1.0 = no decay.                                                                                                                                                   |
@@ -913,13 +939,14 @@ Batch
             └─ _AllReduce (features, chem_env)
             └─ mean-normalise features/chem_env by per-molecule atom count (fp16 safety)
             └─ _pass_2: locality, weights, agg, MishGLU gate -> new embeds
-                        bilinear + tanhshrink + softplus      -> new sigmas
+                        qdiag + ptanhshrink + arctan window   -> new sigmas
        └─ LayerHead: embeds (N,M,Q,λ₁), sigmas updated, f_mags unchanged
 
   └─ OutputHead
        └─ [per M-chunk]
             └─ bilinear(embeds, f_mags) -> (N,mc,Q,λ₃)
-            └─ Mish -> MLP -> softplus  -> (N,mc,Q,2) -> w, c
+            └─ Mish -> MLP -> (N,mc,Q,2) -> PBId -> w (signed)
+                                         └─ SqrP     -> c (positive)
             └─ w * f_mags  * mask -> sum over atoms -> coh_accum (N,Q)
             └─ c * f_mags² * mask -> sum over atoms -> inc_accum (N,Q)
        └─ returns coh_accum, inc_accum UNSQUARED  (N,Q) each
@@ -1081,7 +1108,13 @@ Worst-rank = the epoch-limiting rank (always rank 1 here, see the TP shard-imbal
 
 ### Low-q coherent limit
 
-**Symptom**: percent error at low q climbing off the chart epoch after epoch while high q converged normally. The Kratky diagnostic plot hid it: `q²·I(q)` multiplies the low-q region by ~0 and so suppresses exactly the band where the amplitude was broken, which is why the curves looked healthier than the error numbers.
+**Symptom**: percent error at low q climbing off the chart epoch after epoch while high q converged normally.
+
+**Correction (2026-08-04)**: an earlier version of this section blamed the "Kratky" diagnostic plot, on the grounds that `q²·I(q)` multiplies the low-q region by ~0 and suppresses the band where the amplitude was broken. That is wrong, and it is wrong about code that does not exist: `plot_kratky` (`Baselines/run/metrics.py:977`) applies no `q²` at all. Its own docstring is accurate ("mean log1p(I(q)) vs q"); only the function name, the filename, and this document called it Kratky.
+
+The plot did hide the failure, but by a different mechanism, and that mechanism is still uncorrected. It draws `mean_j ln(1+I_true(q))` against `mean_j ln(1+I_pred(q))`, averaging the two curves over molecules **separately** (`metrics.py:354-355, 446-447`). That difference is the mean *signed* log residual, so a model over-predicting half the test set by +3 log units and under-predicting the other half by −3 draws two coincident curves. There is no band, no percentile, and no `n` on the figure. `ln(1+I) ≈ 2 ln M + const`, so the mean is also dominated by the largest molecules. The per-molecule residual histogram (`metrics.py:1102`) is the honest counterpart and does not have this defect.
+
+Two related caps also participated: `metrics.py:906-907` clamps the per-q R² axis at `-3.0` and `metrics.py:963-964` clamps per-q percent error at `500%`, both silently, with no off-scale marker. "Climbing off the chart" was literal.
 
 **Root cause**: the old `OutputHead` could not represent the low-q limit at any parameter setting. Ground truth is the Debye sum `I(q) = sum_i sum_j f_i f_j sinc(q r_ij)`, and its two endpoints behave very differently in atom count M:
 
@@ -1097,3 +1130,19 @@ That explains the asymmetry in the observed convergence exactly. From standard i
 **Retracted**: an earlier version of this document blamed the `(1 + q²)` Kratky loss weight for starving low-q gradient, with a secondary story about σ being crushed at low q. Both are wrong and are withdrawn. The q-grid here is `q ∈ [0, 0.5] Å⁻¹`, so `1 + q²` spans 1.00 at `q = 0` to 1.25 at `q = 0.5`: a 25% spread across the entire grid. A weight that varies by a quarter cannot starve anything, let alone produce an error gap of orders of magnitude, and the arithmetic should have ruled it out before it was written down.
 
 ---
+
+### The σ⁻² pole (2026-08-03)
+
+**Symptom**: gradients exploding and the clip firing on every step, with the σ pathway simultaneously frozen. At `grad_clip = 1.0` against measured norms of 10-18 the clip was gradient *normalisation*, not a safety valve, and because buckets are size-sorted the clip factor varied with molecule size, systematically downweighting large molecules.
+
+**Root cause**: σ is the RBF bandwidth and the kernel forms `r/σ`, whose backward carries `-r/σ²`. So `∂z/∂σ` has a `σ⁻²` pole and the condition number of the σ → z map is `‖r‖/σ²`. Embed bounds σ into `[0.5, 100]` with an arctan squash precisely to cap that term at ~4. MessagePass then discarded the window on round 1: its `squareplus(σ + shrink(...))` update is unbounded below, asymptoting to `b/(4|x|) → 0⁺`. Measured after one round at init: `min σ = 0.0107`, **41% of entries below Embed's floor**, and `|dL/dσ|` of 1.5e8 at σ = 0.002 against 2.4e3 at the floor, scaling exactly as `σ⁻²`. A global-norm clip against a 1e6-1e8 norm rescales every other parameter's gradient to ~1e-8, which is why the σ and RFF parameters measured grad RMS ~1e-13 and, against Adam's default `eps = 1e-8`, took updates of `lr·g/eps` instead of `lr`: 59% of the model was effectively frozen.
+
+**Fix**: the σ update is now additive in log space and re-squashed by the *same* `arctan_log_sigma_window` Embed uses, every round, so the bound holds on the σ that reaches the kernel and the loss. The head also reads `RMSNorm(new_emb)` rather than the raw residual (it was the only unnormalized linear map in the block, pre-activation std ≈ 25-90), `NoTrilinBilin` inits from the true `in1*in2` fan-in rather than `in1`, `adam_eps` drops to 1e-12, and `grad_clip` rises to 5.0. Measured after: σ ∈ [1.4, 29.2] with 0% below the floor, no parameter with a zero or non-finite gradient, and a global grad norm of 1.1 against 1062 before.
+
+The sigma *penalty* in the loss is gone with it. It was measured identically 0 at init (σ ∈ [1.11, 40.9] against a `4·env` band of [8.0, 400.0]) which made it the only, and dead, gradient path to the σ parameters. The window now bounds σ structurally, so there is nothing left for a penalty to charge for.
+
+### Form-factor init (2026-08-03)
+
+Untrained `Embed` emits `f_mag ~ 0.5` where the physical value is ~7. Since both head channels are homogeneous of degree 2 in `f`, `d log I / d log f_mag = 2` exactly, so that is a ~200x error in `I(q)`, and it measured as **99.5% of the entire gradient norm at init** (`_f0f1` and `_f2` at |g| = 96 and 102, against 0.10 for the largest MessagePass weight). `ScatterNet` now passes a physical `f_init` curve into `Embed`, which biases `_f0f1` onto it and shrinks both weight matrices by `_F_INIT_WEIGHT_GAIN`.
+
+`f_init` averages the **organic** elements (H/C/N/O/P/S), not the whole vocabulary. The vocab is 211 xraydb ions with mean and median `|f|(0)` both ≈ 46.7, but the structures trained on are proteins and viral capsids: `|f|(0)` is 6.0 for C, 7.0 for N, 8.0 for O. Using the vocab mean overshoots by ~6.7x, and since `I ~ f²` that is a ~45x error pointing the wrong way. Measured `I_pred/I_true` at init: 30.3 with the vocab mean, **1.09** with the organic mean.

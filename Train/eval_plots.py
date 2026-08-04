@@ -608,8 +608,13 @@ _CFG_SECTIONS: list[tuple[str, tuple[str, ...]]] = [
         "Training",
         (
             "lr",
+            "lr_factor",
+            "lr_patience",
+            "lr_threshold",
+            "lr_min",
             "weight_decay",
             "grad_clip",
+            "adam_eps",
             "epochs",
             "batcher_seed",
             "atom_size_ceil",

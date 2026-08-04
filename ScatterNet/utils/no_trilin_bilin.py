@@ -70,19 +70,26 @@ class NoTrilinBilin(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """Reset `weight` and `bias` in place, matching `nn.Bilinear`'s scheme.
+        """Reset `weight` and `bias` in place, from the true bilinear fan-in.
 
         Both tensors are drawn from `Uniform(-bound, bound)` with
-        `bound = 1 / sqrt(in1_features)`, identical to `nn.Bilinear`'s own
-        `reset_parameters`, so a freshly constructed model trains from the
-        same initialization distribution regardless of which class is used.
+        `bound = 1 / sqrt(in1_features * in2_features)`.
+
+        `nn.Bilinear` (and this class, previously) uses
+        `1 / sqrt(in1_features)`, which ignores `in2_features` even though
+        the forward sums `in1_features * in2_features` products into every
+        output. That leaves the output variance growing linearly in
+        `in2_features`: at `in2_features = 1` the two bounds agree exactly,
+        but at the `in2_features = Q = 51` call sites it inflated the
+        pre-activation std from 4.0 to 28.4 (max 147), which is a large
+        constant sitting in front of every sigma gradient.
 
         Returns
         -------
         None
         """
 
-        bound = 1 / math.sqrt(self.in1_features)
+        bound = 1 / math.sqrt(self.in1_features * self.in2_features)
         nn.init.uniform_(self.weight, -bound, bound)
         if self.bias is not None:
             nn.init.uniform_(self.bias, -bound, bound)

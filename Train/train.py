@@ -404,6 +404,7 @@ def _parse_args():
     p.add_argument("--lr_min", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
     p.add_argument("--grad_clip", type=float, default=None)
+    p.add_argument("--adam_eps", type=float, default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batcher_seed", type=int, default=None)
     p.add_argument("--atom_size_ceil", type=int, default=None)
@@ -1038,6 +1039,7 @@ def _worker(rank: int, cfg: RunConfig):
             {"params": no_decay_params, "weight_decay": 0.0},
         ],
         lr=cfg.lr,
+        eps=cfg.adam_eps,
         decoupled_weight_decay=True,
     )
 

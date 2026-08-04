@@ -11,7 +11,15 @@ from torch import nn
 
 from ..batching import Batch
 from ..utils.no_trilin_bilin import NoTrilinBilin
+from ..utils.pbid import PBId
+from ..utils.sqrp import SqrP
 from .layer_head import LayerHead
+
+# Multiplier on the terminal Linear's default weight init. Small enough that
+# `raw` does not disturb the w = c = 1 targets (std ~0.5 -> ~0.025), large
+# enough that the backward through it is not degenerate. See the note at the
+# call site in `OutputHead.__init__`.
+_TERMINAL_INIT_GAIN = 0.05
 
 
 class OutputHead(nn.Module):
@@ -32,11 +40,35 @@ class OutputHead(nn.Module):
     like M. Squaring a sum over atoms *is* the pairwise double sum, so the
     coherent term costs one O(M) pass, not O(M^2).
 
-    Both channels stay O(1) at every q; the M^2 scaling comes from the
-    squaring op rather than from learned magnitude. A single linear
-    sum-of-f^2 head cannot reach (sum f)^2 at any parameter setting, and
-    could only fake it by inflating its per-atom weights to ~M, which is
-    what previously made low q converge far slower than high q.
+    The per-atom weights w_j and c_j stay O(1); the M^2 scaling comes from
+    the sum inside the square being O(M), not from learned magnitude. A
+    single linear sum-of-f^2 head cannot reach (sum f)^2 at any parameter
+    setting, and could only fake it by inflating its per-atom weights to
+    ~M, which is what previously made low q converge far slower than
+    high q.
+
+    Initialization
+    --------------
+    Both channels are offset so a zero MLP output gives w = c = 1, i.e.
+    coh = sum_j f_j and inc = sum_j f_j^2 exactly. The head therefore
+    emits the true Debye q->0 limit at step 0 and learns only the
+    correction.
+
+    The target is 1, not 1/sqrt(M). Targeting 1/sqrt(M) makes
+    coh = sqrt(M)*f and so I(0) = M*f^2, which is a factor of M BELOW the
+    true (sum f)^2 = M^2*f^2 (measured ratio 1.7e-2 at M=64 down to
+    3.0e-4 at M=3426). In a log-space loss that is a residual of several
+    nats that does not shrink with training progress, and it is the
+    dominant term the optimizer sees: at w = c = 1 the same replica gives
+    I_pred/I_true = 1.0 and a coherent-path gradient norm of exactly 0,
+    against 14 to 32 for 1/sqrt(M).
+
+    Because the target is a constant, no M appears here at all. That also
+    removes a chunk-dependence bug: M used to be computed from the CHUNK's
+    mask, so identical weights on the same batch gave I values spanning
+    82x across out_chunk in {64 ... 1024}, made checkpoints valid only at
+    their training atm_chunk, and gave each rank a different M under
+    tensor parallelism.
 
     The forward pass is chunked to avoid storing the
     (N, M, Q, lambda_3) bilinear output tensor.
@@ -44,6 +76,8 @@ class OutputHead(nn.Module):
 
     _bilinear: NoTrilinBilin
     _mlp: nn.Sequential
+    _pbid: PBId
+    _sqrp: SqrP
     _fwd_fn: Callable
 
     def __init__(
@@ -89,7 +123,7 @@ class OutputHead(nn.Module):
         if lambda_4 > floor(log2(lambda_3)):
             verr1 = f"lambda_4 must be <= {int(floor(log2(lambda_3)))}"
             verr2 = f" for lambda_3={lambda_3}"
-            verr  = verr1 + verr2
+            verr = verr1 + verr2
             raise ValueError(verr)
         self._bilinear = NoTrilinBilin(lambda_1, 1, lambda_3)
 
@@ -105,11 +139,31 @@ class OutputHead(nn.Module):
             if i < len(dims) - 2:
                 ldicts[f"activation_{i}"] = nn.Mish()
         self._mlp = nn.Sequential(ldicts)
+        self._pbid = PBId(1)
+        self._sqrp = SqrP()
 
-        # terminal layer emits (w, c);
-        # softplus(0.5413) = 1.0 so both channels start
-        # at unity, making I(0) = (Σf)² and high-q = Σf² correct at init.
-        nn.init.constant_(self._mlp[-1].bias, 0.5413) # type: ignore
+        # Terminal layer emits (w, c). Its bias is zeroed and its weight is
+        # shrunk by _TERMINAL_INIT_GAIN so `raw` starts near 0 and the two
+        # channels land on their w = c = 1 targets, i.e. on the true Debye
+        # q->0 limit. Leaving the weight at its default put `raw` at an
+        # O(0.5) random value that swamped the offsets (which are O(0.03) to
+        # O(0.8)), gave I(0) a ~2x error before the model had learned
+        # anything, and pushed E[raw_coh] negative, so the coherent channel
+        # had to be dragged through coh = 0 where dI/dcoh = 2*coh = 0 is a
+        # stationary point of the loss.
+        #
+        # Small, NOT exactly zero. An exactly-zero terminal weight makes
+        # dL/dx = dL/dy @ W.T vanish, which zeroes the gradient of every
+        # parameter upstream of it: measured 35 tensors at |g| = 0 on step
+        # 0, the whole MLP body, the bilinear, all of MessagePass and
+        # Embed's sigma path. The layer itself still learns (dL/dW =
+        # dL/dy * x) and unblocks them on step 2, but there is no reason to
+        # spend a step on that when a small gain gives the same init
+        # accuracy with gradient flowing everywhere immediately.
+        terminal: nn.Linear = self._mlp[-1]  # type: ignore[assignment]
+        with torch.no_grad():
+            terminal.weight.mul_(_TERMINAL_INIT_GAIN)
+            terminal.bias.zero_()
 
         self._fwd_fn = (
             torch.compile(self._forward_fn, dynamic=True, fullgraph=True)
@@ -118,12 +172,14 @@ class OutputHead(nn.Module):
         )
 
     @staticmethod
-    def _forward_fn( # no jaxtype/beartype cuz torch.compile will break
+    def _forward_fn(  # no jaxtype/beartype cuz torch.compile will break
         bilinear: NoTrilinBilin,
         mlp: torch.nn.Sequential,
+        pbid: PBId,
+        sqrp: SqrP,
         emb_c: torch.Tensor,
         fmag_c: torch.Tensor,
-        mask_c: torch.Tensor
+        mask_c: torch.Tensor,
     ) -> Tuple[
         Float[torch.Tensor, "N Q"],  # noqa: F722
         Float[torch.Tensor, "N Q"],  # noqa: F722
@@ -138,6 +194,11 @@ class OutputHead(nn.Module):
         mlp : torch.nn.Sequential
             Compression MLP mapping the bilinear output down to two
             scalars (w, c) per atom per q-point.
+        pbid : PBId
+            Bent identity applied to the coherent channel, which must be
+            able to take signed values.
+        sqrp : SqrP
+            Square-plus activation module applied to the incoherent channel.
         emb_c : torch.Tensor
             Atom embeddings for this chunk, shape (N, Mc, Q, lambda_1).
         fmag_c : torch.Tensor
@@ -158,16 +219,59 @@ class OutputHead(nn.Module):
         # (N,M,Q, λ₁) x (N,M,Q,1) -> (N,M,Q,λ₃)
         atomic = F.mish(bilinear(emb_c, fmag_c))
 
-        # MLP compression -> (N,M,Q,2), split into the two channels
-        chans = F.softplus(mlp(atomic))
-        w, c = chans[..., 0], chans[..., 1]  # (N,M,Q) each
+        # MLP compression -> (N,M,Q,2), split into the two channels.
+        raw = mlp(atomic)
 
-        # fmc**2 is the squared form factor and this reduces over M atoms.
+        # Both channels are offset so that a zero MLP output gives w = c = 1
+        # exactly, i.e. coh = sum_j f_j and inc = sum_j f_j**2, which IS the
+        # Debye q->0 limit. The head therefore starts on the physical answer
+        # and only has to learn the correction. See the "Initialization"
+        # section of the class docstring for why the target is 1 and not
+        # 1/sqrt(M).
+        #
+        # The targets are constants, so there is no M here and nothing that
+        # depends on the chunk. Both inverses stay differentiable in the
+        # activations' own parameters, which is what keeps the "raw = 0 maps
+        # to 1" property true as those parameters move.
+        y = 1.0
+
+        # 1. Coherent channel (w), signed, so it goes through PBId.
+        # Solve PBId(x) = w*(sqrt(x^2+1)-1)/2 + x + b = y for x:
+        #   x = 2[(2z + w) - w*sqrt(z^2 + w*z + 1)] / (4 - w^2),  z = y - b
+        # PBId bounds |w| <= 1.9, so the 4 - w^2 denominator is >= 0.39 and
+        # the radicand's discriminant (w^2 - 4) stays negative; both were
+        # singular when w was unconstrained.
+        w_param = pbid.weight
+        b_param = pbid.bias if pbid.bias is not None else 0.0
+        ymb = y - b_param
+        numerator = 2.0 * ymb + w_param - w_param * torch.sqrt(
+            w_param * ymb + ymb**2 + 1.0
+        )
+        denominator = 2.0 * (1.0 - (w_param**2 / 4.0))
+        target_input_coh = numerator / denominator
+        coh_logits = raw[..., :1] + target_input_coh
+        coh = pbid(coh_logits).squeeze(-1)
+
+        # 2. Incoherent channel (c), strictly positive, so it goes through
+        # SqrP. Solve SqrP(x) = (x + sqrt(x^2 + B)) / 2 = y for x:
+        #   x = y - B / (4y)
+        # At the default B = 4 and y = 1 this is exactly x = 0, where
+        # SqrP'(0) = 1/2 is at its maximum. The old 1/sqrt(M) target put this
+        # at x ~ -sqrt(M) instead, where SqrP' ~ 1/M (1.8e-4 at M = 5436) and
+        # fp16's ulp at that magnitude quantized the channel to a constant.
+        b_param_sqrp = sqrp.b
+        if b_param_sqrp is None:
+            b_param_sqrp = torch.full((), 4.0, device=raw.device)
+        target_input_inc = y - (b_param_sqrp / (4.0 * y))
+        inc_logits = raw[..., 1:] + target_input_inc
+        c = sqrp(inc_logits).squeeze(-1)  # (N, Mc, Q)
+
+        # Reduce over Mc atoms per chunk with autocast disabled for precision
         with torch.autocast(device_type=emb_c.device.type, enabled=False):
             fmc = fmag_c.squeeze(-1).float()  # (N, Mc, Q)
-            maskf = mask_c.float()
-            coh_c = (w.float() * fmc * maskf).sum(dim=1)  # f¹, (N, Q) fp32
-            inc_c = (c.float() * fmc**2 * maskf).sum(dim=1)  # (N, Q) fp32
+            maskf = mask_c.float()  # (N, Mc, 1)
+            coh_c = (coh.float() * fmc * maskf).sum(dim=1)  # f^1, (N, Q) fp32
+            inc_c = (c.float() * fmc**2 * maskf).sum(dim=1)  # f^2, (N, Q) fp32
             return coh_c, inc_c
 
     @jaxtyped(typechecker=beartype)
@@ -176,45 +280,20 @@ class OutputHead(nn.Module):
         batch: Batch,
         msg_head: LayerHead,
     ) -> Tuple[
-            Float[torch.Tensor, "N Q"],   # noqa: F722
-            Float[torch.Tensor, "N Q"],   # noqa: F722
-            Float[torch.Tensor, "N M Q"], # noqa: F722
-            Float[torch.Tensor, "N M Q"], # noqa: F722
-        ]:
-
+        Float[torch.Tensor, "N Q"],  # noqa: F722
+        Float[torch.Tensor, "N Q"],  # noqa: F722
+        Float[torch.Tensor, "N M Q"],  # noqa: F722
+        Float[torch.Tensor, "N M Q"],  # noqa: F722
+    ]:
         """Accumulate the two Debye limits over atom chunks.
 
         Returns the coherent sum UNSQUARED. Callers must reduce it over
-        every atom of the molecule and only then call `combine`. See that
-        method for why the square cannot happen here.
-
-        Parameters
-        ----------
-        batch : Batch
-            Input batch; used for `batch.padding_mask()`.
-        msg_head : LayerHead
-            Output of MessagePass; embeds (N, M, Q, lambda_1), f_mags and
-            sigmas (N, M, Q, 1).
-
-        Returns
-        -------
-        torch.Tensor
-            `coh_accum`, coherent sum(w * f) over this call's atoms, shape
-            (N, Q). NOT squared; see `combine`.
-        torch.Tensor
-            `inc_accum`, incoherent sum(c * f^2) over this call's atoms,
-            shape (N, Q).
-        torch.Tensor
-            `f_mags`, per-atom form factor magnitudes, shape (N, M, Q).
-        torch.Tensor
-            `sigmas`, per-atom kernel bandwidth, shape (N, M, Q).
+        every atom of the molecule and only then call `combine`.
         """
 
         # 1. initialize values
         N, M, Q, _ = msg_head.embeds.shape
-        mask = (
-            batch.padding_mask().unsqueeze(-1).to(msg_head.embeds.dtype)
-        )  # (N, M, 1)
+        mask = batch.padding_mask().unsqueeze(-1).to(msg_head.embeds.dtype)
 
         # accumulate both Debye limits over atom-chunks.
         coh_accum = torch.zeros(
@@ -225,13 +304,11 @@ class OutputHead(nn.Module):
         # 2. Accumulate over chunks
         for mol1 in range(0, M, self._out_chunk):
             mol2 = min(mol1 + self._out_chunk, M)
-            # .contiguous(): these views' stride/storage_offset
-            # vary by mol1 (which chunk), and torch.compile guards on
-            # stride()/storage_offset() in addition to shape causing
-            # extra recompiles beyond the intended chunk-size guard.
             coh_c, inc_c = self._fwd_fn(
                 self._bilinear,
                 self._mlp,
+                self._pbid,
+                self._sqrp,
                 msg_head.embeds[:, mol1:mol2].contiguous(),
                 msg_head.f_mags[:, mol1:mol2].contiguous(),
                 mask[:, mol1:mol2].contiguous(),
@@ -239,9 +316,7 @@ class OutputHead(nn.Module):
             coh_accum += coh_c
             inc_accum += inc_c
 
-        # 3. return output head. coh_accum stays UNSQUARED: under tensor
-        # parallelism this call only saw one rank's atom shard, so the
-        # square has to wait until every shard has been reduced in.
+        # 3. return output head. coh_accum stays UNSQUARED
         f_mags = msg_head.f_mags.squeeze(-1)
         sigmas = msg_head.sigmas.squeeze(-1)
         return coh_accum, inc_accum, f_mags, sigmas
@@ -252,34 +327,5 @@ class OutputHead(nn.Module):
         coh: Float[torch.Tensor, "N Q"],  # noqa: F722
         inc: Float[torch.Tensor, "N Q"],  # noqa: F722
     ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
-        """Square the coherent sum and add the incoherent one.
-
-        `coh` MUST already cover every atom of each molecule before this
-        is called. Squaring a partial sum computes sum_parts (sum_j)^2
-        instead of (sum_parts sum_j)^2, which silently drops every atom
-        pair split across the partition. That applies at both levels the
-        atom dimension gets split:
-
-        - the `_out_chunk` loop in `forward`, handled by accumulating
-        over all chunks before returning
-        - the TP atom shard in `ScatterNet.forward`, handled by
-        all-reducing across ranks before calling this
-
-        Neither failure raises. Both still train and still lower the
-        loss, they just fit a systematically wrong low-q limit, so the
-        chunk- and rank-invariance tests are the only things that catch
-        them.
-
-        Parameters
-        ----------
-        coh : torch.Tensor
-            Fully reduced coherent sum(w * f), shape (N, Q).
-        inc : torch.Tensor
-            Fully reduced incoherent sum(c * f^2), shape (N, Q).
-
-        Returns
-        -------
-        torch.Tensor
-            Predicted I(q), shape (N, Q).
-        """
+        """Square the coherent sum and add the incoherent one."""
         return coh**2 + inc

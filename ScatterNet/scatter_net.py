@@ -23,8 +23,9 @@ class ScatterNet(nn.Module):
     """
     Full ScatterNet pipeline: Embed → MessagePass → OutputHead → I(q).
 
-    Also computes the training loss: Kratky MSLE plus form-factor and
-    sigma penalties.
+    Also computes the training loss: Kratky MSLE plus a form-factor
+    penalty. Sigma needs no penalty term; MessagePass bounds it
+    structurally with Embed's arctan window on every round.
 
     When a distributed process group is active (torch.distributed initialised)
     and the model is training, each batch is routed to one of two parallelism
@@ -122,7 +123,7 @@ class ScatterNet(nn.Module):
         eps_msgp: float,
         sigma_max: float = 100.0,
         sigma_floor: float = 0.5,
-        sigma_init_gain: float = 0.1,
+        sigma_init_gain: float = 1.0,
         dp_atom_threshold: int = 0,
         compile: bool = False,
     ) -> None:
@@ -163,7 +164,7 @@ class ScatterNet(nn.Module):
         sigma_floor : float, optional
             Lower clamp on sigma, in Angstroms. Default 0.5.
         sigma_init_gain : float, optional
-            Multiplier on Embed's `_sigma` init. Default 0.1.
+            Multiplier on Embed's `_sigma` init. Default 1.0.
         dp_atom_threshold : int, optional
             Atom-count threshold below which training batches may be
             routed to the data-parallel path instead of tensor-parallel.
@@ -179,14 +180,6 @@ class ScatterNet(nn.Module):
 
         super().__init__()
         q_points = qgrid.shape[0]
-        self._emb = Embed(
-            lambda_1,
-            qgrid,
-            sigma_max=sigma_max,
-            sigma_floor=sigma_floor,
-            sigma_init_gain=sigma_init_gain,
-            compile=compile,
-        )
         self._msg = MessagePass(
             lambda_1,
             lambda_2,
@@ -195,6 +188,8 @@ class ScatterNet(nn.Module):
             q_points,
             n_chunk=mol_chunk,
             m_chunk=atm_chunk,
+            sigma_max=sigma_max,
+            sigma_floor=sigma_floor,
             compile=compile,
         )
         self._out = OutputHead(
@@ -242,6 +237,38 @@ class ScatterNet(nn.Module):
         self.register_buffer(
             "_q_weights_", (1 + qgrid**2).unsqueeze(0), persistent=False
         )
+
+        # Physical form-factor init for Embed. Untrained Embed emits
+        # f_mag ~ 0.5 while the physical value is ~7, and d log I/d log f_mag
+        # is exactly 2, so without this the model starts ~200x off in I(q)
+        # and that single mismatch was 99.5% of the gradient norm at init.
+        # Built here, after the table, so Embed is constructed last.
+        #
+        # Averaged over the ORGANIC elements, not over the whole vocab. The
+        # vocab is 211 xraydb ions and is dominated by heavy ones (mean and
+        # median |f|(0) both ~46.7), but the structures this trains on are
+        # proteins and viral capsids, which are H/C/N/O/P/S: |f|(0) = 6.0
+        # for C, 7.0 for N, 8.0 for O. Using the vocab mean overshoots the
+        # typical atom by ~6.7x, and since I ~ f^2 that is a ~45x error in
+        # I(q) pointing the WRONG way - measured I_pred/I_true = 30.3 at
+        # init with the vocab mean, against 1.7 with the organic mean.
+        organic = ("h", "c", "n", "o", "p", "s")
+        rows = [
+            idx + 1
+            for idx, ion in enumerate(VOCAB.ions)
+            if ion.lower() in organic
+        ]
+        f_init = fmag_table[rows or slice(1, None)].mean(dim=0)
+        self._emb = Embed(
+            lambda_1,
+            qgrid,
+            sigma_max=sigma_max,
+            sigma_floor=sigma_floor,
+            sigma_init_gain=sigma_init_gain,
+            f_init=f_init,
+            compile=compile,
+        )
+
         self._fwd_fn = (
             torch.compile(self._loss_fn, dynamic=True, fullgraph=True)
             if compile
@@ -306,6 +333,19 @@ class ScatterNet(nn.Module):
             (lambda_6 * ((f_mag_pred - f_mag_real) ** 2)) * mask_2d
         ).sum(dim=1) / n_atoms  # (N, Q)
 
+        # No sigma penalty. Sigma is now bounded STRUCTURALLY rather than by
+        # a loss term: MessagePass squashes log sigma back into Embed's
+        # (sigma_floor, sigma_max) window on every round with the shared
+        # arctan_log_sigma_window, so it can no longer run away in either
+        # direction and there is nothing left for a penalty to charge for.
+        #
+        # The hinge that used to live here was measured to be identically 0
+        # at init (sigma in [1.11, 40.9] against a 4*env band of [8.0,
+        # 400.0], zero elements over the threshold), which made it the only,
+        # and dead, gradient path to the sigma parameters. The two earlier
+        # variants were worse: a symmetric L2 on z = log sigma - log env had
+        # a gradient 78x MSLE's at init, and a plain mean(sigma^2) was 60x,
+        # both driving sigma to the floor rather than to anything physical.
         return (msle_loss + ff_penalty).mean()
 
     @jaxtyped(typechecker=beartype)
