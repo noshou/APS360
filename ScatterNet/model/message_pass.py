@@ -1,5 +1,5 @@
 import math
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -49,7 +49,7 @@ class MessagePass(nn.Module):
     Pass 2; per-atom update using the accumulated context:
 
         ```
-        atmenv_m[q,l] = Σ_d  φ_m(q, d) · glob_ctx[q, d, l] [shape:: (Q, λ₁)]
+        atmenv_m[q,l]   = Σ_d  φ_m(q, d) · glob_ctx[q, d, l] [shape:: (Q, λ₁)]
                         ≈ Σ_{m'} k(r̃_m, r̃_{m'}) · e_{m'}(q, l)
 
         weights_m[q]    = |Σ_d  φ_m(q, d) · features[q, d]| [shape:: (Q,)]
@@ -62,21 +62,6 @@ class MessagePass(nn.Module):
         e_m  ←  e_m + gate_m
         σ_m  ←  exp(window(log σ_m + pshrink(qdiag(RMSNorm(e_m), f_m))))
         ```
-
-    Sigma window
-    ------------
-    The σ update is additive in LOG space and is squashed back into
-    Embed's `(sigma_floor, sigma_max)` window every round by the shared
-    `arctan_log_sigma_window`. σ is the RBF bandwidth and the kernel forms
-    `r/σ`, so `d(kernel)/dσ` has a `σ^-2` pole; leaving σ unbounded below
-    (as the previous squareplus update did, asymptoting to `b/(4|x|)`)
-    put 41% of entries under Embed's 0.5 floor after ONE round and drove
-    `|dL/dσ|` to 1.5e8. The window is what makes the σ pathway trainable
-    rather than clipped away.
-
-    The last round has no σ head: σ feeds the NEXT round's kernel and
-    `OutputHead` ignores σ entirely, so round `λ₂-1`'s σ weights had no
-    path to the loss and sat at init.
 
     Memory strategy
     ---------------
@@ -420,9 +405,10 @@ class MessagePass(nn.Module):
         )
         with torch.no_grad():
             for shrink in self._sigbilin:
-                shrink.bilinear.weight.mul_(sigma_init_gain)
-                if shrink.bilinear.bias is not None:
-                    shrink.bilinear.bias.mul_(sigma_init_gain)
+                bilin = cast(QDiagBilin, shrink.bilinear)
+                bilin.weight.mul_(sigma_init_gain)
+                if bilin.bias is not None:
+                    bilin.bias.mul_(sigma_init_gain)
 
         # The sigma head reads the raw residual stream, which is the only
         # unnormalized linear map in the block (`agg` is RMSNormed). Without

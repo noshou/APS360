@@ -239,7 +239,7 @@ class Linsvm(Baseline):
         self._heads = []
         for q in range(Y.shape[1]):
             head = LinearSVR(
-                dual=False,
+                dual=False,  # pyright: ignore[reportArgumentType]
                 loss="squared_epsilon_insensitive",
                 random_state=self._random_state,
             )

@@ -43,23 +43,12 @@ class Embed(nn.Module):
     the open interval (log floor, log max), and is scaled so the map is
     the identity to first order at the midpoint (d/du = 1 at u = mid).
 
-    Why a soft saturation at all: a hard clamp has EXACTLY zero gradient
-    outside its range, so an entry pushed past a boundary pins there
-    permanently and saturation becomes an absorbing state. Measured on
-    the 2026-08-01 run, the pinned fraction ratcheted 4.1% (step 207) ->
-    38.5% (step 10661) -> 95.8%, at which point sigma is a binary
-    floor-or-max switch. Nothing penalises sigma any more, so MSLE's own
-    gradient is the only force that can pull a saturated entry back, and
-    it can only do that if d(sigma)/dz stays nonzero.
-
     Why arctan and not tanh: arctan's derivative decays polynomially
     (1/x^2) where tanh's decays exponentially (e^-2x), so arctan keeps a
     usable gradient far outside the window. At |u-mid| = 57 nats, the
     previous run's mean, tanh gives 0.0 in fp32 and arctan gives 8.7e-4.
     Plain torch.atan also has a single-op backward, 1/(1+x^2), that
-    cannot overflow or emit NaN for any finite input; the Gudermannian
-    and erf alternatives either NaN or die faster. See the README's
-    saturation comparison table for the full sweep. The cost is that
+    cannot overflow or emit NaN for any finite input. The cost is that
     arctan approaches its asymptote more slowly, so a given |z| reaches a
     less extreme sigma than tanh would (61% of the window vs 71% at the
     run's mean |z| = 2.36); `_sigma`'s weights absorb that.

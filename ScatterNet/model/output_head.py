@@ -37,15 +37,7 @@ class OutputHead(nn.Module):
     goes to 1 and the Debye double sum factorizes to (sum_j f_j)^2, which
     scales like M^2. The linear term is the incoherent limit: at high q the
     off-diagonal pairs oscillate away leaving sum_j f_j^2, which scales
-    like M. Squaring a sum over atoms *is* the pairwise double sum, so the
-    coherent term costs one O(M) pass, not O(M^2).
-
-    The per-atom weights w_j and c_j stay O(1); the M^2 scaling comes from
-    the sum inside the square being O(M), not from learned magnitude. A
-    single linear sum-of-f^2 head cannot reach (sum f)^2 at any parameter
-    setting, and could only fake it by inflating its per-atom weights to
-    ~M, which is what previously made low q converge far slower than
-    high q.
+    like M.
 
     Initialization
     --------------
@@ -53,22 +45,6 @@ class OutputHead(nn.Module):
     coh = sum_j f_j and inc = sum_j f_j^2 exactly. The head therefore
     emits the true Debye q->0 limit at step 0 and learns only the
     correction.
-
-    The target is 1, not 1/sqrt(M). Targeting 1/sqrt(M) makes
-    coh = sqrt(M)*f and so I(0) = M*f^2, which is a factor of M BELOW the
-    true (sum f)^2 = M^2*f^2 (measured ratio 1.7e-2 at M=64 down to
-    3.0e-4 at M=3426). In a log-space loss that is a residual of several
-    nats that does not shrink with training progress, and it is the
-    dominant term the optimizer sees: at w = c = 1 the same replica gives
-    I_pred/I_true = 1.0 and a coherent-path gradient norm of exactly 0,
-    against 14 to 32 for 1/sqrt(M).
-
-    Because the target is a constant, no M appears here at all. That also
-    removes a chunk-dependence bug: M used to be computed from the CHUNK's
-    mask, so identical weights on the same batch gave I values spanning
-    82x across out_chunk in {64 ... 1024}, made checkpoints valid only at
-    their training atm_chunk, and gave each rank a different M under
-    tensor parallelism.
 
     The forward pass is chunked to avoid storing the
     (N, M, Q, lambda_3) bilinear output tensor.
@@ -151,15 +127,6 @@ class OutputHead(nn.Module):
         # anything, and pushed E[raw_coh] negative, so the coherent channel
         # had to be dragged through coh = 0 where dI/dcoh = 2*coh = 0 is a
         # stationary point of the loss.
-        #
-        # Small, NOT exactly zero. An exactly-zero terminal weight makes
-        # dL/dx = dL/dy @ W.T vanish, which zeroes the gradient of every
-        # parameter upstream of it: measured 35 tensors at |g| = 0 on step
-        # 0, the whole MLP body, the bilinear, all of MessagePass and
-        # Embed's sigma path. The layer itself still learns (dL/dW =
-        # dL/dy * x) and unblocks them on step 2, but there is no reason to
-        # spend a step on that when a small gain gives the same init
-        # accuracy with gradient flowing everywhere immediately.
         terminal: nn.Linear = self._mlp[-1]  # type: ignore[assignment]
         with torch.no_grad():
             terminal.weight.mul_(_TERMINAL_INIT_GAIN)
@@ -210,7 +177,7 @@ class OutputHead(nn.Module):
         -------
         torch.Tensor
             `coh_c`, coherent partial sum(w * f) over this chunk's atoms,
-            shape (N, Q). NOT squared here; see `forward`.
+            shape (N, Q).
         torch.Tensor
             `inc_c`, incoherent partial sum(c * f^2) over this chunk's
             atoms, shape (N, Q).
@@ -219,7 +186,8 @@ class OutputHead(nn.Module):
         # (N,M,Q, λ₁) x (N,M,Q,1) -> (N,M,Q,λ₃)
         atomic = F.mish(bilinear(emb_c, fmag_c))
 
-        # MLP compression -> (N,M,Q,2), split into the two channels.
+        # (N,M,Q,λ₃) -> (N,M,Q,λ₃//2) -> (N,M,Q,λ₃//4) -> ... -> (N,M,Q,2)
+        # MLP compression splits input into incoherent and coherent channels.
         raw = mlp(atomic)
 
         # Both channels are offset so that a zero MLP output gives w = c = 1
@@ -244,9 +212,7 @@ class OutputHead(nn.Module):
         w_param = pbid.weight
         b_param = pbid.bias if pbid.bias is not None else 0.0
         ymb = y - b_param
-        numerator = 2.0 * ymb + w_param - w_param * torch.sqrt(
-            w_param * ymb + ymb**2 + 1.0
-        )
+        numerator = 2.0*ymb+w_param-w_param*torch.sqrt(w_param*ymb+ymb**2+1.0)
         denominator = 2.0 * (1.0 - (w_param**2 / 4.0))
         target_input_coh = numerator / denominator
         coh_logits = raw[..., :1] + target_input_coh
@@ -268,10 +234,10 @@ class OutputHead(nn.Module):
 
         # Reduce over Mc atoms per chunk with autocast disabled for precision
         with torch.autocast(device_type=emb_c.device.type, enabled=False):
-            fmc = fmag_c.squeeze(-1).float()  # (N, Mc, Q)
-            maskf = mask_c.float()  # (N, Mc, 1)
+            fmc = fmag_c.squeeze(-1).float()                # (N, Mc, Q)
+            maskf = mask_c.float()                          # (N, Mc, 1)
             coh_c = (coh.float() * fmc * maskf).sum(dim=1)  # f^1, (N, Q) fp32
-            inc_c = (c.float() * fmc**2 * maskf).sum(dim=1)  # f^2, (N, Q) fp32
+            inc_c = (c.float() * fmc**2 * maskf).sum(dim=1) # f^2, (N, Q) fp32
             return coh_c, inc_c
 
     @jaxtyped(typechecker=beartype)
@@ -280,14 +246,14 @@ class OutputHead(nn.Module):
         batch: Batch,
         msg_head: LayerHead,
     ) -> Tuple[
-        Float[torch.Tensor, "N Q"],  # noqa: F722
-        Float[torch.Tensor, "N Q"],  # noqa: F722
-        Float[torch.Tensor, "N M Q"],  # noqa: F722
-        Float[torch.Tensor, "N M Q"],  # noqa: F722
+        Float[torch.Tensor, "N Q"],   # noqa: F722
+        Float[torch.Tensor, "N Q"],   # noqa: F722
+        Float[torch.Tensor, "N M Q"], # noqa: F722
+        Float[torch.Tensor, "N M Q"], # noqa: F722
     ]:
         """Accumulate the two Debye limits over atom chunks.
 
-        Returns the coherent sum UNSQUARED. Callers must reduce it over
+        Returns the coherent sum unsquared. Callers must reduce it over
         every atom of the molecule and only then call `combine`.
         """
 
@@ -297,7 +263,10 @@ class OutputHead(nn.Module):
 
         # accumulate both Debye limits over atom-chunks.
         coh_accum = torch.zeros(
-            N, Q, device=msg_head.embeds.device, dtype=torch.float32
+            N,
+            Q,
+            device=msg_head.embeds.device,
+            dtype=torch.float32
         )
         inc_accum = torch.zeros_like(coh_accum)
 
