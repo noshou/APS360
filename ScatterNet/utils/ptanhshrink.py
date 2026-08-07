@@ -18,7 +18,6 @@ from torch import nn
 # c ~ 100). Bounding the ratio caps both.
 _W_SPAN = 1.0
 
-
 class PTanhShrink(nn.Module):
     """Bilinear layer followed by a width-parametric tanh shrink.
 

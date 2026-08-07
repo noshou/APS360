@@ -340,7 +340,7 @@ CLAUDE.md
 ## ==========================================
 ## Python & Data Environment
 ## ==========================================
-__pycache__/
+*__pycache__/
 *.py[cod]
 *$py.class
 venv/
