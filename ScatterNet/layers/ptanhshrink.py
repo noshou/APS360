@@ -37,7 +37,7 @@ class PTanhShrink(nn.Module):
     ---------
     `f'` is bounded in `[0, 1)` with a double zero at `y = 0`, so the
     shrink also gates its own gradient. Averaged uniformly over
-    `|y| < c/2`, only **7.6%** of the gradient survives
+    `|y| < c/2`, only 7.6% of the gradient survives
     (`(2/c)∫₀^{c/2} tanh²(y/c) dy = 2(0.5 - tanh 0.5) = 0.0758`); at
     `|y| = c` it is 58%, and it reaches 99% only at `|y| = 3c`. `c`
     therefore sets a real threshold, not just a scale, which is why it is

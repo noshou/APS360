@@ -24,12 +24,11 @@ class SqrP(nn.Module):
 
     Tail behaviour vs softplus
     --------------------------
-    `f(x) -> x + b/(4x)` as `x -> +inf` and `f(x) -> b/(4|x|)` as
-    `x -> -inf`. The negative tail decays as `1/|x|`, **not**
-    exponentially: reaching an output of 1e-6 at `b = 4` needs
-    `x = -1e6`, where softplus needs only `x = -13.8`. Use this where a
-    strictly positive output of order 1 is wanted and exact zero is not;
-    do not use it where the network must be able to switch a channel off.
+    `f(x) -> x + b/(4x)` as `x -> +inf` and `f(x) -> b/(4|x|)` as `x -> -inf`.
+    The negative tail decays as `1/|x|`: reaching an output of 1e-6 at `b = 4`
+    needs `x = -1e6`, where softplus needs only `x = -13.8`. Use this where a
+    strictly positive output of order 1 is wanted and exact zero is not; do not
+    use it where the network must be able to switch a channel off.
 
     Numerical form
     --------------

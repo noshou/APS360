@@ -333,19 +333,6 @@ class ScatterNet(nn.Module):
             (lambda_6 * ((f_mag_pred - f_mag_real) ** 2)) * mask_2d
         ).sum(dim=1) / n_atoms  # (N, Q)
 
-        # No sigma penalty. Sigma is now bounded STRUCTURALLY rather than by
-        # a loss term: MessagePass squashes log sigma back into Embed's
-        # (sigma_floor, sigma_max) window on every round with the shared
-        # arctan_log_sigma_window, so it can no longer run away in either
-        # direction and there is nothing left for a penalty to charge for.
-        #
-        # The hinge that used to live here was measured to be identically 0
-        # at init (sigma in [1.11, 40.9] against a 4*env band of [8.0,
-        # 400.0], zero elements over the threshold), which made it the only,
-        # and dead, gradient path to the sigma parameters. The two earlier
-        # variants were worse: a symmetric L2 on z = log sigma - log env had
-        # a gradient 78x MSLE's at init, and a plain mean(sigma^2) was 60x,
-        # both driving sigma to the floor rather than to anything physical.
         return (msle_loss + ff_penalty).mean()
 
     @jaxtyped(typechecker=beartype)
@@ -435,12 +422,19 @@ class ScatterNet(nn.Module):
 
         if not dist_on:
             msg_head = self._msg(batch, embed_head, self._eps_msgp)
+            _, f_mags, sigmas = msg_head
+            f_mags = f_mags.squeeze(-1)
+            sigmas = sigmas.squeeze(-1)
             # whole molecule on one device, so coh already covers every atom
-            coh, inc, f_mags, sigmas = self._out(batch, msg_head)
-            iq = OutputHead.combine(coh, inc)
+            coh, inc = self._out(batch, msg_head)
+            # TODO(pspline): PSpline smooths coh/inc (pre-square) and takes
+            # over this combination; OutputHead.combine was removed as a
+            # no-op placeholder.
+            iq = coh**2 + inc
             return iq, f_mags, sigmas, batch, 1.0
 
-        M = embed_head.embeds.shape[1]
+        emb_embeds, emb_fmags, emb_sigmas = embed_head
+        M = emb_embeds.shape[1]
         N = batch.vocab.shape[0]
         route_dp = (
             self._dp_atom_threshold > 0
@@ -468,10 +462,10 @@ class ScatterNet(nn.Module):
                 iqval=batch.iqval[n0:n1],
                 coord=batch.coord[n0:n1],
             )
-            local_head = embed_head._replace(
-                embeds=embed_head.embeds[n0:n1],
-                f_mags=embed_head.f_mags[n0:n1],
-                sigmas=embed_head.sigmas[n0:n1],
+            local_head = (
+                emb_embeds[n0:n1],
+                emb_fmags[n0:n1],
+                emb_sigmas[n0:n1],
             )
             # use_all_reduce=False: each rank holds a disjoint set of mols,
             # not a shard of the SAME molecules like TP, so there is nothing to
@@ -479,10 +473,14 @@ class ScatterNet(nn.Module):
             msg_head = self._msg(
                 local_batch, local_head, self._eps_msgp, use_all_reduce=False
             )
+            _, f_mags, sigmas = msg_head
+            f_mags = f_mags.squeeze(-1)
+            sigmas = sigmas.squeeze(-1)
             # DP splits molecules, not atoms, so each rank holds every atom
             # of the molecules it owns and coh is already complete.
-            coh, inc, f_mags, sigmas = self._out(local_batch, msg_head)
-            iq = OutputHead.combine(coh, inc)
+            coh, inc = self._out(local_batch, msg_head)
+            # TODO(pspline): see single-GPU branch above.
+            iq = coh**2 + inc
             return iq, f_mags, sigmas, local_batch, (n1 - n0) / N
 
         rank = dist.get_rank()
@@ -496,14 +494,17 @@ class ScatterNet(nn.Module):
             vocab=batch.vocab[:, m0:m1],
             coord=batch.coord[:, m0:m1],
         )
-        shard_head = embed_head._replace(
-            embeds=embed_head.embeds[:, m0:m1],
-            f_mags=embed_head.f_mags[:, m0:m1],
-            sigmas=embed_head.sigmas[:, m0:m1],
+        shard_head = (
+            emb_embeds[:, m0:m1],
+            emb_fmags[:, m0:m1],
+            emb_sigmas[:, m0:m1],
         )
 
         msg_head = self._msg(shard_batch, shard_head, self._eps_msgp)
-        coh, inc, f_mags, sigmas = self._out(shard_batch, msg_head)
+        _, f_mags, sigmas = msg_head
+        f_mags = f_mags.squeeze(-1)
+        sigmas = sigmas.squeeze(-1)
+        coh, inc = self._out(shard_batch, msg_head)
 
         # TP shards the ATOM dim, so coh/inc here cover only this rank's
         # atoms. Both partials must be reduced across ranks BEFORE the
@@ -514,7 +515,10 @@ class ScatterNet(nn.Module):
         parts = DistributedSum.apply(  # type: ignore[assignment]
             torch.stack((coh, inc), dim=-1)
         )
-        iq = OutputHead.combine(parts[..., 0], parts[..., 1])
+        # TODO(pspline): PSpline smooths the fully-reduced coh/inc
+        # (parts[..., 0], parts[..., 1], pre-square) and takes over this
+        # combination; OutputHead.combine was removed as a no-op placeholder.
+        iq = parts[..., 0] ** 2 + parts[..., 1]
         f_mags = AllGatherDim1.apply(f_mags, m0, M)  # type: ignore[assignment]
         sigmas = AllGatherDim1.apply(sigmas, m0, M)  # type: ignore[assignment]
         return iq, f_mags, sigmas, batch, 1.0

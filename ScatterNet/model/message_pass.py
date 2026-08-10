@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from beartype import beartype
+from beartype.typing import Tuple
 from jaxtyping import Bool, Float, jaxtyped
 from torch import cos, nn
 from torch.autograd.function import FunctionCtx as FuncCtx
@@ -12,10 +13,9 @@ from torch.nn.functional import mish
 from torch.utils.checkpoint import checkpoint
 
 from ..batching import Batch
-from ..utils.ptanhshrink import PTanhShrink
-from ..utils.qdiag_bilin import QDiagBilin
+from ..layers.ptanhshrink import PTanhShrink
+from ..layers.qdiag_bilin import QDiagBilin
 from ..utils.sigma_window import arctan_log_sigma_window
-from .layer_head import LayerHead
 
 
 class MessagePass(nn.Module):
@@ -950,10 +950,10 @@ class MessagePass(nn.Module):
     def forward(
         self,
         batch: Batch,
-        embed_head: LayerHead,
+        embed_head: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         eps: float,
         use_all_reduce: bool = True,
-    ) -> LayerHead:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run λ₂ rounds of RFF message passing.
 
         Parameters
@@ -961,9 +961,9 @@ class MessagePass(nn.Module):
         batch : Batch
             Molecule geometry; uses `coord` (N, M, 3) Cartesian positions
             (Å).
-        embed_head : LayerHead
-            Output of Embed; embeds (N, M, 1, λ₁), f_mags and sigmas
-            (N, M, Q, 1).
+        embed_head : Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            Output of Embed; `(embeds, f_mags, sigmas)` with embeds
+            (N, M, 1, λ₁), f_mags and sigmas (N, M, Q, 1).
         eps : float
             Numerical floor for sigma clamping and the aggregate
             denominator.
@@ -979,16 +979,18 @@ class MessagePass(nn.Module):
 
         Returns
         -------
-        LayerHead
-            `embed_head` with `embeds` updated to (N, M, Q, λ₁) and
-            `sigmas` updated; `f_mags` unchanged.
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            `(embeds, f_mags, sigmas)`, embeds updated to (N, M, Q, λ₁)
+            and sigmas updated; f_mags unchanged.
         """
 
-        embeds_raw = embed_head.embeds  # (N, M, 1, λ₁); Q not yet expanded
-        sigmas = embed_head.sigmas
+        embeds_raw, f_mags, sigmas = embed_head  # (N,M,1,λ₁); Q not expanded
         coord = batch.coord
         padding_mask = batch.padding_mask()
-        f_mags = embed_head.f_mags
+        # f_mags is padded below for the chunked passes but is returned
+        # unchanged (per this method's contract), so keep the pristine,
+        # un-padded reference to return at the end.
+        f_mags_out = f_mags
 
         N_real, M_real, _ = coord.shape
         Q = sigmas.shape[2]
@@ -1108,4 +1110,4 @@ class MessagePass(nn.Module):
         embeds = embeds[:N_real, :M_real]
         sigmas = sigmas[:N_real, :M_real]
 
-        return embed_head._replace(embeds=embeds, sigmas=sigmas)
+        return embeds, f_mags_out, sigmas

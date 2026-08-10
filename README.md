@@ -13,7 +13,7 @@ GNN that predicts X-ray powder scattering curves I(q) from atomic coordinates an
   - [2.2 Bucketing](#22-bucketing-batcher)
   - [2.3 Loading](#23-loading-batchset)
 - [3. Embed](#3-embed)
-- [4. LayerHead](#4-layerhead)
+- [4. Inter-stage tensors](#4-inter-stage-tensors)
 - [5. MessagePass](#5-messagepass)
   - [Mathematical Formulation](#mathematical-formulation)
   - [Pass 1: Accumulate Global Context](#pass-1-accumulate-global-context)
@@ -197,7 +197,7 @@ Converts each atom's VOCAB index into three tensors that feed the rest of the pi
     .unsqueeze(-1) * mask.unsqueeze(-1) (N, M, Q, 1) zero padding atoms
   -> sigma                              (N, M, Q, 1)
 
-  # pack into LayerHead
+  # pack into (embeds, f_mags, sigmas) tuple
   embed.unsqueeze(-2)  -> embeds        (N, M, 1, λ₁)  Q=1, broadcastable
   f_mag.unsqueeze(-1) * mask -> f_mags  (N, M, Q, 1)
   sigma                -> sigmas        (N, M, Q, 1)
@@ -225,9 +225,9 @@ Converts each atom's VOCAB index into three tensors that feed the rest of the pi
 
 ---
 
-## 4. `LayerHead`
+## 4. Inter-stage tensors
 
-`LayerHead` is a `NamedTuple` (immutable, typed) passed between Embed, MessagePass, and OutputHead.
+Embed, MessagePass, and OutputHead pass a plain `(embeds, f_mags, sigmas)` tuple between them (no container class; each stage unpacks positionally).
 
 
 | Field    | Shape from Embed | Shape after MessagePass | Meaning                                                                 |
@@ -236,7 +236,7 @@ Converts each atom's VOCAB index into three tensors that feed the rest of the pi
 | `f_mags` | (N, M, Q, 1)     | unchanged               | Form factor magnitude. Trailing 1 broadcasts over λ₁.                 |
 | `sigmas` | (N, M, Q, 1)     | updated per round       | RFF bandwidth. Trailing 1 broadcasts over λ₁.                         |
 
-The `*` wildcard in the jaxtyping annotation for `embeds` ("N M * λ₁") allows Q to be 1 or Q without a type error. `NamedTuple._replace(...)` produces modified copies without mutation.
+MessagePass returns `embeds` and `sigmas` updated and `f_mags` unchanged (pass-through). OutputHead only consumes `embeds` and `f_mags`; `sigmas` is not part of the Debye-limit accumulation.
 
 ---
 
@@ -507,15 +507,17 @@ Both channels stay O(1) at every q; the M² scaling comes from the squaring op, 
   # return (coh_accum is NOT squared here - see note below):
   coh_accum          (N, Q)    coherent partial, sum(w * f)
   inc_accum          (N, Q)    incoherent partial, sum(c * f²)
-  f_mags.squeeze(-1) (N, M, Q)
-  sigmas.squeeze(-1) (N, M, Q)
+
+  # f_mags/sigmas are no longer routed through OutputHead - ScatterNet.forward
+  # reads them directly off MessagePass's (embeds, f_mags, sigmas) tuple.
 
   # the caller finishes it, once the sums cover every atom:
-  OutputHead.combine(coh, inc) -> coh**2 + inc   (N, Q)   predicted I(q)
+  # TODO: PSpline(coh, inc) -> smoothed, combined I(q) (N, Q); until it lands,
+  # ScatterNet.forward computes coh**2 + inc inline.
 ```
 
   **Why `forward` returns the coherent sum unsquared.** Squaring a *partial* sum computes `sum_parts (sum_j w_j f_j)²` where the correct quantity is `(sum_parts sum_j w_j f_j)²`. The two differ by every cross-part pair term, so every atom pair whose members land in different parts is silently dropped from the coherent sum, and the head degrades toward the incoherent-only behaviour it was written to replace.
-  The atom dimension gets split at two independent levels, and the invariant has to hold at both. Inside `forward`, the `out_chunk` loop splits it, handled by accumulating over all chunks before returning. One level up, the tensor-parallel path (see [§7](#tensor-parallel-forward)) shards it across ranks, so `forward` cannot square at all: it hands back `coh_accum` and `inc_accum` raw, and each caller in `ScatterNet.forward` calls `OutputHead.combine` only once its sums cover every atom of the molecule. The single-GPU and DP paths combine immediately (both hold whole molecules); the TP path stacks the two partials, all-reduces them in one collective, and combines after.
+  The atom dimension gets split at two independent levels, and the invariant has to hold at both. Inside `forward`, the `out_chunk` loop splits it, handled by accumulating over all chunks before returning. One level up, the tensor-parallel path (see [§7](#tensor-parallel-forward)) shards it across ranks, so `forward` cannot square at all: it hands back `coh_accum` and `inc_accum` raw, and each caller in `ScatterNet.forward` finishes the combination itself (currently inline `coh**2 + inc`, slated to become a `PSpline` call, see [§4](#4-inter-stage-tensors)) only once its sums cover every atom of the molecule. The single-GPU and DP paths combine immediately (both hold whole molecules); the TP path stacks the two partials, all-reduces them in one collective, and combines after.
   Nothing in a normal run surfaces a violation. The truncated model is still a smooth function of the parameters, so it still trains and the loss still goes down; it just converges to a different (chunk- or rank-dependent) function than intended, and no loss curve, R², or per-q plot distinguishes the two. The only reliable checks are explicit invariance tests: forward the same batch at `out_chunk = M` (no cross-chunk pairs to lose) and at `out_chunk = 1` (every pair is cross-chunk), and separately at world sizes 1 and 2, asserting I(q) matches in both. Measured, squaring before the rank reduction gives a 48% error at world size 2 while passing every other diagnostic in the repo.
 3. **Activations**
 
@@ -559,9 +561,10 @@ Top-level module. Wraps Embed, MessagePass, and OutputHead, and routes each batc
 ### Single-GPU Forward
 
 ```{rtf}
-batch -> Embed(batch, ε_e)              LayerHead: (N,M,1,λ₁), (N,M,Q,1), (N,M,Q,1)
-      -> MessagePass(batch, head, ε_m)  LayerHead: (N,M,Q,λ₁), (N,M,Q,1), (N,M,Q,1)
-      -> OutputHead(batch, head)        (N,Q), (N,M,Q), (N,M,Q)
+batch -> Embed(batch, ε_e)              (embeds, f_mags, sigmas): (N,M,1,λ₁), (N,M,Q,1), (N,M,Q,1)
+      -> MessagePass(batch, head, ε_m)  (embeds, f_mags, sigmas): (N,M,Q,λ₁), (N,M,Q,1), (N,M,Q,1)
+      -> OutputHead(batch, head)        (coh, inc): (N,Q), (N,Q)
+      -> TODO: PSpline(coh, inc)        smooths + combines -> iq (N,Q)
 ```
 
 ### Routing: TP vs DP
@@ -612,23 +615,23 @@ Step 2: Shard M dimension
         shard_head.sigmas  (N, m1-m0, Q, 1)
 
 Step 3: MessagePass on shard (each rank processes its atoms)
-        msg_head: embeds (N, m1-m0, Q, λ₁), sigmas updated
+        msg_head: (embeds, f_mags, sigmas), embeds (N, m1-m0, Q, λ₁), sigmas updated
+        f_mags_shard, sigmas_shard read straight off msg_head, squeezed to (N, m1-m0, Q)
 
 Step 4: OutputHead on shard
         coh_partial   (N, Q)       sum(w*f)  over this rank's atoms only
         inc_partial   (N, Q)       sum(c*f²) over this rank's atoms only
-        f_mags_shard  (N, m1-m0, Q)
-        sigmas_shard  (N, m1-m0, Q)
 
 Step 5: Gather
         stack((coh_partial, inc_partial), -1)      (N, Q, 2)  one collective
         _DistributedSum(...)         -> parts     (N, Q, 2)  global sums
-        OutputHead.combine(parts[...,0], parts[...,1]) -> iq (N, Q)
+        # TODO: PSpline(parts[...,0], parts[...,1]) -> iq (N,Q); inline
+        # coh**2 + inc used until PSpline lands, see [§4](#4-inter-stage-tensors)
         _AllGatherDim1(f_mags_shard) -> f_mags    (N, M, Q)  cat along dim=1
         _AllGatherDim1(sigmas_shard) -> sigmas    (N, M, Q)
 ```
 
-The reduce must precede the square. `OutputHead.forward` therefore returns both partials unsquared and never calls `combine` itself; only `ScatterNet.forward` does, once the sums span every atom. Squaring per rank would compute `sum_ranks (sum_j w_j f_j)²` and drop every atom pair straddling a shard boundary, measured at a 48% error on 2 ranks. See [§6](#6-outputhead) for the full argument. The two partials are stacked so this stays a single collective rather than two.
+The reduce must precede the square. `OutputHead.forward` therefore returns both partials unsquared and does not combine them itself; `ScatterNet.forward` does, once the sums span every atom (currently inline `coh**2 + inc`, slated to become a `PSpline` call). Squaring per rank would compute `sum_ranks (sum_j w_j f_j)²` and drop every atom pair straddling a shard boundary, measured at a 48% error on 2 ranks. See [§6](#6-outputhead) for the full argument. The two partials are stacked so this stays a single collective rather than two.
 
 ### Custom Autograd Functions
 
@@ -928,7 +931,7 @@ Batch
        └─ PReLU                       -> (N, M, λ₁)
        └─ _f0f1, _f2, hypot          -> f_mag (N, M, Q)
        └─ _sigma bilinear, exp + 1/q envelope -> sigma (N, M, Q, 1)
-       └─ LayerHead: embeds (N,M,1,λ₁), f_mags (N,M,Q,1), sigmas (N,M,Q,1)
+       └─ returns (embeds, f_mags, sigmas): (N,M,1,λ₁), (N,M,Q,1), (N,M,Q,1)
 
   [Distributed: shard M across ranks]
 
@@ -940,7 +943,7 @@ Batch
             └─ mean-normalise features/chem_env by per-molecule atom count (fp16 safety)
             └─ _pass_2: locality, weights, agg, MishGLU gate -> new embeds
                         qdiag + ptanhshrink + arctan window   -> new sigmas
-       └─ LayerHead: embeds (N,M,Q,λ₁), sigmas updated, f_mags unchanged
+       └─ returns (embeds, f_mags, sigmas): embeds (N,M,Q,λ₁), sigmas updated, f_mags unchanged
 
   └─ OutputHead
        └─ [per M-chunk]
@@ -953,8 +956,9 @@ Batch
 
   [Distributed: _DistributedSum(stack(coh, inc)), _AllGatherDim1(f_mags, sigmas)]
 
-  └─ OutputHead.combine(coh, inc) = coh² + inc  (N, Q)
-       [square happens HERE, after every chunk AND every rank is summed in]
+  └─ TODO: PSpline(coh, inc) -> smoothed, combined I(q) (N, Q)
+       [ScatterNet.forward computes coh² + inc inline until PSpline lands;
+        happens HERE, after every chunk AND every rank is summed in]
 
 Loss
   └─ _kratky_MSLE:  (1+q²)*(log1p(Î)-log1p(I))²    (N,Q)

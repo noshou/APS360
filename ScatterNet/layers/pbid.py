@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 # Hard cap on |w|. Monotonicity needs |w| < 2 (see the class docstring), and
-# `OutputHead`'s init inverse divides by `2*(1 - w**2/4)`, which is 0 at
+# `OutputHead`'s init inverse divides by `2*(1 - w²/4)`, which is 0 at
 # |w| = 2 and underflows to 0 in fp16 once |w - 2| < 1e-4. Capping strictly
 # at 1.9 the smallest denominator is 0.195 and the smallest slope is 0.05.
 _W_MAX = 1.9

@@ -10,10 +10,9 @@ from numpy import floor, log2
 from torch import nn
 
 from ..batching import Batch
-from ..utils.no_trilin_bilin import NoTrilinBilin
-from ..utils.pbid import PBId
-from ..utils.sqrp import SqrP
-from .layer_head import LayerHead
+from ..layers.no_trilin_bilin import NoTrilinBilin
+from ..layers.pbid import PBId
+from ..layers.sqrp import SqrP
 
 # Multiplier on the terminal Linear's default weight init. Small enough that
 # `raw` does not disturb the w = c = 1 targets (std ~0.5 -> ~0.025), large
@@ -24,14 +23,13 @@ _TERMINAL_INIT_GAIN = 0.05
 
 class OutputHead(nn.Module):
     """
-    Collapses per-atom contributions into a predicted I(q) curve.
+    Collapses per-atom contributions into coherent and incoherent
+    scattering limits. For each atom, combines its embedding with its form
+    factor magnitude via a bilinear layer and passes the result through an MLP,
+    which emits two per-atom, per-q channels (w, c). These are summed over
+    atoms into the two limits of the Debye sum:
 
-    For each atom, combines its embedding with its form factor magnitude
-    via a bilinear layer and passes the result through an MLP, which emits
-    two per-atom, per-q channels (w, c). These are summed over atoms into
-    the two limits of the Debye sum:
-
-        I(q) = (sum_j w_j f_j)^2 + sum_j c_j f_j^2
+        I(q) = coh**2 + inc = (sum_j w_j f_j)^2 + sum_j c_j f_j^2
 
     The squared term is the coherent limit: at q -> 0 every sinc(q r_ij)
     goes to 1 and the Debye double sum factorizes to (sum_j f_j)^2, which
@@ -244,28 +242,37 @@ class OutputHead(nn.Module):
     def forward(
         self,
         batch: Batch,
-        msg_head: LayerHead,
+        msg_head: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> Tuple[
         Float[torch.Tensor, "N Q"],   # noqa: F722
         Float[torch.Tensor, "N Q"],   # noqa: F722
-        Float[torch.Tensor, "N M Q"], # noqa: F722
-        Float[torch.Tensor, "N M Q"], # noqa: F722
     ]:
         """Accumulate the two Debye limits over atom chunks.
 
-        Returns the coherent sum unsquared. Callers must reduce it over
-        every atom of the molecule and only then call `combine`.
+        Returns both sums unsquared/uncombined. Callers must reduce coh
+        over every atom of the molecule and only then call `combine`.
+
+        Parameters
+        ----------
+        batch : Batch
+            Input batch; uses `batch.padding_mask()`.
+        msg_head : Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            Output of MessagePass; `(embeds, f_mags, sigmas)` with embeds
+            (N, M, Q, λ₁), f_mags and sigmas (N, M, Q, 1). Only embeds and
+            f_mags are used here; sigmas is not part of this accumulation.
         """
 
+        embeds, f_mags, _sigmas = msg_head
+
         # 1. initialize values
-        N, M, Q, _ = msg_head.embeds.shape
-        mask = batch.padding_mask().unsqueeze(-1).to(msg_head.embeds.dtype)
+        N, M, Q, _ = embeds.shape
+        mask = batch.padding_mask().unsqueeze(-1).to(embeds.dtype)
 
         # accumulate both Debye limits over atom-chunks.
         coh_accum = torch.zeros(
             N,
             Q,
-            device=msg_head.embeds.device,
+            device=embeds.device,
             dtype=torch.float32
         )
         inc_accum = torch.zeros_like(coh_accum)
@@ -278,23 +285,12 @@ class OutputHead(nn.Module):
                 self._mlp,
                 self._pbid,
                 self._sqrp,
-                msg_head.embeds[:, mol1:mol2].contiguous(),
-                msg_head.f_mags[:, mol1:mol2].contiguous(),
+                embeds[:, mol1:mol2].contiguous(),
+                f_mags[:, mol1:mol2].contiguous(),
                 mask[:, mol1:mol2].contiguous(),
             )
             coh_accum += coh_c
             inc_accum += inc_c
 
         # 3. return output head. coh_accum stays UNSQUARED
-        f_mags = msg_head.f_mags.squeeze(-1)
-        sigmas = msg_head.sigmas.squeeze(-1)
-        return coh_accum, inc_accum, f_mags, sigmas
-
-    @staticmethod
-    @jaxtyped(typechecker=beartype)
-    def combine(
-        coh: Float[torch.Tensor, "N Q"],  # noqa: F722
-        inc: Float[torch.Tensor, "N Q"],  # noqa: F722
-    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
-        """Square the coherent sum and add the incoherent one."""
-        return coh**2 + inc
+        return coh_accum, inc_accum
