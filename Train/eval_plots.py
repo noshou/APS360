@@ -3,7 +3,6 @@ import json
 import os
 import time
 from collections.abc import Callable, Iterable
-from contextlib import contextmanager
 from dataclasses import replace as dc_replace
 
 import torch
@@ -30,35 +29,37 @@ class ScatterNetBaseline(Baseline):
     effect, so the single evaluation pass that drives the diagnostic plots
     ALSO yields the epoch's test loss/R2 - removing a second, redundant full
     pass over the test set. Read the accumulated result back with `loss_r2()`.
-    This is only correct because the plots pass forces tensor-parallel routing
-    (see `_force_tp`): under TP every rank holds the full-batch output, so the
-    per-batch loss is the whole-bucket loss and needs no cross-rank reduction -
-    exactly the TP branch of train.py's `evaluate()`. (DP's molecule-shard
-    all-reduce is unnecessary here prec1isely because TP is forced.)
+
+    The forward pass always runs under BF16 autocast (`torch.autocast(...,
+    dtype=torch.bfloat16)`), matching Train/train.py's training-time
+    precision exactly - there is no fp16/AMP toggle. ScatterNet's numerics
+    guards (see message_pass.py/output_head.py) were originally tuned and
+    validated against fp16-specific overflow failure modes; BF16's different
+    (lower-mantissa, wider-exponent) rounding behavior has not been
+    separately re-validated against those guards, so predictions from this
+    path are still worth spot-checking against a fp32 reference before
+    trusting a run's accuracy numbers, not just its speed.
     """
 
     def __init__(
         self,
         model: ScatterNet,
-        amp: bool,
         device: str,
         compute_loss: bool = False,
         lambda_6: float | None = None,
+        lambda_7: float | None = None,
         progress: bool = False,
         n_batch: int = 0,
-        dtype: torch.dtype = torch.float16,
         start_seen: int = 0,
         resume_loss_state: dict | None = None,
     ) -> None:
-        """Store the model and precision/device settings used at call time.
+        """Store the model and device settings used at call time.
 
         Parameters
         ----------
         model : ScatterNet
             Model to wrap; called in whatever train()/eval() mode the
             caller already put it in.
-        amp : bool
-            Whether to run the forward pass under autocast at all.
         device : str
             Torch device string; autocast is only enabled on CUDA.
         compute_loss : bool, optional
@@ -69,27 +70,13 @@ class ScatterNetBaseline(Baseline):
         lambda_6 : float, optional
             Loss weight forwarded to `model.compute_loss`; required when
             `compute_loss` is True.
+        lambda_7 : float, optional
+            2nd-derivative roughness penalty weight forwarded to
+            `model.compute_loss`; required when `compute_loss` is True.
         progress : bool
             Print a progress line every 20 batches.
         n_batch : int
             Total number of batches, for the "i/N" in the progress line.
-        dtype : torch.dtype, optional
-            Autocast dtype. Default `torch.float16` matches train.py's own
-            `evaluate()` and every existing caller (the per-epoch training
-            diagnostic plots) exactly -- unchanged. Pass `torch.bfloat16`
-            for a standalone post-training inference speed comparison
-            against the BF16-refactored baselines (see
-            `Baselines.run.baseline.autocast_dtype` for picking it based on
-            device capability) on Ampere+ GPUs (A100, L4, Blackwell); NOT
-            recommended for T4 (no BF16 tensor cores) or for training-time
-            use, since ScatterNet's numerics were tuned/guarded against fp16
-            overflow specifically (see message_pass.py/output_head.py) and
-            haven't been separately re-validated for bf16's different
-            (lower-mantissa, wider-exponent) rounding behavior. This class
-            is inference-only wherever it's used today, so that's a smaller
-            concern than it would be for training, but still worth spot-
-            checking predictions against the fp16/fp32 path before trusting
-            a bf16 comparison run's accuracy numbers, not just its speed.
         start_seen : int
             Number of molecules-batches already processed before this call
             (> 0 on a mid-pass resume), used only to label the progress
@@ -104,13 +91,12 @@ class ScatterNetBaseline(Baseline):
         None
         """
         self._model = model
-        self._amp = amp and device.startswith("cuda")
         self._device = device
         self._compute_loss = compute_loss
         self._lambda_6 = lambda_6
+        self._lambda_7 = lambda_7
         self._progress = progress
         self._n_batch = n_batch
-        self._dtype = dtype
         self._seen = start_seen
         self._start_seen = start_seen
         self._last_printed = -1
@@ -149,8 +135,6 @@ class ScatterNetBaseline(Baseline):
         """Return (mean composite loss, log1p R2) accumulated over all calls.
 
         Returns NaNs if `compute_loss` was False or nothing was evaluated.
-        Both ranks accumulate identical values under forced TP, so rank 0's
-        return value is the correct global result.
         """
         if not self._compute_loss or self._mols == 0:
             return float("nan"), float("nan")
@@ -183,29 +167,34 @@ class ScatterNetBaseline(Baseline):
             iqval=batch.iqval.to(self._device),
             coord=batch.coord.to(self._device),
         )
-        with torch.autocast(
-            device_type="cuda", dtype=self._dtype, enabled=self._amp
-        ):
-            iq, fmags, sigmas, local_batch, _ = self._model(batch)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            iq, coh, inc, fmags, sigmas = self._model(batch)
             # Composite loss/R2 as a side effect, in the same forward pass, so
             # plots eval doubles as the test loss/R2 eval. Computed inside
             # autocast + with the raw (unclamped) iq, matching
             # train.py evaluate() exactly.
             if self._compute_loss:
                 lambda_6 = self._lambda_6
+                lambda_7 = self._lambda_7
                 assert lambda_6 is not None, (
                     "lambda_6 required when compute_loss is True"
                 )
+                assert lambda_7 is not None, (
+                    "lambda_7 required when compute_loss is True"
+                )
                 loss = self._model.compute_loss(
                     iq,
+                    coh,
+                    inc,
                     fmags,
-                    local_batch,
+                    batch,
                     lambda_6,
+                    lambda_7,
                 )
                 iqf = iq.float()
-                n = local_batch.iqval.shape[0]
+                n = batch.iqval.shape[0]
                 log_pred = torch.log1p(iqf)
-                log_target = torch.log1p(local_batch.iqval)
+                log_target = torch.log1p(batch.iqval)
                 self._loss_sum += loss.item() * n
                 self._mols += n
                 self._ss_res += ((log_pred - log_target) ** 2).sum().item()
@@ -230,46 +219,16 @@ class ScatterNetBaseline(Baseline):
         return iq.float().clamp(min=0).cpu()
 
 
-@contextmanager
-def _force_tp(model: ScatterNet):
-    """Temporarily disable DP routing so every prediction covers full batch.
-
-    Baselines.run.metrics.evaluate() assumes a baseline's prediction shape
-    matches the full batch it was given (pred.shape == batch.iqval.shape).
-    A DP-routed bucket returns only a rank-local molecule shard instead,
-    which would silently break that assumption. TP is unaffected, since
-    every rank already reconstructs the full-batch output internally, so
-    forcing TP here keeps every rank's independent evaluate() call
-    numerically identical without touching Baselines/run/metrics.py.
-
-    Parameters
-    ----------
-    model : ScatterNet
-        Model whose `_dp_atom_threshold` is temporarily zeroed.
-
-    Yields
-    ------
-    None
-    """
-    saved = model._dp_atom_threshold
-    model._dp_atom_threshold = 0
-    try:
-        yield
-    finally:
-        model._dp_atom_threshold = saved
-
-
 def save_epoch_plots(
     model: ScatterNet,
     loader: Iterable[Batch],
     q_grid: torch.Tensor,
-    amp: bool,
     device: str,
     data_dir: str,
     epoch: int,
-    rank: int,
     compute_loss: bool = False,
     lambda_6: float | None = None,
+    lambda_7: float | None = None,
     verbose: bool = False,
     start_batch: int = 0,
     resume_state: dict | None = None,
@@ -294,18 +253,11 @@ def save_epoch_plots(
     new baseline statistic appears in the epoch plots automatically, no
     change needed here.
 
-    When `compute_loss` is True, this ONE forced-TP pass also accumulates the
+    When `compute_loss` is True, this ONE pass also accumulates the
     composite loss and log1p R2 (via ScatterNetBaseline), so the caller no
     longer needs a separate `evaluate(test_loader)` pass - the test set is
     walked once, not twice. The values are numerically the same as train.py's
-    `evaluate()` would produce: forcing TP just changes the parallel reduction,
-    not the per-molecule output (see ScatterNetBaseline's docstring).
-
-    Must be called on every rank in a distributed run - forward passes
-    through the model (even TP-forced) need every rank's participation for
-    their internal all-reduce/gather. Only rank 0 writes files; every rank
-    computes identical loss/R2 under forced TP, so the return value is correct
-    on every rank.
+    `evaluate()` would produce (see ScatterNetBaseline's docstring).
 
     Parameters
     ----------
@@ -316,8 +268,6 @@ def save_epoch_plots(
         Evaluation batches (typically the test loader).
     q_grid : torch.Tensor
         q-point grid, shape (Q,).
-    amp : bool
-        Whether to run the forward pass under fp16 autocast.
     device : str
         Torch device string.
     data_dir : str
@@ -325,16 +275,17 @@ def save_epoch_plots(
         `{data_dir}/epoch_{epoch:03d}/`.
     epoch : int
         Current epoch number, used to name the per-epoch subdirectory.
-    rank : int
-        This process's rank; only rank 0 writes plot files.
     compute_loss : bool, optional
         If True, the pass also returns (test_loss, test_r2). If False
         (default), the return value is (nan, nan) and only plots are
         produced.
     lambda_6 : float, optional
         Loss weight, required when `compute_loss` is True.
+    lambda_7 : float, optional
+        2nd-derivative roughness penalty weight, required when
+        `compute_loss` is True.
     verbose : bool
-        Print a progress line every 20 batches (rank 0 only).
+        Print a progress line every 20 batches.
     start_batch : int
         Global batch index of the first batch `loader` will yield (0
         normally; > 0 on a mid-pass resume, where `loader`'s sampler
@@ -361,11 +312,11 @@ def save_epoch_plots(
     """
     baseline = ScatterNetBaseline(
         model,
-        amp,
         device,
         compute_loss=compute_loss,
         lambda_6=lambda_6,
-        progress=verbose and rank == 0,
+        lambda_7=lambda_7,
+        progress=verbose,
         n_batch=start_batch + len(loader),  # type: ignore[arg-type]
         start_seen=start_batch,
         resume_loss_state=(
@@ -382,34 +333,32 @@ def save_epoch_plots(
             {"eval": eval_state, "loss": baseline.loss_state()}, batch_idx
         )
 
-    with _force_tp(model):
-        result = _bl_evaluate(
-            baseline,
-            loader,
-            q_grid,
-            "ScatterNet",
-            start_batch=start_batch,
-            resume_state=resume_state["eval"] if resume_state else None,
-            ckpt_cb=_ckpt_cb if ckpt_cb is not None else None,
-            ckpt_interval_sec=ckpt_interval_sec,
-        )
-    if rank == 0:
-        epoch_dir = os.path.join(data_dir, f"epoch_{epoch:03d}")
-        # bar_chart_png=False: only one result (ScatterNet) is ever plotted
-        # here, so a one-row bar chart has nothing to compare against --
-        # summary.json/per_q_summary.json (always written regardless) carry
-        # the same numbers without the pointless PNG.
-        written = run_all_plots(
-            [result],
-            q_grid,
-            epoch_dir,
-            categories={"ScatterNet": "learned"},
-            bar_chart_png=False,
-        )
-        print(
-            f"  [plots] wrote {len(written)} file(s) to {epoch_dir}",
-            flush=True,
-        )
+    result = _bl_evaluate(
+        baseline,
+        loader,
+        q_grid,
+        "ScatterNet",
+        start_batch=start_batch,
+        resume_state=resume_state["eval"] if resume_state else None,
+        ckpt_cb=_ckpt_cb if ckpt_cb is not None else None,
+        ckpt_interval_sec=ckpt_interval_sec,
+    )
+    epoch_dir = os.path.join(data_dir, f"epoch_{epoch:03d}")
+    # bar_chart_png=False: only one result (ScatterNet) is ever plotted
+    # here, so a one-row bar chart has nothing to compare against --
+    # summary.json/per_q_summary.json (always written regardless) carry
+    # the same numbers without the pointless PNG.
+    written = run_all_plots(
+        [result],
+        q_grid,
+        epoch_dir,
+        categories={"ScatterNet": "learned"},
+        bar_chart_png=False,
+    )
+    print(
+        f"  [plots] wrote {len(written)} file(s) to {epoch_dir}",
+        flush=True,
+    )
     return baseline.loss_r2()
 
 
@@ -595,15 +544,12 @@ _CFG_SECTIONS: list[tuple[str, tuple[str, ...]]] = [
             "msg_seed",
             "atm_chunk",
             "mol_chunk",
-            "dp_atom_threshold",
             "compile",
-            "amp",
-            "amp_init_scale",
             "eps_embd",
             "eps_msgp",
         ),
     ),
-    ("Loss", ("lambda_6",)),
+    ("Loss", ("lambda_6", "lambda_7")),
     (
         "Training",
         (
@@ -668,7 +614,7 @@ def _rtf_escape(text: str) -> str:
 def save_run_config_rtf(cfg: RunConfig, data_dir: str) -> None:
     """Dump the run's full RunConfig to `{data_dir}/run_config.rtf`.
 
-    Written once, at the start of training (rank 0 only), so the data dir is
+    Written once, at the start of training, so the data dir is
     self-describing: whoever reads the per-epoch metrics months later can see
     exactly which hyperparameters produced them without digging up the notebook
     cell that launched the run. Every field of the dataclass is dumped, grouped

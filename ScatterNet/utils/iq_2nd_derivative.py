@@ -72,8 +72,8 @@ class IQ2ndDerivative:
     q_grid  : the step size of the grid
     """
 
-    _delta_q:   float
-    _fwd_fn:    (Callable)
+    __delta_q:   float
+    __fwd_fn:    (Callable)
 
     def __init__(
         self,
@@ -96,16 +96,16 @@ class IQ2ndDerivative:
             atol=1e-5
         ), f"Grid steps must be uniformly equal to delta_q ({delta_q})."
 
-        self._delta_q = delta_q
+        self.__delta_q = delta_q
 
-        self._fwd_fn = (
-            torch.compile(self._forward_fn, dynamic=True, fullgraph=True)
+        self.__fwd_fn = (
+            torch.compile(self.__forward_fn, dynamic=True, fullgraph=True)
             if compile
-            else self._forward_fn
+            else self.__forward_fn
         )
 
     @staticmethod
-    def _forward_fn( # can't use jaxtyping/beartype due to torch.compile
+    def __forward_fn( # can't use jaxtyping/beartype due to torch.compile
         intensity: torch.Tensor,
         delta: float
     ) -> torch.Tensor:
@@ -174,4 +174,4 @@ class IQ2ndDerivative:
             If neither `delta_q` nor `q` provides a valid spacing, or if the
             grid is not uniform.
         """
-        return self._fwd_fn(intensity, self._delta_q)
+        return self.__fwd_fn(intensity, self.__delta_q)

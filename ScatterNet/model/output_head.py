@@ -2,13 +2,13 @@ from collections import OrderedDict
 from typing import Callable
 
 import torch
-import torch.nn.functional as F
 from beartype import beartype
 from beartype.typing import Tuple
 from jaxtyping import Float, jaxtyped
 from numpy import floor, log2
+from pyteals import NoTrilinBilin, PBId, SqrP
 from torch import nn
-from torch_extras import NoTrilinBilin, PBId, SqrP
+from torch.nn.functional import mish
 
 from ..batching import Batch
 
@@ -32,8 +32,7 @@ class OutputHead(nn.Module):
     The squared term is the coherent limit: at q -> 0 every sinc(q r_ij)
     goes to 1 and the Debye double sum factorizes to (sum_j f_j)^2, which
     scales like M^2. The linear term is the incoherent limit: at high q the
-    off-diagonal pairs oscillate away leaving sum_j f_j^2, which scales
-    like M.
+    off-diagonal pairs oscillate away leaving sum_j f_j^2, which scales like M.
 
     Initialization
     --------------
@@ -46,11 +45,11 @@ class OutputHead(nn.Module):
     (N, M, Q, lambda_3) bilinear output tensor.
     """
 
-    _bilinear: NoTrilinBilin
-    _mlp: nn.Sequential
-    _pbid: PBId
-    _sqrp: SqrP
-    _fwd_fn: Callable
+    __bilinear: NoTrilinBilin
+    __mlp: nn.Sequential
+    __pbid: PBId
+    __sqrp: SqrP
+    __fwd_fn: Callable
 
     def __init__(
         self,
@@ -88,7 +87,7 @@ class OutputHead(nn.Module):
         """
 
         super().__init__()
-        self._out_chunk = out_chunk
+        self.__out_chunk = out_chunk
 
         if lambda_4 <= 0:
             raise ValueError("lambda_4 must be > 0")
@@ -97,7 +96,7 @@ class OutputHead(nn.Module):
             verr2 = f" for lambda_3={lambda_3}"
             verr = verr1 + verr2
             raise ValueError(verr)
-        self._bilinear = NoTrilinBilin(lambda_1, 1, lambda_3)
+        self.__bilinear = NoTrilinBilin(lambda_1, 1, lambda_3)
 
         dims = [lambda_3 // 2**i for i in range(lambda_4 + 1)]
         if dims[-1] == 1:
@@ -110,9 +109,9 @@ class OutputHead(nn.Module):
             ldicts[f"layer_{i}"] = nn.Linear(dims[i], dims[i + 1])
             if i < len(dims) - 2:
                 ldicts[f"activation_{i}"] = nn.Mish()
-        self._mlp = nn.Sequential(ldicts)
-        self._pbid = PBId(1)
-        self._sqrp = SqrP()
+        self.__mlp = nn.Sequential(ldicts)
+        self.__pbid = PBId(1)
+        self.__sqrp = SqrP()
 
         # Terminal layer emits (w, c). Its bias is zeroed and its weight is
         # shrunk by _TERMINAL_INIT_GAIN so `raw` starts near 0 and the two
@@ -123,19 +122,19 @@ class OutputHead(nn.Module):
         # anything, and pushed E[raw_coh] negative, so the coherent channel
         # had to be dragged through coh = 0 where dI/dcoh = 2*coh = 0 is a
         # stationary point of the loss.
-        terminal: nn.Linear = self._mlp[-1]  # type: ignore[assignment]
+        terminal: nn.Linear = self.__mlp[-1]  # type: ignore[assignment]
         with torch.no_grad():
             terminal.weight.mul_(_TERMINAL_INIT_GAIN)
             terminal.bias.zero_()
 
-        self._fwd_fn = (
-            torch.compile(self._forward_fn, dynamic=True, fullgraph=True)
+        self.__fwd_fn = (
+            torch.compile(self.__forward_fn, dynamic=True, fullgraph=True)
             if compile
-            else self._forward_fn
+            else self.__forward_fn
         )
 
     @staticmethod
-    def _forward_fn(  # no jaxtype/beartype cuz torch.compile will break
+    def __forward_fn(  # no jaxtype/beartype cuz torch.compile will break
         bilinear: NoTrilinBilin,
         mlp: torch.nn.Sequential,
         pbid: PBId,
@@ -180,7 +179,7 @@ class OutputHead(nn.Module):
         """
 
         # (N,M,Q, λ₁) x (N,M,Q,1) -> (N,M,Q,λ₃)
-        atomic = F.mish(bilinear(emb_c, fmag_c))
+        atomic = mish(bilinear(emb_c, fmag_c))
 
         # (N,M,Q,λ₃) -> (N,M,Q,λ₃//2) -> (N,M,Q,λ₃//4) -> ... -> (N,M,Q,2)
         # MLP compression splits input into incoherent and coherent channels.
@@ -276,13 +275,13 @@ class OutputHead(nn.Module):
         inc_accum = torch.zeros_like(coh_accum)
 
         # 2. Accumulate over chunks
-        for mol1 in range(0, M, self._out_chunk):
-            mol2 = min(mol1 + self._out_chunk, M)
-            coh_c, inc_c = self._fwd_fn(
-                self._bilinear,
-                self._mlp,
-                self._pbid,
-                self._sqrp,
+        for mol1 in range(0, M, self.__out_chunk):
+            mol2 = min(mol1 + self.__out_chunk, M)
+            coh_c, inc_c = self.__fwd_fn(
+                self.__bilinear,
+                self.__mlp,
+                self.__pbid,
+                self.__sqrp,
                 embeds[:, mol1:mol2].contiguous(),
                 f_mags[:, mol1:mol2].contiguous(),
                 mask[:, mol1:mol2].contiguous(),

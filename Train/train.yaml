@@ -1,7 +1,5 @@
 # Default config for the local CLI path (python train.py --config runs/default.yaml).
-# The Kaggle notebook (kaggle_train.ipynb) builds RunConfig in Python and does NOT
-# read this file; that notebook is the source of truth. Keep the knobs below in sync
-# with it. Missing keys fall back to RunConfig dataclass defaults; CLI flags override.
+# Missing keys fall back to RunConfig dataclass defaults; CLI flags override.
 
 # paths - local defaults; override on the CLI for other environments.
 # hdf5 and encodings_sqlite3_path are downloaded from HuggingFace (noshou/iq_train_set)
@@ -47,9 +45,6 @@ msg_seed: 42
 # memory ones.
 atm_chunk: 512
 mol_chunk: 256
-
-# parallelism routing (multi-GPU only; see README ScatterNet section 7)
-dp_atom_threshold: 101   # calibrated for 2x T4: 1.8x faster, peak 13.55G. 0 = always TP.
 
 # numerical floors
 eps_embd: 1.0e-8

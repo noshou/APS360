@@ -10,22 +10,17 @@
 #   export HSA_OVERRIDE_GFX_VERSION=9.0.0
 # -----------------------------------------------------------------------
 torch==2.12.0
-# Local, not-yet-published package (ScatterNet/layers' former contents,
-# extracted so they're reusable outside this repo). Editable install from
-# a sibling directory until it's pushed to GitHub/PyPI:
-#   pip install -e ../torch-extras
--e ../torch-extras
+pyteals==1.0.1
 numpy==2.4.6
 scipy==1.17.1
 h5py==3.16.0
 hdf5plugin==6.0.0
 xraydb==4.5.8
 beartype==0.22.9
+jaxtyping
 tqdm==4.67.3
 plotly==6.7.0
 huggingface_hub==1.20.1
 pyyaml
 scikit-learn
-threadpoolctl
-joblib
 ruff

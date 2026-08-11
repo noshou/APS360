@@ -1,10 +1,8 @@
 import re
-from dataclasses import replace as _dc_replace
 from typing import Callable
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import xraydb
 from beartype import beartype
 from beartype.typing import Tuple
@@ -14,63 +12,27 @@ from torch import nn
 from Preprocess import VOCAB
 
 from .batching import Batch
-from .model import Embed, MessagePass, OutputHead
-from .utils.all_gather import AllGatherDim1
-from .utils.distributed_sum import DistributedSum
+from .model import Embed, MessagePass, OutputHead, SplineSmooth
+from .utils.iq_2nd_derivative import IQ2ndDerivative
 
 
 class ScatterNet(nn.Module):
     """
-    Full ScatterNet pipeline: Embed → MessagePass → OutputHead → I(q).
+    Full ScatterNet pipeline: Embed → MessagePass → OutputHead → SplineSmooth
+    → I(q). Single-GPU only; there is no routing or sharding of any kind.
+
+    1. Embed produces per-atom embeddings, form factor magnitudes, and
+    sigmas from the batch.
+    2. MessagePass runs lambda_2 rounds of RFF-based message passing on
+    the full batch.
+    3. OutputHead accumulates the coherent and incoherent I(q) sums from
+    the message-passed atoms.
+    4. SplineSmooth smooths the raw coherent/incoherent curves into the
+    final predicted I(q).
 
     Also computes the training loss: Kratky MSLE plus a form-factor
     penalty. Sigma needs no penalty term; MessagePass bounds it
     structurally with Embed's arctan window on every round.
-
-    When a distributed process group is active (torch.distributed initialised)
-    and the model is training, each batch is routed to one of two parallelism
-    strategies based on M (padded atoms per molecule), N (molecule count), and
-    `dp_atom_threshold`:
-
-    Tensor-parallel (TP) - the default; used whenever DP's conditions (below)
-    aren't met, or dp_atom_threshold <= 0. Applies in both train and eval -
-    routing is keyed on M/N/dp_atom_threshold only, not self.training, so a
-    given bucket takes the same path (and therefore the same compiled shapes)
-    in both modes. Forcing eval onto TP unconditionally used to introduce
-    fresh dynamic shapes into the compiled Embed/MessagePass/OutputHead
-    functions the first time evaluate() ran each session - a compile storm at
-    the first epoch boundary. eval() correctly aggregates DP's per-rank
-    molecule shards (see evaluate() in train.py), so there's no correctness
-    reason to force TP there anymore:
-        1. Embed runs on the full batch on every rank (cheap, per-atom lookup).
-        2. Each rank slices its atom shard from embed_head.
-        3. MessagePass runs on the shard; an all-reduce inside MessagePass
-        reconstructs the global RFF context (features, chem_env) between
-        the two passes so every atom still attends to all others.
-        4. OutputHead produces partial I(q) and per-atom f_mags/sigmas for
-        the shard.
-        5. I(q) is summed across ranks (all-reduce); f_mags and sigmas are
-        gathered back to full M.
-
-    Data-parallel (DP) - training, M < dp_atom_threshold, AND N >= 2*mol_chunk:
-        Molecules are divided across ranks (no atom sharding, no in-model
-        communication at all - small M means TP's all-reduce cost would
-        dwarf the tiny amount of per-rank compute it parallelises). Each
-        rank runs the ordinary single-GPU forward on its own molecule slice
-        and returns a `loss_scale = local_N / global_N` so that, once the
-        training loop's existing grad all-reduce (SUM) runs, summing the
-        two ranks' scaled-local-mean gradients reconstructs the exact
-        global-mean gradient - the same mechanism already used to combine
-        TP's partial gradients, just fed a differently-scaled loss.
-
-        The `N >= 2*mol_chunk` guard matters: DP halves the outer N-chunk
-        loop but does NOT halve M before MessagePass's own atm_chunk-loop
-        runs (TP does, by sharding M first). So a DP-routed bucket runs
-        ~2x the inner M-chunk-loop launches TP would've had on the same
-        bucket - only worth it if halving N actually shrinks the outer
-        loop. If N already fits in one N-chunk, DP is pure overhead.
-
-    Without a process group the forward is identical to the single-GPU path.
 
     Hyperparameters:
         lambda_1:  atom embedding dimension
@@ -80,7 +42,6 @@ class ScatterNet(nn.Module):
         lambda_5:  number of RFF features in MessagePass
         atm_chunk: atoms per M-chunk in MessagePass and OutputHead
         mol_chunk: molecules per N-chunk in MessagePass
-        dp_atom_threshold: see class docstring; 0 = always TP
         qgrid:     q-grid tensor, shape (Q,)
         energy:    X-ray energy (eV) for xraydb form factors
         eps_embd:  numerical floor for Embed
@@ -89,23 +50,23 @@ class ScatterNet(nn.Module):
 
     Attributes
     ----------
-    _fmag_table : torch.Tensor
+    __fmag_table : torch.Tensor
         Reference form factor magnitudes per vocabulary entry per
         q-point, shape (V, Q) where V = len(VOCAB) + 1.
-    _q_weights_ : torch.Tensor
+    __q_weights_ : torch.Tensor
         Kratky weighting (1 + q^2), shape (1, Q).
     """
 
-    _emb: Embed
-    _msg: MessagePass
-    _out: OutputHead
-    _eps_embd: Float
-    _eps_msgp: Float
-    _dp_atom_threshold: int
-    _mol_chunk: int
-    _fmag_table: Float[torch.Tensor, "V Q"]  # noqa: F722
-    _q_weights_: Float[torch.Tensor, "1 Q"]  # noqa: F722
-    _fwd_fn: Callable
+    __emb: Embed
+    __msg: MessagePass
+    __out: OutputHead
+    __spline: SplineSmooth
+    __iq2d: IQ2ndDerivative
+    __eps_embd: Float
+    __eps_msgp: Float
+    __fmag_table: Float[torch.Tensor, "V Q"]  # noqa: F722
+    __q_weights_: Float[torch.Tensor, "1 Q"]  # noqa: F722
+    __fwd_fn: Callable
 
     def __init__(
         self,
@@ -124,7 +85,6 @@ class ScatterNet(nn.Module):
         sigma_max: float = 100.0,
         sigma_floor: float = 0.5,
         sigma_init_gain: float = 1.0,
-        dp_atom_threshold: int = 0,
         compile: bool = False,
     ) -> None:
         """Construct the Embed, MessagePass, and OutputHead submodules.
@@ -165,10 +125,6 @@ class ScatterNet(nn.Module):
             Lower clamp on sigma, in Angstroms. Default 0.5.
         sigma_init_gain : float, optional
             Multiplier on Embed's `_sigma` init. Default 1.0.
-        dp_atom_threshold : int, optional
-            Atom-count threshold below which training batches may be
-            routed to the data-parallel path instead of tensor-parallel.
-            0 (default) always uses tensor-parallel.
         compile : bool, optional
             If True, torch.compile Embed/MessagePass/OutputHead's
             checkpointed step functions. Default is False.
@@ -180,7 +136,7 @@ class ScatterNet(nn.Module):
 
         super().__init__()
         q_points = qgrid.shape[0]
-        self._msg = MessagePass(
+        self.__msg = MessagePass(
             lambda_1,
             lambda_2,
             lambda_5,
@@ -192,13 +148,14 @@ class ScatterNet(nn.Module):
             sigma_floor=sigma_floor,
             compile=compile,
         )
-        self._out = OutputHead(
+        self.__out = OutputHead(
             lambda_1, lambda_3, lambda_4, atm_chunk, compile=compile
         )
-        self._eps_embd = eps_embd
-        self._eps_msgp = eps_msgp
-        self._dp_atom_threshold = dp_atom_threshold
-        self._mol_chunk = mol_chunk
+        delta_q = float(qgrid[1] - qgrid[0])
+        self.__spline = SplineSmooth(q_points, delta_q, compile=compile)
+        self.__iq2d = IQ2ndDerivative(qgrid, delta_q, compile=compile)
+        self.__eps_embd = eps_embd
+        self.__eps_msgp = eps_msgp
 
         fmag_table = torch.zeros(len(VOCAB) + 1, len(qgrid))
 
@@ -233,9 +190,13 @@ class ScatterNet(nn.Module):
                 ).float()
             fmag_table[idx + 1] = f_mag
 
-        self.register_buffer("_fmag_table", fmag_table, persistent=False)
         self.register_buffer(
-            "_q_weights_", (1 + qgrid**2).unsqueeze(0), persistent=False
+            "_ScatterNet__fmag_table", fmag_table, persistent=False
+        )
+        self.register_buffer(
+            "_ScatterNet__q_weights_",
+            (1 + qgrid**2).unsqueeze(0),
+            persistent=False,
         )
 
         # Physical form-factor init for Embed. Untrained Embed emits
@@ -259,7 +220,7 @@ class ScatterNet(nn.Module):
             if ion.lower() in organic
         ]
         f_init = fmag_table[rows or slice(1, None)].mean(dim=0)
-        self._emb = Embed(
+        self.__emb = Embed(
             lambda_1,
             qgrid,
             sigma_max=sigma_max,
@@ -269,27 +230,32 @@ class ScatterNet(nn.Module):
             compile=compile,
         )
 
-        self._fwd_fn = (
-            torch.compile(self._loss_fn, dynamic=True, fullgraph=True)
+        self.__fwd_fn = (
+            torch.compile(self.__loss_fn, dynamic=True, fullgraph=True)
             if compile
-            else self._loss_fn
+            else self.__loss_fn
         )
 
     @staticmethod
-    def _loss_fn(  # can't jaxtype here bc of torch.compile graph breaking
+    def __loss_fn(  # can't jaxtype here bc of torch.compile graph breaking
         fmag_table: torch.Tensor,
         q_weights: torch.Tensor,
+        iq2d: IQ2ndDerivative,
         output_head: torch.Tensor,
+        coh: torch.Tensor,
+        inc: torch.Tensor,
         f_mag_pred: torch.Tensor,
         iqval: torch.Tensor,
         vocab: torch.Tensor,
         mask: torch.Tensor,
         lambda_6: float,
+        lambda_7: float,
     ) -> torch.Tensor:
         """Compute the total training loss.
 
-        Sums the Kratky MSLE and the form-factor penalty, then averages
-        over molecules and q-points.
+        Sums the Kratky MSLE, the form-factor penalty, and a 2nd-
+        derivative roughness penalty on the pre-smoothing coherent/
+        incoherent curves, then averages over molecules and q-points.
 
         Parameters
         ----------
@@ -298,8 +264,18 @@ class ScatterNet(nn.Module):
             q-point, shape (V, Q).
         q_weights : torch.Tensor
             Kratky weighting (1 + q^2), shape (1, Q).
+        iq2d : IQ2ndDerivative
+            Central-difference second derivative, applied to `coh`/`inc`.
         output_head : torch.Tensor
             Predicted I(q), shape (N, Q).
+        coh : torch.Tensor
+            Raw accumulated coherent sum, pre-`SplineSmooth`, shape
+            (N, Q). Penalized directly rather than post-smoothing so the
+            penalty nudges `OutputHead` itself, instead of leaning on
+            `SplineSmooth`'s Λ to compensate for a rough raw curve.
+        inc : torch.Tensor
+            Raw accumulated incoherent sum, pre-`SplineSmooth`, shape
+            (N, Q).
         f_mag_pred : torch.Tensor
             Predicted form factor magnitudes, shape (N, M, Q).
         iqval : torch.Tensor
@@ -311,6 +287,8 @@ class ScatterNet(nn.Module):
             atom.
         lambda_6 : float
             Weight on the form-factor penalty term.
+        lambda_7 : float
+            Weight on the 2nd-derivative roughness penalty term.
 
         Returns
         -------
@@ -333,31 +311,48 @@ class ScatterNet(nn.Module):
             (lambda_6 * ((f_mag_pred - f_mag_real) ** 2)) * mask_2d
         ).sum(dim=1) / n_atoms  # (N, Q)
 
-        return (msle_loss + ff_penalty).mean()
+        # 2nd-derivative roughness penalty, pre-smoothing coh/inc.
+        d2_coh = iq2d.forward(coh)
+        d2_inc = iq2d.forward(inc)
+        smooth_penalty = lambda_7 * (d2_coh**2 + d2_inc**2)  # (N, Q)
+
+        return (msle_loss + ff_penalty + smooth_penalty).mean()
 
     @jaxtyped(typechecker=beartype)
     def compute_loss(
         self,
         output_head: Float[torch.Tensor, "N Q"],  # noqa: F722
+        coh: Float[torch.Tensor, "N Q"],  # noqa: F722
+        inc: Float[torch.Tensor, "N Q"],  # noqa: F722
         f_mag_pred: Float[torch.Tensor, "N M Q"],  # noqa: F722
         batch: Batch,
         lambda_6: float,
+        lambda_7: float,
     ) -> Float[torch.Tensor, ""]:  # noqa: F722
         """Compute the total training loss.
 
-        Sums the Kratky MSLE and the form-factor penalty, then averages
-        over molecules and q-points.
+        Sums the Kratky MSLE, the form-factor penalty, and a 2nd-
+        derivative roughness penalty on the pre-smoothing coherent/
+        incoherent curves, then averages over molecules and q-points.
 
         Parameters
         ----------
         output_head : torch.Tensor
             Predicted I(q), shape (N, Q).
+        coh : torch.Tensor
+            Raw accumulated coherent sum, pre-`SplineSmooth`, shape
+            (N, Q).
+        inc : torch.Tensor
+            Raw accumulated incoherent sum, pre-`SplineSmooth`, shape
+            (N, Q).
         f_mag_pred : torch.Tensor
             Predicted form factor magnitudes, shape (N, M, Q).
         batch : Batch
             Input batch with reference I(q), vocab, and padding mask.
         lambda_6 : float
             Weight on the form-factor penalty term.
+        lambda_7 : float
+            Weight on the 2nd-derivative roughness penalty term.
 
         Returns
         -------
@@ -368,15 +363,19 @@ class ScatterNet(nn.Module):
         # concatenation/squeeze ops whose stride can vary run to run, and
         # torch.compile guards on stride() in addition to shape - causing
         # avoidable recompiles.
-        return self._fwd_fn(
-            self._fmag_table,
-            self._q_weights_,
+        return self.__fwd_fn(
+            self.__fmag_table,
+            self.__q_weights_,
+            self.__iq2d,
             output_head.contiguous(),
+            coh.contiguous(),
+            inc.contiguous(),
             f_mag_pred.contiguous(),
             batch.iqval,
             batch.vocab,
             batch.padding_mask(),
             lambda_6,
+            lambda_7,
         )
 
     @jaxtyped(typechecker=beartype)
@@ -384,12 +383,12 @@ class ScatterNet(nn.Module):
         self, batch: Batch
     ) -> Tuple[
         Float[torch.Tensor, "N Q"],  # noqa: F722
+        Float[torch.Tensor, "N Q"],  # noqa: F722
+        Float[torch.Tensor, "N Q"],  # noqa: F722
         Float[torch.Tensor, "N M Q"],  # noqa: F722
         Float[torch.Tensor, "N M Q"],  # noqa: F722
-        Batch,
-        float,
     ]:
-        """Run the ScatterNet forward pass, routing to TP, DP, or single-GPU.
+        """Run the ScatterNet forward pass.
 
         Parameters
         ----------
@@ -402,123 +401,23 @@ class ScatterNet(nn.Module):
         torch.Tensor
             `iq`, predicted I(q), shape (N, Q).
         torch.Tensor
+            `coh`, raw accumulated coherent sum, unsquared and
+            pre-smoothing, shape (N, Q). For the 2nd-derivative loss.
+        torch.Tensor
+            `inc`, raw accumulated incoherent sum, pre-smoothing, shape
+            (N, Q). For the 2nd-derivative loss.
+        torch.Tensor
             `f_mags`, per-atom form factor magnitudes, shape (N, M, Q).
         torch.Tensor
             `sigmas`, per-atom Gaussian kernel bandwidth, shape (N, M, Q).
-        Batch
-            `local_batch`, the slice of `batch` these outputs correspond
-            to. Equal to `batch` unchanged unless this batch was routed to
-            the data-parallel path (in which case N above is the local
-            molecule count, not the global one) - pass this to the loss,
-            not the original `batch`.
-        float
-            `loss_scale`, local_N / global_N when data-parallel routed;
-            1.0 otherwise. Multiply the loss by this before calling
-            backward().
         """
 
-        embed_head = self._emb(batch, self._eps_embd)
-        dist_on = dist.is_available() and dist.is_initialized()
-
-        if not dist_on:
-            msg_head = self._msg(batch, embed_head, self._eps_msgp)
-            _, f_mags, sigmas = msg_head
-            f_mags = f_mags.squeeze(-1)
-            sigmas = sigmas.squeeze(-1)
-            # whole molecule on one device, so coh already covers every atom
-            coh, inc = self._out(batch, msg_head)
-            # TODO(pspline): PSpline smooths coh/inc (pre-square) and takes
-            # over this combination; OutputHead.combine was removed as a
-            # no-op placeholder.
-            iq = coh**2 + inc
-            return iq, f_mags, sigmas, batch, 1.0
-
-        emb_embeds, emb_fmags, emb_sigmas = embed_head
-        M = emb_embeds.shape[1]
-        N = batch.vocab.shape[0]
-        route_dp = (
-            self._dp_atom_threshold > 0
-            and M < self._dp_atom_threshold
-            # DP halves the N-chunk loop but does NOT halve M (unlike TP, which
-            # shards M before MessagePass's own atm_chunk-loop runs on it), so
-            # DP-routed bucket runs the M-chunk loop over the *full* M. That
-            # only pays for itself if halving N shrinks the outer loop,
-            # if N already fits in one N-chunk (N < 2*mol_chunk), splitting it
-            # buys nothing while but eats the un-halved-M cost, so stay on TP.
-            and N >= 2 * self._mol_chunk
-        )
-
-        if route_dp:
-            rank = dist.get_rank()
-            ws = dist.get_world_size()
-            N = batch.vocab.shape[0]
-            shard = (N + ws - 1) // ws
-            n0 = rank * shard
-            n1 = min(n0 + shard, N)
-
-            local_batch = _dc_replace(
-                batch,
-                vocab=batch.vocab[n0:n1],
-                iqval=batch.iqval[n0:n1],
-                coord=batch.coord[n0:n1],
-            )
-            local_head = (
-                emb_embeds[n0:n1],
-                emb_fmags[n0:n1],
-                emb_sigmas[n0:n1],
-            )
-            # use_all_reduce=False: each rank holds a disjoint set of mols,
-            # not a shard of the SAME molecules like TP, so there is nothing to
-            # reconcile across ranks.
-            msg_head = self._msg(
-                local_batch, local_head, self._eps_msgp, use_all_reduce=False
-            )
-            _, f_mags, sigmas = msg_head
-            f_mags = f_mags.squeeze(-1)
-            sigmas = sigmas.squeeze(-1)
-            # DP splits molecules, not atoms, so each rank holds every atom
-            # of the molecules it owns and coh is already complete.
-            coh, inc = self._out(local_batch, msg_head)
-            # TODO(pspline): see single-GPU branch above.
-            iq = coh**2 + inc
-            return iq, f_mags, sigmas, local_batch, (n1 - n0) / N
-
-        rank = dist.get_rank()
-        ws = dist.get_world_size()
-        shard = (M + ws - 1) // ws
-        m0 = rank * shard
-        m1 = min(m0 + shard, M)
-
-        shard_batch = _dc_replace(
-            batch,
-            vocab=batch.vocab[:, m0:m1],
-            coord=batch.coord[:, m0:m1],
-        )
-        shard_head = (
-            emb_embeds[:, m0:m1],
-            emb_fmags[:, m0:m1],
-            emb_sigmas[:, m0:m1],
-        )
-
-        msg_head = self._msg(shard_batch, shard_head, self._eps_msgp)
+        embed_head = self.__emb(batch, self.__eps_embd)
+        msg_head = self.__msg(batch, embed_head, self.__eps_msgp)
         _, f_mags, sigmas = msg_head
         f_mags = f_mags.squeeze(-1)
         sigmas = sigmas.squeeze(-1)
-        coh, inc = self._out(shard_batch, msg_head)
-
-        # TP shards the ATOM dim, so coh/inc here cover only this rank's
-        # atoms. Both partials must be reduced across ranks BEFORE the
-        # coherent term is squared: squaring first would give
-        # sum_ranks (sum_j w_j f_j)^2 instead of (sum_ranks sum_j w_j f_j)^2,
-        # dropping every atom pair split across the shard boundary. Stacked
-        # into one tensor so this stays a single collective.
-        parts = DistributedSum.apply(  # type: ignore[assignment]
-            torch.stack((coh, inc), dim=-1)
-        )
-        # TODO(pspline): PSpline smooths the fully-reduced coh/inc
-        # (parts[..., 0], parts[..., 1], pre-square) and takes over this
-        # combination; OutputHead.combine was removed as a no-op placeholder.
-        iq = parts[..., 0] ** 2 + parts[..., 1]
-        f_mags = AllGatherDim1.apply(f_mags, m0, M)  # type: ignore[assignment]
-        sigmas = AllGatherDim1.apply(sigmas, m0, M)  # type: ignore[assignment]
-        return iq, f_mags, sigmas, batch, 1.0
+        # whole molecule on one device, so coh already covers every atom
+        coh, inc = self.__out(batch, msg_head)
+        iq = self.__spline(sigmas, f_mags, coh, inc, batch)
+        return iq, coh, inc, f_mags, sigmas

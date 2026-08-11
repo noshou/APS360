@@ -20,20 +20,17 @@ setup(
             "Train.*",
         ]
     ),
-    # NOTE: `torch-extras` (ScatterNet/layers' former contents, now a
-    # separate local package) is also a required runtime dependency, but
-    # isn't published yet, so it can't be listed here as a normal
-    # `install_requires` entry without hardcoding a local path. Install it
-    # separately first: `pip install -e ../torch-extras` (also covered by
-    # requirements.txt).
     install_requires=[
         "torch",
+        # ScatterNet/layers' former contents: https://pypi.org/project/pyteals/
+        "pyteals",
         "numpy",
         "scipy",
         "h5py",
         "hdf5plugin",
         "xraydb",
         "beartype",
+        "jaxtyping",
         "pyyaml",
     ],
     entry_points={

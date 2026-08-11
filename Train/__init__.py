@@ -1,2 +1,2 @@
-"""Training entry point package: train.py (CLI + notebook main),
-train.yaml (CLI defaults), kaggle_train.ipynb."""
+"""Training entry point package: train.py (CLI main), train.yaml
+(CLI defaults)."""

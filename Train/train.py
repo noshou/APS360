@@ -10,11 +10,6 @@ from time import perf_counter
 
 import h5py
 import torch
-import torch.distributed as dist
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-from torch.multiprocessing.spawn import (
-    spawn as mp_spawn,  # type: ignore[attr-defined]
-)
 from torch.utils.data import DataLoader, Subset
 
 from Preprocess import Encoding
@@ -76,7 +71,7 @@ def _rclone_push(path: str, dest: str | None):
 
 # profiler
 class _LoopProfiler:
-    """Per-rank, per-section wall-clock profiler for the training loop.
+    """Per-section wall-clock profiler for the training loop.
 
     Active only when cfg.profiler is set (otherwise every method is a
     near-zero no-op, so the normal training path pays nothing). Each
@@ -85,33 +80,25 @@ class _LoopProfiler:
     the next one - without this, "data_wait" silently absorbs the
     previous batch's still-running backward.
 
-    Two things this is built to surface:
-      * data-loader stalls vs GPU compute (is __getitem__ starving the
-        GPU?), and
-      * tensor-parallel rank skew - compare the same section across
-        ranks; a rank that is fast in compute but slow in
-        grad_allreduce is *waiting* on a slower peer (the cause of the
-        NCCL ALLREDUCE timeout).
-    A per-batch record is also kept so heavy buckets can be correlated
-    with stalls, and per-batch peak CUDA memory is tracked (a free
-    counter read - unlike torch.profiler's profile_memory, which OOMs)
-    so you can see headroom for raising atm_chunk / mol_chunk.
+    The main thing this is built to surface is data-loader stalls vs
+    GPU compute (is __getitem__ starving the GPU?). A per-batch record
+    is also kept so heavy buckets can be correlated with stalls, and
+    per-batch peak CUDA memory is tracked (a free counter read - unlike
+    torch.profiler's profile_memory, which OOMs) so you can see
+    headroom for raising atm_chunk / mol_chunk.
     """
 
-    def __init__(self, rank: int, device: str, enabled: bool):
+    def __init__(self, device: str, enabled: bool):
         """Initialize the profiler's timing and memory-tracking state.
 
         Parameters
         ----------
-        rank : int
-            Rank of this process, used to tag printed output.
         device : str
             Torch device string (e.g. 'cuda:0' or 'cpu').
         enabled : bool
             Whether profiling is active. When False, all methods are
             near-zero no-ops.
         """
-        self.rank = rank
         self.enabled = enabled
         self.device = device
         self.cuda = enabled and device.startswith("cuda")
@@ -230,7 +217,6 @@ class _LoopProfiler:
         "forward",
         "loss",
         "backward",
-        "grad_allreduce",
         "clip",
         "step",
     ]
@@ -247,7 +233,7 @@ class _LoopProfiler:
         n = len(self.records)
         total = sum(self.totals.values())
         names = self._ORDER + [k for k in self.totals if k not in self._ORDER]
-        tag = f"[prof r{self.rank}]"
+        tag = "[prof]"
         lines = [
             f"{tag} ---- section breakdown over {n} active batch(es) "
             f"(total {total:.3f}s, {total / n * 1e3:.1f} ms/batch) ----"
@@ -319,11 +305,10 @@ class _LoopProfiler:
         # aren't comparable across profiler runs whose group sizes differ, and
         # they're
         # not very informative even within one run. Report each group
-        # separately so
-        # e.g. "did dp_atom_threshold help the heavy_nm group" is a
-        # like-for-like question.
+        # separately so different groups' costs can be compared
+        # like-for-like.
         _GROUP_LABEL = {
-            "heavy_nm": "heaviest N*M_shard",
+            "heavy_nm": "heaviest N*M",
             "heavy_m": "heaviest M",
             "regular": "median",
         }
@@ -346,7 +331,6 @@ class _LoopProfiler:
                     f"compute={g_ms('compute'):8.2f}ms/batch  "
                     f"forward={g_ms('forward'):7.2f}ms  "
                     f"backward={g_ms('backward'):7.2f}ms  "
-                    f"grad_allreduce={g_ms('grad_allreduce'):7.2f}ms  "
                     f"peak_alloc={g_peak:.2f}G"
                 )
 
@@ -386,15 +370,13 @@ def _parse_args():
     p.add_argument("--msg_seed", type=int, default=None)
     p.add_argument("--atm_chunk", type=int, default=None)
     p.add_argument("--mol_chunk", type=int, default=None)
-    p.add_argument("--dp_atom_threshold", type=int, default=None)
     p.add_argument("--compile", action="store_const", const=True, default=None)
-    p.add_argument("--amp", action="store_const", const=True, default=None)
-    p.add_argument("--amp_init_scale", type=float, default=None)
     p.add_argument("--eps_embd", type=float, default=None)
     p.add_argument("--eps_msgp", type=float, default=None)
 
     # loss
     p.add_argument("--lambda_6", type=float, default=None)
+    p.add_argument("--lambda_7", type=float, default=None)
 
     # training
     p.add_argument("--lr", type=float, default=None)
@@ -441,27 +423,12 @@ def evaluate(
     model: ScatterNet,
     cfg: RunConfig,
     device: str,
-    rank: int = 0,
     label: str = "eval",
     start_batch: int = 0,
     resume_state: dict | None = None,
     ckpt_cb: "Callable[[dict, int], None] | None" = None,
 ) -> tuple[float, float]:
     """Run one pass over `loader` without gradients and return (mean_loss, R2).
-
-    Both ranks call this with identical loaders (same seed, no shuffle). Each
-    bucket routes to TP or DP by the same M/N/dp_atom_threshold rule as
-    training (ScatterNet.forward no longer forces TP for eval - matching
-    train's routing means eval doesn't feed the compiled step functions
-    shapes they've never seen, which used to trigger a recompile storm the
-    first time evaluate() ran each session). Under TP, `local_batch` returned
-    by the model equals the full `batch` and both ranks already hold
-    identical whole-bucket outputs, so per-rank accumulation is exact as-is.
-    Under DP, each rank only sees its own molecule shard, so the six running
-    accumulators are all_reduced (SUM) across ranks before being folded in -
-    otherwise a DP-routed bucket would silently undercount every rank's
-    contribution to the other's molecules. Only rank 0 uses the returned
-    values for logging and checkpointing.
 
     Parameters
     ----------
@@ -470,11 +437,9 @@ def evaluate(
     model : ScatterNet
         Model to evaluate; called in `eval()` mode.
     cfg : RunConfig
-        Run configuration, used for `lambda_6`.
+        Run configuration, used for `lambda_6`/`lambda_7`.
     device : str
         Torch device to move batch tensors to.
-    rank : int
-        This process's rank; only rank 0 prints progress.
     label : str
         Split being walked ("val"/"test"), used in the progress line.
         Val and test hold one batch per bucket exactly like train, so
@@ -504,8 +469,6 @@ def evaluate(
         log1p space.
     """
     model.eval()
-    amp = bool(cfg.amp) and device.startswith("cuda")
-    dist_on = dist.is_available() and dist.is_initialized()
     total_loss = 0.0
     total_mols = 0.0
     ss_res = 0.0
@@ -519,7 +482,7 @@ def evaluate(
         sum_y = resume_state["sum_y"]
         sum_y2 = resume_state["sum_y2"]
         n_elem = resume_state["n_elem"]
-    verbose = rank == 0 and cfg.verbosity in ("batch", "diagnostic")
+    verbose = cfg.verbosity in ("batch", "diagnostic")
     n_batch = start_batch + len(loader)
     t0 = _time.time()
     last_ckpt = _time.time()
@@ -531,44 +494,27 @@ def evaluate(
                 iqval=batch.iqval.to(device),
                 coord=batch.coord.to(device),
             )
-            with torch.autocast(
-                device_type="cuda", dtype=torch.float16, enabled=amp
-            ):
-                iq, fmags, sigmas, local_batch, _ = model(batch)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                iq, coh, inc, fmags, sigmas = model(batch)
                 loss = model.compute_loss(
                     iq,
+                    coh,
+                    inc,
                     fmags,
-                    local_batch,
+                    batch,
                     cfg.lambda_6,
+                    cfg.lambda_7,
                 )
             iq = iq.float()  # R2/metrics accumulate in fp32 regardless of AMP
-            n = local_batch.iqval.shape[0]
+            n = batch.iqval.shape[0]
             b_loss = loss.item() * n
             b_mols = float(n)
             log_pred = torch.log1p(iq)
-            log_target = torch.log1p(local_batch.iqval)
+            log_target = torch.log1p(batch.iqval)
             b_ss_res = ((log_pred - log_target) ** 2).sum().item()
             b_sum_y = log_target.sum().item()
             b_sum_y2 = (log_target**2).sum().item()
             b_n_elem = float(log_target.numel())
-
-            # DP gives each rank a disjoint molecule shard (unlike TP, where
-            # the
-            # model's internal all-reduce/gather already leaves both ranks
-            # holding
-            # the whole bucket) - sum the six scalars across ranks so this
-            # bucket's
-            # contribution is counted once globally, not once per rank locally.
-            if dist_on and local_batch.vocab.shape[0] != batch.vocab.shape[0]:
-                stats = torch.tensor(
-                    [b_loss, b_mols, b_ss_res, b_sum_y, b_sum_y2, b_n_elem],
-                    dtype=torch.float64,
-                    device=device,
-                )
-                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                b_loss, b_mols, b_ss_res, b_sum_y, b_sum_y2, b_n_elem = (
-                    stats.tolist()
-                )
 
             total_loss += b_loss
             total_mols += b_mols
@@ -576,7 +522,7 @@ def evaluate(
             sum_y += b_sum_y
             sum_y2 += b_sum_y2
             n_elem += b_n_elem
-            del iq, fmags, sigmas, loss, log_pred, log_target
+            del iq, coh, inc, fmags, sigmas, loss, log_pred, log_target
 
             if verbose and (_bi + 1) % 20 == 0:
                 elapsed = _time.time() - t0
@@ -592,8 +538,7 @@ def evaluate(
             # losing a whole pass to a late timeout is exactly the failure
             # mode this closes.
             if (
-                rank == 0
-                and ckpt_cb is not None
+                ckpt_cb is not None
                 and (_time.time() - last_ckpt) > cfg.ckpt_interval_sec
             ):
                 ckpt_cb(
@@ -614,29 +559,12 @@ def evaluate(
     return mean_loss, r2
 
 
-# distributed worker
-def _worker(rank: int, cfg: RunConfig):
-    """Run the per-process training worker for one rank.
-
-    When launched with mp.spawn this runs on rank i with GPU cuda:i. When
-    called directly (single GPU) rank is 0.
-
-    Parallelism routing is handled inside ScatterNet.forward, per batch: by
-    default atoms are sharded across ranks for tensor parallelism (TP) -
-    MessagePass all_reduces between its two passes, and outputs are gathered
-    before returning. If cfg.dp_atom_threshold > 0 and a training batch's
-    padded atom count M falls below it, the batch is instead split by
-    molecule across ranks (DP) with no in-model communication at all. This
-    worker is responsible for syncing parameter gradients after each backward
-    (all_reduce SUM), which DDP would otherwise handle; TP needs the full SUM
-    (partial gradients per atom shard), and DP relies on ScatterNet.forward's
-    loss_scale to make the same SUM reconstruct the correct global-mean
-    gradient too - see the comment at the grad_allreduce call site below.
+# training worker
+def _worker(cfg: RunConfig):
+    """Run the training worker, in-process on the single available GPU.
 
     Parameters
     ----------
-    rank : int
-        Rank of this process (0-based), also used as the CUDA device index.
     cfg : RunConfig
         Full run configuration (paths, model hyperparameters, training
         schedule, and profiler settings).
@@ -646,33 +574,21 @@ def _worker(rank: int, cfg: RunConfig):
     None
     """
 
-    world_size = torch.cuda.device_count()
-    is_dist = world_size > 1
-
     if cfg.compile:
         os.environ.setdefault(
             "TORCHDYNAMO_VERBOSE", "1"
         )  # full Dynamo/Inductor traceback on compile failures
 
-    if is_dist:
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "12355")
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
-    if torch.cuda.is_available():
-        torch.cuda.set_device(rank)
-
-    # Both ranks must see identical batch orderings each epoch.
     torch.manual_seed(cfg.batcher_seed)
 
-    if rank == 0:
-        print(f"world_size={world_size}  device={device}")
-        print(
-            f"lr={cfg.lr}  epochs={cfg.epochs}  λ1={cfg.lambda_1}  "
-            f"λ2={cfg.lambda_2}  λ3={cfg.lambda_3}  λ4={cfg.lambda_4}  "
-            f"λ5={cfg.lambda_5}  λ6={cfg.lambda_6}"
-        )
+    print(f"device={device}")
+    print(
+        f"lr={cfg.lr}  epochs={cfg.epochs}  λ1={cfg.lambda_1}  "
+        f"λ2={cfg.lambda_2}  λ3={cfg.lambda_3}  λ4={cfg.lambda_4}  "
+        f"λ5={cfg.lambda_5}  λ6={cfg.lambda_6}  λ7={cfg.lambda_7}"
+    )
 
     # data
 
@@ -701,20 +617,20 @@ def _worker(rank: int, cfg: RunConfig):
         # Each split is
         # sampled independently (Batcher drops empty per-bucket splits, so the
         # three
-        # ._batches lists don't share an index space), deterministically off
+        # .batches lists don't share an index space), deterministically off
         # batcher_seed
         # and fixed for the run. Rebuilds a BatchSet rather than wrapping in
         # Subset so
-        # ._batches stays intact - the profiler branch below reaches into it
+        # .batches stays intact - the profiler branch below reaches into it
         # directly.
         def _thin(bset: BatchSet, salt: int) -> tuple[BatchSet, int]:
-            n = len(bset._batches)
+            n = len(bset.batches)
             k = max(1, round(n * cfg.dataset_frac))
             idx = sorted(
                 random.Random(cfg.batcher_seed + salt).sample(range(n), k)
             )
             return BatchSet(
-                bset._db_path, bset._enc, [bset._batches[i] for i in idx]
+                bset.db_path, bset.enc, [bset.batches[i] for i in idx]
             ), n
 
         (train_set, n_trn), (val_set, n_val), (test_set, n_tst) = (
@@ -722,13 +638,12 @@ def _worker(rank: int, cfg: RunConfig):
             _thin(val_set, 1),
             _thin(test_set, 2),
         )
-        if rank == 0:
-            print(
-                f"dataset_frac={cfg.dataset_frac}  "
-                f"train={len(train_set)}/{n_trn}  "
-                f"val={len(val_set)}/{n_val}  "
-                f"test={len(test_set)}/{n_tst} batches",
-            )
+        print(
+            f"dataset_frac={cfg.dataset_frac}  "
+            f"train={len(train_set)}/{n_trn}  "
+            f"val={len(val_set)}/{n_val}  "
+            f"test={len(test_set)}/{n_tst} batches",
+        )
 
     pin = device != "cpu" and not str(device).startswith("privateuseone")
     pw = cfg.num_workers > 0
@@ -809,9 +724,9 @@ def _worker(rank: int, cfg: RunConfig):
     # In profiler mode, pick which buckets to profile from metadata (atom
     # counts live in
     # each row (grp, stem, atoms), so no tensors are loaded). A single
-    # N*M_shard ranking
+    # N*M ranking
     # misses two things: (1) memory-risk buckets with large M but small N
-    # (N*M_shard is a
+    # (N*M is a
     # compute-time proxy dominated by N, so a huge-M/small-N bucket can rank
     # low on it even
     # though it has the biggest per-chunk activations), and (2) what a
@@ -819,13 +734,12 @@ def _worker(rank: int, cfg: RunConfig):
     # looks like (a pure worst-case sample only ever shows outliers). So the
     # profiling budget
     # is split three ways:
-    # 1. heaviest by N*M_shard  - compute-time worst case (usually
-    # huge-N/tiny-M; this is
-    #      where TP's all-reduce cost piles up, see dp_atom_threshold).
+    # 1. heaviest by N*M  - compute-time worst case (usually
+    # huge-N/tiny-M).
     # 2. heaviest by raw M      - memory-risk worst case (large per-chunk RFF
     # tensors),
-    #      invisible to the N*M_shard ranking whenever N is small.
-    # 3. a band around the median N*M_shard - representative "regular" batches,
+    #      invisible to the N*M ranking whenever N is small.
+    # 3. a band around the median N*M - representative "regular" batches,
     # so the
     #      two worst-case groups have a baseline to compare against.
     # Worst-of-group-1 stays first (bi=0, the profiler's "wait" step) so it
@@ -840,26 +754,22 @@ def _worker(rank: int, cfg: RunConfig):
         0,
     )  # (end of heavy_nm, end of heavy_m) indices into `worst`
     if cfg.profiler:
-        ws_proxy = max(world_size, 1)
 
         def _bucket_nm_proxy(i: int):
-            """Compute the N*M_shard compute-time proxy for bucket `i`.
+            """Compute the N*M compute-time proxy for bucket `i`.
 
             Parameters
             ----------
             i : int
-                Index of the bucket in `train_set._batches`.
+                Index of the bucket in `train_set.batches`.
 
             Returns
             -------
             int
-                Number of molecules in the bucket times the per-rank
-                atom-shard size (ceil-divided max atom count).
+                Number of molecules in the bucket times the max atom count.
             """
-            rows = train_set._batches[i]
-            return len(rows) * (
-                (max(r[2] for r in rows) + ws_proxy - 1) // ws_proxy
-            )
+            rows = train_set.batches[i]
+            return len(rows) * max(r[2] for r in rows)
 
         def _bucket_max_m(i: int):
             """Return the raw maximum atom count M for bucket `i`.
@@ -867,14 +777,14 @@ def _worker(rank: int, cfg: RunConfig):
             Parameters
             ----------
             i : int
-                Index of the bucket in `train_set._batches`.
+                Index of the bucket in `train_set.batches`.
 
             Returns
             -------
             int
                 Maximum atom count among molecules in the bucket.
             """
-            return max(r[2] for r in train_set._batches[i])
+            return max(r[2] for r in train_set.batches[i])
 
         n_each = 1 + cfg.prof_warmup + cfg.prof_active
         n_group = max(1, n_each // 3)
@@ -883,7 +793,7 @@ def _worker(rank: int, cfg: RunConfig):
             # hardcoded fixture list, build a lookup from (grp, stem) to
             # batch index
             key_to_bi: dict = {}
-            for bi, batch in enumerate(train_set._batches):
+            for bi, batch in enumerate(train_set.batches):
                 for grp, stem, _ in batch:
                     key_to_bi[(grp, stem)] = bi
             fixture_bis: list[int] = []
@@ -918,7 +828,7 @@ def _worker(rank: int, cfg: RunConfig):
             worst = heavy_nm + heavy_m + regular
             prof_group_bounds = (len(heavy_nm), len(heavy_nm) + len(heavy_m))
             mode = (
-                f"{len(heavy_nm)} heaviest N*M_shard + "
+                f"{len(heavy_nm)} heaviest N*M + "
                 f"{len(heavy_m)} heaviest M + {len(regular)} median"
             )
         prof_loader = DataLoader(
@@ -929,53 +839,51 @@ def _worker(rank: int, cfg: RunConfig):
             num_workers=cfg.num_workers,
             pin_memory=pin,
         )
-        if rank == 0:
 
-            def _describe(i: int):
-                """Format a bucket's molecule count and max atom count for
-                logging.
+        def _describe(i: int):
+            """Format a bucket's molecule count and max atom count for
+            logging.
 
-                Parameters
-                ----------
-                i : int
-                    Index of the bucket in `train_set._batches`.
+            Parameters
+            ----------
+            i : int
+                Index of the bucket in `train_set.batches`.
 
-                Returns
-                -------
-                str
-                    Human-readable description, e.g. '12 mols x 340 atoms'.
-                """
-                rows = train_set._batches[i]
-                return f"{len(rows)} mols x {max(r[2] for r in rows)} atoms"
+            Returns
+            -------
+            str
+                Human-readable description, e.g. '12 mols x 340 atoms'.
+            """
+            rows = train_set.batches[i]
+            return f"{len(rows)} mols x {max(r[2] for r in rows)} atoms"
 
-            print(f"[profiler] probing {mode}")
-            n_hm, n_hmax = prof_group_bounds
-            for label, group, proxy_fn in (
-                ("worst N*M_shard", worst[:n_hm], _bucket_nm_proxy),
-                ("worst M", worst[n_hm:n_hmax], _bucket_max_m),
-                ("median sample", worst[n_hmax:], _bucket_nm_proxy),
-            ):
-                if group:
-                    print(
-                        f"  {label:<16s} "
-                        f"proxy={proxy_fn(group[0]):<8d} "
-                        f"{_describe(group[0])}",
-                    )
+        print(f"[profiler] probing {mode}")
+        n_hm, n_hmax = prof_group_bounds
+        for label, group, proxy_fn in (
+            ("worst N*M", worst[:n_hm], _bucket_nm_proxy),
+            ("worst M", worst[n_hm:n_hmax], _bucket_max_m),
+            ("median sample", worst[n_hmax:], _bucket_nm_proxy),
+        ):
+            if group:
+                print(
+                    f"  {label:<16s} "
+                    f"proxy={proxy_fn(group[0]):<8d} "
+                    f"{_describe(group[0])}",
+                )
 
-    if rank == 0:
-        train_mols = sum(len(b) for b in train_set._batches)
-        val_mols = sum(len(b) for b in val_set._batches)
-        test_mols = sum(len(b) for b in test_set._batches)
-        print(
-            f"batches/epoch: train={len(train_set)}  "
-            f"val={len(val_loader)}  test={len(test_loader)}"
-            f"  (buckets; same count by design - each bucket "
-            f"contributes one sub-batch per split)",
-        )
-        print(
-            f"molecules:     train={train_mols}  val={val_mols}  "
-            f"test={test_mols}",
-        )
+    train_mols = sum(len(b) for b in train_set.batches)
+    val_mols = sum(len(b) for b in val_set.batches)
+    test_mols = sum(len(b) for b in test_set.batches)
+    print(
+        f"batches/epoch: train={len(train_set)}  "
+        f"val={len(val_loader)}  test={len(test_loader)}"
+        f"  (buckets; same count by design - each bucket "
+        f"contributes one sub-batch per split)",
+    )
+    print(
+        f"molecules:     train={train_mols}  val={val_mols}  "
+        f"test={test_mols}",
+    )
 
     # model
 
@@ -995,7 +903,6 @@ def _worker(rank: int, cfg: RunConfig):
         sigma_max=cfg.sigma_max,
         sigma_floor=cfg.sigma_floor,
         sigma_init_gain=cfg.sigma_init_gain,
-        dp_atom_threshold=cfg.dp_atom_threshold,
         compile=cfg.compile,
     ).to(device)
 
@@ -1042,27 +949,6 @@ def _worker(rank: int, cfg: RunConfig):
         eps=cfg.adam_eps,
         decoupled_weight_decay=True,
     )
-
-    # Mixed precision: fp16 autocast + GradScaler (CUDA only).
-    # GradScaler(enabled=False) makes scale()/unscale_()/step()/update()
-    # pass-throughs, so the loop below is byte-for-byte the same math in
-    # fp32 mode. Correctness under the manual TP/DP grad all-reduce
-    # depends on both ranks keeping the loss scale in LOCKSTEP: they
-    # start from the same init scale, and the grad all-reduce (below)
-    # runs BEFORE unscale_, so each rank unscales the identical summed
-    # gradient, makes the same inf/nan skip decision, and calls the
-    # same update() - the scale factor can never diverge across ranks
-    # (a divergence would corrupt the scaled-grad SUM, since it mixes
-    # grads scaled by different factors).
-    amp = bool(cfg.amp) and device.startswith("cuda")
-    scaler = torch.amp.GradScaler(  # pyright: ignore[reportPrivateImportUsage]
-        "cuda", init_scale=cfg.amp_init_scale, enabled=amp
-    )
-    if rank == 0 and amp:
-        print(
-            "mixed precision: fp16 autocast + GradScaler ON "
-            f"(init_scale={cfg.amp_init_scale}, RFF+Debye kept fp32)",
-        )
 
     # LR decay on validation plateau, stepped once per epoch with val loss.
     # Constructed here (before the resume block) so its state_dict can be
@@ -1127,8 +1013,6 @@ def _worker(rank: int, cfg: RunConfig):
         optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
-        if "scaler" in ckpt and ckpt["scaler"]:
-            scaler.load_state_dict(ckpt["scaler"])
         # "best_val" is the correct key going forward - it's the best
         # end-of-epoch validation loss seen so far, not a per-checkpoint
         # value (mid-epoch checkpoints don't run validation). Older
@@ -1169,21 +1053,19 @@ def _worker(rank: int, cfg: RunConfig):
             resume_skip = resume_phase_skip
             resume_phase = None  # training loop needs no phase-skip logic
         resume_grad_norms = list(ckpt.get("grad_norms", []))
-        if rank == 0:
-            resumed_lr = optimizer.param_groups[0]["lr"]
-            print(
-                f"resumed from {cfg.resume} (epoch {ckpt['epoch']}, "
-                f"phase {saved_phase}, batch_idx {saved_bi}, "
-                f"best_val {best_val:.4f}, lr {resumed_lr:.4g})",
-            )
+        resumed_lr = optimizer.param_groups[0]["lr"]
+        print(
+            f"resumed from {cfg.resume} (epoch {ckpt['epoch']}, "
+            f"phase {saved_phase}, batch_idx {saved_bi}, "
+            f"best_val {best_val:.4f}, lr {resumed_lr:.4g})",
+        )
         del ckpt
 
-    # profiler - diagnostic mode. Two decoupled layers, both on every rank:
+    # profiler - diagnostic mode. Two decoupled layers:
     #
     #   * _LoopProfiler  - O(1)-memory wall-clock section timers. Runs the FULL
-    # 1 + prof_warmup + prof_active window so per-rank averages are
-    # representative;
-    # this is what exposes tensor-parallel skew, and it costs ~nothing in RAM.
+    # 1 + prof_warmup + prof_active window so the averages are
+    # representative, and it costs ~nothing in RAM.
     #
     # * torch.profiler - kernel-level trace. This buffers every op (thousands
     # per
@@ -1211,7 +1093,7 @@ def _worker(rank: int, cfg: RunConfig):
     )  # keep the heavy torch trace to a few steps
     tb_stop_bi = prof_warmup + tb_active  # torch profiler's last step index
 
-    loop_prof = _LoopProfiler(rank, device, enabled=cfg.profiler)
+    loop_prof = _LoopProfiler(device, enabled=cfg.profiler)
 
     def _on_trace_ready(p: torch.profiler.profile):
         """Handle a completed torch.profiler trace: print a kernel table and
@@ -1239,21 +1121,17 @@ def _worker(rank: int, cfg: RunConfig):
         # line isn't column-aligned with the row below it. Shrinking the
         # name column keeps the whole table narrower so it's less likely
         # to wrap.
-        if rank == 0:
-            print(
-                f"\n[profiler] top GPU ops (rank 0, "
-                f"{tb_active} active batch(es)):",
-            )
-            print(
-                p.key_averages().table(
-                    sort_by="cuda_time_total",
-                    row_limit=25,
-                    max_name_column_width=30,
-                ),
-            )
-        torch.profiler.tensorboard_trace_handler(
-            f"./profiler_trace/rank{rank}"
-        )(p)
+        print(
+            f"\n[profiler] top GPU ops ({tb_active} active batch(es)):",
+        )
+        print(
+            p.key_averages().table(
+                sort_by="cuda_time_total",
+                row_limit=25,
+                max_name_column_width=30,
+            ),
+        )
+        torch.profiler.tensorboard_trace_handler("./profiler_trace")(p)
 
     _prof = None
     if cfg.profiler:
@@ -1271,13 +1149,12 @@ def _worker(rank: int, cfg: RunConfig):
             with_stack=False,  # huge per-event RAM at export; keep off
         )
         _prof.start()
-        if rank == 0:
-            print(
-                "[profiler] started on all ranks - section timers over "
-                f"1+{prof_warmup}+{prof_active} batches, torch trace "
-                f"over 1+{prof_warmup}+{tb_active}; "
-                "traces -> ./profiler_trace/rank<r>/",
-            )
+        print(
+            "[profiler] started - section timers over "
+            f"1+{prof_warmup}+{prof_active} batches, torch trace "
+            f"over 1+{prof_warmup}+{tb_active}; "
+            "traces -> ./profiler_trace/",
+        )
 
     # training loop
 
@@ -1305,9 +1182,6 @@ def _worker(rank: int, cfg: RunConfig):
     ):
         """Write the resume checkpoint (weights, optimizer, position) and
         push it off-box.
-
-        Both TP ranks hold identical weights, so rank 0's state_dict is
-        complete.
 
         Covers all three per-epoch stages, not just training: `phase`
         records which stage this checkpoint belongs to ("train", "val",
@@ -1369,7 +1243,6 @@ def _worker(rank: int, cfg: RunConfig):
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
-                "scaler": scaler.state_dict(),
                 "best_val": best_val,
                 "grad_norms": batch_grad_norms,
                 "lr": optimizer.param_groups[0]["lr"],
@@ -1385,7 +1258,7 @@ def _worker(rank: int, cfg: RunConfig):
     # metrics underneath it are self-describing. Written after the resume
     # block, so
     # a resumed run records the config it is actually continuing under.
-    if rank == 0 and cfg.data_dir:
+    if cfg.data_dir:
         from Train.eval_plots import save_run_config_rtf
 
         save_run_config_rtf(cfg, cfg.data_dir)
@@ -1402,7 +1275,8 @@ def _worker(rank: int, cfg: RunConfig):
         )
         skip_val_entirely = is_resumed_epoch and resume_phase == "test"
 
-        # Seed before iteration so all ranks shuffle train_loader identically.
+        # Seed before iteration so train_loader shuffles identically across
+        # resumes.
         torch.manual_seed(cfg.batcher_seed + epoch)
 
         model.train()
@@ -1418,8 +1292,7 @@ def _worker(rank: int, cfg: RunConfig):
         # every step, which is gradient normalisation rather than a safety
         # valve, and the clip factor then varies with molecule size (buckets
         # are size-sorted), systematically downweighting large molecules.
-        # Set grad_clip off the p99 of this series. inf entries are real:
-        # that is an fp16 overflow batch that GradScaler then skipped.
+        # Set grad_clip off the p99 of this series.
         batch_grad_norms: list[tuple[int, float]] = (
             resume_grad_norms if is_resumed_epoch else []
         )
@@ -1460,9 +1333,7 @@ def _worker(rank: int, cfg: RunConfig):
             loop_prof.start_batch(rec)
             if cfg.profiler:
                 # Bucket geometry, read off the still-on-CPU batch (no GPU
-                # sync).
-                # real_atoms drives the per-rank shard imbalance behind the
-                # ALLREDUCE timeout, so it is logged next to per-batch timings.
+                # sync), logged next to per-batch timings.
                 rec["n_mols"] = batch.vocab.shape[0]
                 rec["max_atoms"] = batch.vocab.shape[1]
                 rec["real_atoms"] = int(batch.padding_mask().sum().item())
@@ -1483,25 +1354,21 @@ def _worker(rank: int, cfg: RunConfig):
             optimizer.zero_grad(set_to_none=True)
 
             with loop_prof.section("forward", rec):
-                with torch.autocast(
-                    device_type="cuda", dtype=torch.float16, enabled=amp
-                ):
-                    iq, fmags, sigmas, local_batch, loss_scale = model(batch)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    iq, coh, inc, fmags, sigmas = model(batch)
             with loop_prof.section("loss", rec):
-                with torch.autocast(
-                    device_type="cuda", dtype=torch.float16, enabled=amp
-                ):
-                    loss = (
-                        model.compute_loss(
-                            iq,
-                            fmags,
-                            local_batch,
-                            cfg.lambda_6,
-                        )
-                        * loss_scale
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss = model.compute_loss(
+                        iq,
+                        coh,
+                        inc,
+                        fmags,
+                        batch,
+                        cfg.lambda_6,
+                        cfg.lambda_7,
                     )
 
-            if rank == 0 and cfg.verbosity == "diagnostic":
+            if cfg.verbosity == "diagnostic":
 
                 def _s(t: torch.Tensor):
                     """Format a tensor's NaN/Inf/min/max summary for debug
@@ -1535,88 +1402,30 @@ def _worker(rank: int, cfg: RunConfig):
                     print(f"    iq:     {_s(iq)}")
                     print(f"    fmags:  {_s(fmags)}")
                     print(f"    sigmas: {_s(sigmas)}")
-                    print(f"    iqval:  {_s(local_batch.iqval)}")
-                    print(f"    coord:  {_s(local_batch.coord)}")
-                    n_real = local_batch.padding_mask().sum().item()
+                    print(f"    iqval:  {_s(batch.iqval)}")
+                    print(f"    coord:  {_s(batch.coord)}")
+                    n_real = batch.padding_mask().sum().item()
                     print(
-                        f"    vocab shape: {local_batch.vocab.shape}  "
+                        f"    vocab shape: {batch.vocab.shape}  "
                         f"n_real_atoms: {n_real}",
                     )
 
             with loop_prof.section("backward", rec):
-                scaler.scale(loss).backward()
-
-            # With TP, each rank's parameter gradients are a partial sum over
-            # its
-            # atom shard, so they must be summed across ranks (SUM, not average
-            # -
-            # DDP averages, TP needs the full sum). With DP (small-M batches
-            # routed
-            # by dp_atom_threshold), ScatterNet.forward's loss_scale =
-            # local_N/global_N
-            # rescales each rank's local-mean loss before backward, so the same
-            # SUM
-            # here reconstructs the correct global-mean gradient instead of
-            # double-
-            # counting it - one all-reduce rule serves both routing modes. A
-            # rank
-            # that is fast everywhere else but slow here is *waiting* on a
-            # laggard
-            # peer - that's the skew to hunt with the per-rank section report.
-            if is_dist:
-                with loop_prof.section("grad_allreduce", rec):
-                    # Flattened into one all_reduce instead of one call per
-                    # parameter:
-                    # same SUM semantics (see comment above), but a single
-                    # collective
-                    # instead of a serial Python-loop of N tiny ones. All
-                    # params are
-                    # fp32 (only activations run in fp16 under autocast), so
-                    # flattening
-                    # is dtype-safe across the whole model.
-                    grads = [
-                        p.grad
-                        for p in model.parameters()
-                        if p.grad is not None
-                    ]
-                    if grads:
-                        flat = _flatten_dense_tensors(grads)
-                        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-                        for g, synced in zip(
-                            grads, _unflatten_dense_tensors(flat, grads)
-                        ):
-                            g.copy_(synced)
+                loss.backward()
 
             with loop_prof.section("clip", rec):
-                # unscale BEFORE clip so the norm acts on true gradients; done
-                # AFTER the
-                # all-reduce above so both ranks unscale the identical summed
-                # grad (keeps the
-                # scale in lockstep - see the scaler comment near its
-                # construction). No-op
-                # when amp is off.
-                scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), cfg.grad_clip
                 )
             with loop_prof.section("step", rec):
-                # internally skips the step if grads are inf/nan (fp16
-                # overflow)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
 
             # Grad-norm diagnostic, hoisted ABOVE the profiler branch so it
             # fires in
             # profiler mode too (that branch `continue`s past the rest of the
-            # tail). This
-            # is the main lever for debugging an AMP run under the profiler:
-            # grad_norm goes
-            # inf when fp16 grads overflow - expected, GradScaler then skips
-            # the step and
-            # halves the scale, and this line makes that visible.
+            # tail).
             if (
-                rank == 0
-                and cfg.verbosity == "diagnostic"
+                cfg.verbosity == "diagnostic"
                 and (_bi < 12 or not torch.isfinite(grad_norm))
             ):
                 print(
@@ -1630,11 +1439,10 @@ def _worker(rank: int, cfg: RunConfig):
                 ):  # stop the memory-heavy trace early; timers keep going
                     _prof.stop()
                     _prof = None
-                    if rank == 0:
-                        print(
-                            "[profiler] torch trace written - see "
-                            "./profiler_trace/rank<r>/",
-                        )
+                    print(
+                        "[profiler] torch trace written - see "
+                        "./profiler_trace/",
+                    )
 
             if cfg.profiler:
                 rec["compute"] = sum(
@@ -1643,38 +1451,34 @@ def _worker(rank: int, cfg: RunConfig):
                         "forward",
                         "loss",
                         "backward",
-                        "grad_allreduce",
                         "clip",
                         "step",
                     )
                 )
-                del iq, fmags, sigmas, loss
+                del iq, coh, inc, fmags, sigmas, loss
                 loop_prof.end_batch(rec)
-                if (
-                    _bi >= prof_stop_bi
-                ):  # all ranks stop together to avoid NCCL deadlock
+                if _bi >= prof_stop_bi:  # loop's last profiled batch
                     loop_prof.report()
                     break
                 continue  # skip the metrics/logging tail during profiling
 
-            n = local_batch.iqval.shape[0]
+            n = batch.iqval.shape[0]
             batch_loss = loss.item()
             train_loss_sum += batch_loss * n
             train_mols += n
             batch_grad_norms.append((_bi, grad_norm.item()))
             with torch.no_grad():
                 log_pred = torch.log1p(iq)
-                log_target = torch.log1p(local_batch.iqval)
+                log_target = torch.log1p(batch.iqval)
                 train_ss_res += ((log_pred - log_target) ** 2).sum().item()
                 train_sum_y += log_target.sum().item()
                 train_sum_y2 += (log_target**2).sum().item()
                 train_n_elem += log_target.numel()
 
-            del iq, fmags, sigmas, loss, log_pred, log_target
+            del iq, coh, inc, fmags, sigmas, loss, log_pred, log_target
 
             if (
-                rank == 0
-                and cfg.verbosity in ("batch", "diagnostic")
+                cfg.verbosity in ("batch", "diagnostic")
                 and (_bi + 1) % 20 == 0
             ):
                 elapsed = _time.time() - _t0
@@ -1694,13 +1498,8 @@ def _worker(rank: int, cfg: RunConfig):
                 torch.cuda.reset_peak_memory_stats()
 
             # Crash safety: every ckpt_interval_sec, save a mid-epoch resume
-            # point
-            # (rank 0 only; both ranks hold identical weights) and push it
-            # off-box.
-            if (
-                rank == 0
-                and (_time.time() - last_ckpt) > cfg.ckpt_interval_sec
-            ):
+            # point and push it off-box.
+            if (_time.time() - last_ckpt) > cfg.ckpt_interval_sec:
                 _save_resume(epoch, _bi)
                 last_ckpt = _time.time()
                 if cfg.verbosity in ("batch", "diagnostic"):
@@ -1720,17 +1519,16 @@ def _worker(rank: int, cfg: RunConfig):
             train_r2 = (
                 1.0 - train_ss_res / train_ss_tot if train_ss_tot > 0 else 0.0
             )
-            if rank == 0:
-                # Marks training done for this epoch, so a crash during val
-                # or test resumes straight into that phase instead of
-                # redoing the training loop.
-                _save_resume(
-                    epoch,
-                    -1,
-                    phase="train",
-                    train_loss=train_loss,
-                    train_r2=train_r2,
-                )
+            # Marks training done for this epoch, so a crash during val
+            # or test resumes straight into that phase instead of
+            # redoing the training loop.
+            _save_resume(
+                epoch,
+                -1,
+                phase="train",
+                train_loss=train_loss,
+                train_r2=train_r2,
+            )
 
         if skip_val_entirely:
             val_loss, val_r2 = resume_val_loss, resume_val_r2
@@ -1751,54 +1549,42 @@ def _worker(rank: int, cfg: RunConfig):
                 model,
                 cfg,
                 device,
-                rank,
                 "val",
                 start_batch=val_start,
                 resume_state=val_state,
                 ckpt_cb=(
-                    (
-                        lambda st, bi: _save_resume(
-                            epoch,
-                            bi,
-                            phase="val",
-                            eval_state=st,
-                            train_loss=train_loss,
-                            train_r2=train_r2,
-                        )
+                    lambda st, bi: _save_resume(
+                        epoch,
+                        bi,
+                        phase="val",
+                        eval_state=st,
+                        train_loss=train_loss,
+                        train_r2=train_r2,
                     )
-                    if rank == 0
-                    else None
                 ),
             )
             torch.cuda.empty_cache()
-            if rank == 0:
-                # Marks val done for this epoch, so a crash during test
-                # resumes straight into test instead of redoing val.
-                _save_resume(
-                    epoch,
-                    -1,
-                    phase="val",
-                    train_loss=train_loss,
-                    train_r2=train_r2,
-                    val_loss=val_loss,
-                    val_r2=val_r2,
-                )
+            # Marks val done for this epoch, so a crash during test
+            # resumes straight into test instead of redoing val.
+            _save_resume(
+                epoch,
+                -1,
+                phase="val",
+                train_loss=train_loss,
+                train_r2=train_r2,
+                val_loss=val_loss,
+                val_r2=val_r2,
+            )
 
         # Test set is walked exactly once per epoch. When diagnostic plots are
         # on,
-        # save_epoch_plots' single (forced-TP) pass ALSO returns the test
-        # loss/R2,
-        # so we skip the separate evaluate(test_loader) that used to double the
-        # test
+        # save_epoch_plots' single pass ALSO returns the test loss/R2, so we
+        # skip the separate evaluate(test_loader) that used to double the test
         # cost. Baseline-style diagnostic plots (per-q R2, percent error,
         # Kratky
         # overlay, residual histogram, error-vs-atom-count) reuse
         # Baselines/run/metrics.py
         # so they stay directly comparable to Baselines/kaggle_baselines.ipynb.
-        # The
-        # plots pass runs on every rank (TP-forced forward needs all ranks); it
-        # gates
-        # file-writing to rank 0 but returns identical loss/R2 on every rank.
         test_start = (
             resume_phase_skip
             if (is_resumed_epoch and resume_phase == "test")
@@ -1833,17 +1619,16 @@ def _worker(rank: int, cfg: RunConfig):
                 model,
                 test_loader,
                 q_grid,
-                cfg.amp,
                 device,
                 cfg.data_dir,
                 epoch,
-                rank,
                 compute_loss=True,
                 lambda_6=cfg.lambda_6,
+                lambda_7=cfg.lambda_7,
                 verbose=cfg.verbosity in ("batch", "diagnostic"),
                 start_batch=test_start,
                 resume_state=test_state,
-                ckpt_cb=_test_ckpt_cb if rank == 0 else None,
+                ckpt_cb=_test_ckpt_cb,
                 ckpt_interval_sec=cfg.ckpt_interval_sec,
             )
             torch.cuda.empty_cache()
@@ -1853,96 +1638,94 @@ def _worker(rank: int, cfg: RunConfig):
                 model,
                 cfg,
                 device,
-                rank,
                 "test",
                 start_batch=test_start,
                 resume_state=test_state,
-                ckpt_cb=_test_ckpt_cb if rank == 0 else None,
+                ckpt_cb=_test_ckpt_cb,
             )
             torch.cuda.empty_cache()
 
-        if rank == 0:
-            print(
-                f"epoch {epoch:3d}"
-                f"  train loss {train_loss:.4f}  r2 {train_r2:.4f}"
-                f"  |  val loss {val_loss:.4f}  r2 {val_r2:.4f}"
-                f"  |  test loss {test_loss:.4f}  r2 {test_r2:.4f}"
+        print(
+            f"epoch {epoch:3d}"
+            f"  train loss {train_loss:.4f}  r2 {train_r2:.4f}"
+            f"  |  val loss {val_loss:.4f}  r2 {val_r2:.4f}"
+            f"  |  test loss {test_loss:.4f}  r2 {test_r2:.4f}"
+        )
+
+        # This epoch's numbers go in this epoch's own dir, one json per
+        # epoch, and
+        # the loss-vs-epoch curve is then drawn from the jsons READ BACK
+        # OFF DISK
+        # (not from an in-memory history list). That is what makes a resume
+        # safe:
+        # a resumed process has no memory of the epochs it did not run, so
+        # a
+        # single run-level metrics file would be rewritten with only the
+        # post-resume epochs, silently truncating everything before it.
+        # Concatenate
+        # the per-epoch jsons after the run for the full history. Both
+        # steps are
+        # cheap (no forward passes), as is the off-box push (rclone copy is
+        # incremental: earlier epochs' files are already uploaded and get
+        # skipped).
+        if cfg.data_dir:
+            from Train.eval_plots import (
+                load_epoch_history,
+                save_epoch_loss_plot,
+                save_epoch_metrics,
             )
 
-            # This epoch's numbers go in this epoch's own dir, one json per
-            # epoch, and
-            # the loss-vs-epoch curve is then drawn from the jsons READ BACK
-            # OFF DISK
-            # (not from an in-memory history list). That is what makes a resume
-            # safe:
-            # a resumed process has no memory of the epochs it did not run, so
-            # a
-            # single run-level metrics file would be rewritten with only the
-            # post-resume epochs, silently truncating everything before it.
-            # Concatenate
-            # the per-epoch jsons after the run for the full history. Both
-            # steps are
-            # cheap (no forward passes), as is the off-box push (rclone copy is
-            # incremental: earlier epochs' files are already uploaded and get
-            # skipped).
-            if cfg.data_dir:
-                from Train.eval_plots import (
-                    load_epoch_history,
-                    save_epoch_loss_plot,
-                    save_epoch_metrics,
-                )
-
-                save_epoch_metrics(
-                    {
-                        "epoch": epoch,
-                        "train_loss": train_loss,
-                        "train_r2": train_r2,
-                        "val_loss": val_loss,
-                        "val_r2": val_r2,
-                        "test_loss": test_loss,
-                        "test_r2": test_r2,
-                    },
-                    cfg.data_dir,
-                    epoch,
-                )
-                save_epoch_loss_plot(
-                    load_epoch_history(cfg.data_dir), cfg.data_dir
-                )
-                _rclone_push(cfg.data_dir, cfg.data_rclone_dest)
-
-            # update best BEFORE the resume save so the latter records the
-            # current best_val. val_loss/val_r2 are always floats by this
-            # point (either just computed, or carried forward from a
-            # checkpoint written after val phase completed - never None).
-            assert val_loss is not None
-            if val_loss < best_val:
-                best_val = val_loss
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model": model.state_dict(),
-                        "val_loss": val_loss,
-                        "q_grid": q_grid,
-                        "energy": energy,
-                        "hparams": hparams,
-                    },
-                    cfg.ckpt_best,
-                )
-                _rclone_push(cfg.ckpt_best, cfg.ckpt_rclone_dest)
-                print(f"  saved best checkpoint (val {val_loss:.4f})")
-
-            # phase="test", batch_idx=-1: test done -> whole epoch complete,
-            # matching the phase-machine's terminal state (see the resume
-            # block's _PHASE_ORDER walk).
-            _save_resume(
+            save_epoch_metrics(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "train_r2": train_r2,
+                    "val_loss": val_loss,
+                    "val_r2": val_r2,
+                    "test_loss": test_loss,
+                    "test_r2": test_r2,
+                },
+                cfg.data_dir,
                 epoch,
-                -1,
-                phase="test",
-                train_loss=train_loss,
-                train_r2=train_r2,
-                val_loss=val_loss,
-                val_r2=val_r2,
             )
+            save_epoch_loss_plot(
+                load_epoch_history(cfg.data_dir), cfg.data_dir
+            )
+            _rclone_push(cfg.data_dir, cfg.data_rclone_dest)
+
+        # update best BEFORE the resume save so the latter records the
+        # current best_val. val_loss/val_r2 are always floats by this
+        # point (either just computed, or carried forward from a
+        # checkpoint written after val phase completed - never None).
+        assert val_loss is not None
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "val_loss": val_loss,
+                    "q_grid": q_grid,
+                    "energy": energy,
+                    "hparams": hparams,
+                },
+                cfg.ckpt_best,
+            )
+            _rclone_push(cfg.ckpt_best, cfg.ckpt_rclone_dest)
+            print(f"  saved best checkpoint (val {val_loss:.4f})")
+
+        # phase="test", batch_idx=-1: test done -> whole epoch complete,
+        # matching the phase-machine's terminal state (see the resume
+        # block's _PHASE_ORDER walk).
+        _save_resume(
+            epoch,
+            -1,
+            phase="test",
+            train_loss=train_loss,
+            train_r2=train_r2,
+            val_loss=val_loss,
+            val_r2=val_r2,
+        )
 
         # This epoch's resume-phase carryover is now fully consumed - later
         # epochs always start fresh.
@@ -1952,23 +1735,15 @@ def _worker(rank: int, cfg: RunConfig):
         resume_train_loss = resume_train_r2 = None
         resume_val_loss = resume_val_r2 = None
 
-        # Every rank steps identically, so the LR stays in lockstep across
-        # TP/DP ranks same as the model weights. That used to hold because
-        # the step was a pure function of the epoch count; with the plateau
-        # scheduler it holds because val_loss itself is rank-identical:
-        # evaluate() all_reduces its stat accumulators on DP-split batches,
-        # and on the TP path every rank sees the same batch and the same
-        # all-reduced I(q). Feeding a rank-LOCAL metric here would silently
-        # desync the LR across ranks mid-run.
+        # val_loss/val_r2 are always floats by this point (either just
+        # computed, or carried forward from a checkpoint written after val
+        # phase completed - never None).
         assert val_loss is not None
         prev_lr = optimizer.param_groups[0]["lr"]
         scheduler.step(val_loss)
         new_lr = optimizer.param_groups[0]["lr"]
-        if rank == 0 and new_lr != prev_lr:
+        if new_lr != prev_lr:
             print(f"  val loss plateaued, lr {prev_lr:.3g} -> {new_lr:.3g}")
-
-    if is_dist:
-        dist.destroy_process_group()
 
 
 # entry point
@@ -1976,11 +1751,8 @@ def main(cfg: RunConfig | None = None):
     """Entry point for training.
 
     Pass a RunConfig directly (e.g. from a Kaggle notebook), or leave None
-    to parse sys.argv.
-
-    With multiple GPUs, launches one process per GPU via mp.spawn.
-    Each process initialises NCCL and runs the full training loop with
-    M-dimension tensor parallelism.
+    to parse sys.argv. Runs the training loop in-process on the single
+    available GPU.
 
     Parameters
     ----------
@@ -2010,14 +1782,12 @@ def main(cfg: RunConfig | None = None):
             msg_seed=A.msg_seed,
             atm_chunk=A.atm_chunk,
             mol_chunk=A.mol_chunk,
-            dp_atom_threshold=A.dp_atom_threshold,
             compile=A.compile,
-            amp=A.amp,
-            amp_init_scale=A.amp_init_scale,
             eps_embd=A.eps_embd,
             eps_msgp=A.eps_msgp,
             lambda_6=A.lambda_6,
-                lr=A.lr,
+            lambda_7=A.lambda_7,
+            lr=A.lr,
             lr_factor=A.lr_factor,
             lr_patience=A.lr_patience,
             lr_threshold=A.lr_threshold,
@@ -2038,20 +1808,7 @@ def main(cfg: RunConfig | None = None):
 
     assert cfg is not None
 
-    n_gpus = torch.cuda.device_count()
-    if n_gpus > 1:
-        # build the encoding DB once here, before spawning workers -- each
-        # worker
-        # process also constructs Encoding(cfg.encodings_sqlite3_path,
-        # cfg.hdf5), and if
-        # the sqlite3 file doesn't exist yet they'd race to create it
-        # concurrently and hit
-        # "database is locked". Pre-building means every worker takes the
-        # fast, lock-free "found existing database" path instead.
-        Encoding(cfg.encodings_sqlite3_path, cfg.hdf5)
-        mp_spawn(_worker, args=(cfg,), nprocs=n_gpus, join=True)
-    else:
-        _worker(0, cfg)
+    _worker(cfg)
 
 
 if __name__ == "__main__":

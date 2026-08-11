@@ -118,38 +118,11 @@ class RunConfig:
         size of chem_env (mol_chunk, Q, lambda_5, lambda_1); only one
         N-chunk's chem_env exists at a time (freed after each N-chunk
         checkpoint recomputation).
-    dp_atom_threshold : int
-        Training-only routing knob (only matters with >1 GPU). A
-        batch's padded atom count is M. If M < dp_atom_threshold AND
-        the batch's molecule count N >= 2*mol_chunk, it is routed
-        through data-parallel splitting (molecules divided across
-        ranks, no in-model all-reduce) instead of the default
-        tensor-parallel atom sharding. TP shards atoms
-        across ranks and all-reduces to reconstruct chem_env every
-        round; for buckets with very few atoms per molecule that
-        all-reduce cost dwarfs the tiny amount of per-rank compute it
-        parallelises. The N >= 2*mol_chunk guard matters too: DP
-        halves the outer N-chunk loop but does NOT halve M before
-        MessagePass's own atm_chunk-loop runs (TP does, by sharding M
-        first), so a DP-routed bucket runs ~2x the inner
-        M-chunk-loop launches TP would've had on the same bucket.
     compile : bool
         If True, torch.compile the checkpointed step functions in
         Embed, MessagePass, OutputHead, and Loss (fullgraph=True,
         dynamic=True). True (default) compiles them; set False to run
         eager.
-    amp : bool
-        If True, run forward/backward under fp16 autocast +
-        GradScaler (CUDA only; no-op on CPU). Halves activation
-        memory and uses Turing/Ampere fp16 tensor cores. MessagePass's
-        RFF projection is kept in fp32 to avoid overflow. False
-        (default) trains in fp32.
-    amp_init_scale : float
-        GradScaler starting loss scale when amp is on. Default 1024
-        (not torch's 65536): this model's activations sit near O(1)
-        after mean-normalization, so a lower start avoids the initial
-        overflow/back-off thrash a 65536 scale causes here. GradScaler
-        still auto-grows/backs-off from this. Ignored when amp is off.
     eps_embd : float
         Numerical floor in the Embed module (avoids division by
         zero).
@@ -165,6 +138,10 @@ class RunConfig:
     Loss
     lambda_6 : float
         Weight on the form-factor penalty term. See
+        ScatterNet/scatter_net.py's ScatterNet.compute_loss.
+    lambda_7 : float
+        Weight on the 2nd-derivative roughness penalty term, applied to
+        the pre-`SplineSmooth` coherent/incoherent curves. See
         ScatterNet/scatter_net.py's ScatterNet.compute_loss.
 
     Training
@@ -291,12 +268,7 @@ class RunConfig:
     msg_seed: int = 42
     atm_chunk: int = 512
     mol_chunk: int = 256
-    dp_atom_threshold: int = (
-        0  # 0 = always TP (old behaviour); see docstring above
-    )
     compile: bool = True  # torch.compile checkpointed step functions
-    amp: bool = False  # fp16 autocast + GradScaler
-    amp_init_scale: float = 1024.0  # GradScaler starting loss scale (amp only)
     eps_embd: float = 1e-8
     eps_msgp: float = 1e-3
     sigma_max: float = 100.0
@@ -307,6 +279,7 @@ class RunConfig:
 
     # loss
     lambda_6: float = 1.0
+    lambda_7: float = 0.25
 
     # training
     lr: float = 1.3e-4
@@ -382,13 +355,13 @@ class RunConfig:
         # literal silently sails through here and only blows up later inside
         # beartype-guarded Loss.loss() call, deep into a training run.
         for name in (
-            "amp_init_scale",
             "eps_embd",
             "eps_msgp",
             "sigma_max",
             "sigma_floor",
             "sigma_init_gain",
             "lambda_6",
+            "lambda_7",
             "lr",
             "lr_factor",
             "lr_threshold",

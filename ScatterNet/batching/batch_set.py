@@ -67,9 +67,24 @@ class BatchSet(Dataset):
             Pre-built batches from ``Batcher``, each a list of
             (grp, stem, atoms) rows.
         """
-        self._batches = batches
-        self._enc = enc
-        self._db_path = hdf5_db
+        self.__batches = batches
+        self.__enc = enc
+        self.__db_path = hdf5_db
+
+    @property
+    def batches(self) -> list:
+        """The list of batch buckets."""
+        return self.__batches
+
+    @property
+    def enc(self) -> Encoding:
+        """The vocabulary encoder."""
+        return self.__enc
+
+    @property
+    def db_path(self) -> str:
+        """Path to the source HDF5 database."""
+        return self.__db_path
 
     def __len__(self) -> int:
         """Return the number of pre-built batches in this dataset.
@@ -79,7 +94,7 @@ class BatchSet(Dataset):
         int
             Number of batches.
         """
-        return len(self._batches)
+        return len(self.__batches)
 
     def __getitem__(self, i: int) -> Batch:
         """Load and return sub-batch ``i``
@@ -96,8 +111,8 @@ class BatchSet(Dataset):
             The loaded batch, with vocab, I(q) intensities, and coordinates
             read from the HDF5 file and padded via ``Batch.from_lists``.
         """
-        rows = self._batches[i]
-        vocab_by_key = self._enc.get_vocab_for_keys(
+        rows = self.__batches[i]
+        vocab_by_key = self.__enc.get_vocab_for_keys(
             [(grp, stem) for grp, stem, _ in rows]
         )
 
@@ -105,7 +120,7 @@ class BatchSet(Dataset):
         iqval: List = []
         coord: List = []
 
-        with h5py.File(self._db_path, "r") as db:
+        with h5py.File(self.__db_path, "r") as db:
             for grp, stem, _ in rows:
                 mol = db[grp][stem]  # type: ignore
                 vocab.append(torch.tensor(vocab_by_key[(grp, stem)]))

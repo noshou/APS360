@@ -36,9 +36,9 @@ class Batcher:
         Wraps the three resulting lists in ``BatchSet`` instances.
     """
 
-    _train: "BatchSet"
-    _val: "BatchSet"
-    _test: "BatchSet"
+    __train: "BatchSet"
+    __val: "BatchSet"
+    __test: "BatchSet"
 
     def __init__(
         self,
@@ -216,7 +216,7 @@ class Batcher:
         batch (by nearest median atom count, ties merge down), then each
         remaining batch is independently split at the molecule level using
         a seeded RNG. The results are wrapped into ``BatchSet`` instances and
-        assigned to ``self._train``, ``self._val``, and ``self._test``.
+        assigned to ``self.__train``, ``self.__val``, and ``self.__test``.
 
         Parameters
         ----------
@@ -306,9 +306,9 @@ class Batcher:
                 [batch[j] for j in idx[n_trn + n_val : n_trn + n_val + n_tst]]
             )
 
-        self._train = BatchSet(hdf5_db, enc, [b for b in train_batches if b])
-        self._val = BatchSet(hdf5_db, enc, [b for b in val_batches if b])
-        self._test = BatchSet(hdf5_db, enc, [b for b in test_batches if b])
+        self.__train = BatchSet(hdf5_db, enc, [b for b in train_batches if b])
+        self.__val = BatchSet(hdf5_db, enc, [b for b in val_batches if b])
+        self.__test = BatchSet(hdf5_db, enc, [b for b in test_batches if b])
 
     def get_sets(self) -> Tuple[BatchSet, BatchSet, BatchSet]:
         """Return the pre-built train, validation, and test BatchSets.
@@ -319,4 +319,4 @@ class Batcher:
             A ``(train, val, test)`` tuple of ``BatchSet``, used with
             ``DataLoader(batch_size=1, collate_fn=lambda x: x[0])``.
         """
-        return self._train, self._val, self._test
+        return self.__train, self.__val, self.__test

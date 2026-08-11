@@ -5,8 +5,8 @@ import torch
 from beartype import beartype
 from beartype.typing import Tuple
 from jaxtyping import jaxtyped
+from pyteals import NoTrilinBilin
 from torch import nn
-from torch_extras import NoTrilinBilin
 
 from Preprocess import VOCAB
 
@@ -102,12 +102,12 @@ class Embed(nn.Module):
     dL/dW = dL/dy * x, which is independent of W's magnitude.
     """
 
-    _mbd: nn.Embedding      # atom identity in learned space
-    _f0f1: nn.Linear        # approximate real form factor at each q
-    _f2: nn.Linear          # approximate imaginary form factor at each q
-    _prelu: nn.PReLU        # prelu activation function
-    _sigma: NoTrilinBilin   # computes positional scaling from embed and f_mag
-    _fwd_fn: (Callable)     # torch.compiled or plain _forward_fn flag
+    __mbd: nn.Embedding      # atom identity in learned space
+    __f0f1: nn.Linear        # approximate real form factor at each q
+    __f2: nn.Linear          # approximate imaginary form factor at each q
+    __prelu: nn.PReLU        # prelu activation function
+    __sigma: NoTrilinBilin   # computes positional scaling from embed and f_mag
+    __fwd_fn: (Callable)     # torch.compiled or plain _forward_fn flag
 
     def __init__(
         self,
@@ -155,15 +155,15 @@ class Embed(nn.Module):
 
         super().__init__()
         qPoints = qgrid.shape[0]
-        self._log_sigma_floor = math.log(sigma_floor)
-        self._log_sigma_max = math.log(sigma_max)
+        self.__log_sigma_floor = math.log(sigma_floor)
+        self.__log_sigma_max = math.log(sigma_max)
         # midpoint / half-width of the log-sigma window, for the arctan
         # saturation that replaced the hard clamp (see class docstring).
-        self._log_sigma_mid = 0.5 * (
-            self._log_sigma_floor + self._log_sigma_max
+        self.__log_sigma_mid = 0.5 * (
+            self.__log_sigma_floor + self.__log_sigma_max
         )
-        self._log_sigma_half = 0.5 * (
-            self._log_sigma_max - self._log_sigma_floor
+        self.__log_sigma_half = 0.5 * (
+            self.__log_sigma_max - self.__log_sigma_floor
         )
 
         # 1/q sigma envelope, stored in log space (see class docstring).
@@ -180,29 +180,31 @@ class Embed(nn.Module):
         # persistent=False matches _q_weights_: derived from the q-grid,
         # not learned, so it stays out of the checkpoint.
         self.register_buffer(
-            "_log_sigma_env", env.log().view(1, 1, -1), persistent=False
+            "_Embed__log_sigma_env",
+            env.log().view(1, 1, -1),
+            persistent=False,
         )
-        self._mbd = nn.Embedding(
+        self.__mbd = nn.Embedding(
             len(VOCAB) + 1, lambda_1, padding_idx=0 # +1 since 0 is padding idx
         )
-        self._f0f1 = nn.Linear(lambda_1, qPoints)
-        self._f2 = nn.Linear(lambda_1, qPoints)
-        self._prelu = nn.PReLU(lambda_1)
+        self.__f0f1 = nn.Linear(lambda_1, qPoints)
+        self.__f2 = nn.Linear(lambda_1, qPoints)
+        self.__prelu = nn.PReLU(lambda_1)
 
         # Form-factor init: see the class docstring section of the same name.
         if f_init is not None:
             with torch.no_grad():
-                self._f0f1.weight.mul_(_F_INIT_WEIGHT_GAIN)
-                self._f2.weight.mul_(_F_INIT_WEIGHT_GAIN)
-                self._f0f1.bias.copy_(f_init.to(self._f0f1.bias.dtype))
-                self._f2.bias.zero_()
+                self.__f0f1.weight.mul_(_F_INIT_WEIGHT_GAIN)
+                self.__f2.weight.mul_(_F_INIT_WEIGHT_GAIN)
+                self.__f0f1.bias.copy_(f_init.to(self.__f0f1.bias.dtype))
+                self.__f2.bias.zero_()
 
         # The F.bilinear op dispatches to aten::_trilinear,
         # which profiled as a top CUDA op here (741ms / 12 calls) and forces
         # a torch.compile graph break. NoTrilinBilin is mathematically
         # identical (verified to fp32 rounding) with the same init, routing
         # through GEMM + elementwise instead.
-        self._sigma = NoTrilinBilin(lambda_1, qPoints, qPoints)
+        self.__sigma = NoTrilinBilin(lambda_1, qPoints, qPoints)
 
         # Shrink _sigma's init. Under exp, z is in log-sigma units, so its
         # init spread is a spread in orders of magnitude: a pre-activation
@@ -217,18 +219,18 @@ class Embed(nn.Module):
         # reproduces the old 0.1-with-wrong-fan-in scale to within 40%
         # (0.1/sqrt(128) = 8.8e-3 vs 1.0/sqrt(128*51) = 1.2e-2).
         with torch.no_grad():
-            self._sigma.weight.mul_(sigma_init_gain)
-            if self._sigma.bias is not None:
-                self._sigma.bias.mul_(sigma_init_gain)
+            self.__sigma.weight.mul_(sigma_init_gain)
+            if self.__sigma.bias is not None:
+                self.__sigma.bias.mul_(sigma_init_gain)
 
-        self._fwd_fn = (
-            torch.compile(self._forward_fn, dynamic=True, fullgraph=True)
+        self.__fwd_fn = (
+            torch.compile(self.__forward_fn, dynamic=True, fullgraph=True)
             if compile
-            else self._forward_fn
+            else self.__forward_fn
         )
 
     @staticmethod
-    def _forward_fn( # can't use jaxtyping/beartype due to torch.compile
+    def __forward_fn( # can't use jaxtyping/beartype due to torch.compile
         prelu: nn.PReLU,
         mbd: nn.Embedding,
         f0f1: nn.Linear,
@@ -353,15 +355,15 @@ class Embed(nn.Module):
             `sigmas`, shape (N, M, Q, 1).
         """
 
-        return self._fwd_fn(
-            self._prelu,
-            self._mbd,
-            self._f0f1,
-            self._f2,
-            self._sigma,
-            self._log_sigma_env,
-            self._log_sigma_mid,
-            self._log_sigma_half,
+        return self.__fwd_fn(
+            self.__prelu,
+            self.__mbd,
+            self.__f0f1,
+            self.__f2,
+            self.__sigma,
+            self.__log_sigma_env,
+            self.__log_sigma_mid,
+            self.__log_sigma_half,
             batch.vocab,
             batch.padding_mask(),
             eps,
