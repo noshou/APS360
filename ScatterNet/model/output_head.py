@@ -8,11 +8,9 @@ from beartype.typing import Tuple
 from jaxtyping import Float, jaxtyped
 from numpy import floor, log2
 from torch import nn
+from torch_extras import NoTrilinBilin, PBId, SqrP
 
 from ..batching import Batch
-from ..layers.no_trilin_bilin import NoTrilinBilin
-from ..layers.pbid import PBId
-from ..layers.sqrp import SqrP
 
 # Multiplier on the terminal Linear's default weight init. Small enough that
 # `raw` does not disturb the w = c = 1 targets (std ~0.5 -> ~0.025), large

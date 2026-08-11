@@ -6,11 +6,11 @@ from beartype import beartype
 from beartype.typing import Tuple
 from jaxtyping import jaxtyped
 from torch import nn
+from torch_extras import NoTrilinBilin
 
 from Preprocess import VOCAB
 
 from ..batching import Batch
-from ..layers.no_trilin_bilin import NoTrilinBilin
 from ..utils.sigma_window import arctan_log_sigma_window
 
 # Multiplier on `_f0f1`/`_f2`'s default weight init when a physical

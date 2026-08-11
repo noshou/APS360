@@ -11,10 +11,9 @@ from torch import cos, nn
 from torch.autograd.function import FunctionCtx as FuncCtx
 from torch.nn.functional import mish
 from torch.utils.checkpoint import checkpoint
+from torch_extras import PTanhShrink, QDiagBilin
 
 from ..batching import Batch
-from ..layers.ptanhshrink import PTanhShrink
-from ..layers.qdiag_bilin import QDiagBilin
 from ..utils.sigma_window import arctan_log_sigma_window
 
 

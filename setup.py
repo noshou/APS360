@@ -20,6 +20,12 @@ setup(
             "Train.*",
         ]
     ),
+    # NOTE: `torch-extras` (ScatterNet/layers' former contents, now a
+    # separate local package) is also a required runtime dependency, but
+    # isn't published yet, so it can't be listed here as a normal
+    # `install_requires` entry without hardcoding a local path. Install it
+    # separately first: `pip install -e ../torch-extras` (also covered by
+    # requirements.txt).
     install_requires=[
         "torch",
         "numpy",
