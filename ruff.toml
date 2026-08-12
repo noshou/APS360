@@ -1,7 +1,7 @@
 line-length  	= 79
 indent-width 	= 4
 target-version 	= "py314"
-exclude = ["*.ipynb", "__init__.py"]
+exclude = ["*.ipynb", "__init__.py", "_demo/*"]
 
 [format]
 indent-style = "space"

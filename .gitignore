@@ -1,4 +1,9 @@
 ## ==========================================
+## rclone config
+## ==========================================
+rclone/
+
+## ==========================================
 ## ruff cache
 ## ==========================================
 .ruff_cache/*
@@ -347,6 +352,11 @@ venv/
 env/
 .env
 .venv/
+
+# rclone credentials (never commit; lives at ~/.config/rclone/rclone.conf,
+# only relevant here if a local copy is ever staged for a Docker build)
+rclone.conf
+*.rclone.conf
 dataloads.py
 build_db.py
 *.h5

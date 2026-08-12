@@ -20,9 +20,17 @@ ckpt_dir:  checkpoints
 # comparable to Baselines/kaggle_baselines.ipynb's. The run's full config is dumped once
 # to {data_dir}/run_config.rtf. Nothing is written per-run except that dump, so a resume
 # cannot overwrite an earlier epoch's numbers; concatenate the per-epoch metrics.json
-# files afterwards for the whole history. Off by default (the plots need the same LaTeX/
-# JuliaMono toolchain Baselines/kaggle_baselines.ipynb installs) - uncomment to enable.
-# data_dir: scatternet_data
+# files afterwards for the whole history. Needs the same LaTeX/JuliaMono toolchain
+# Baselines/kaggle_baselines.ipynb installs.
+data_dir: scatternet_data
+
+# rclone destinations for off-box durability (vast.ai local disk is not assumed
+# durable across instance teardown). ckpt_best and numbered resume checkpoints are
+# deleted locally once pushed (see Train/train.py:_rclone_push); data_dir is pushed
+# every epoch but kept locally too, since load_epoch_history() reads it back each
+# epoch to rebuild loss_per_epoch.png.
+ckpt_rclone_dest: gdrive:ScatterNet_Train/checkpoints
+data_rclone_dest: gdrive:ScatterNet_Train/data
 
 # model architecture
 lambda_1: 128
@@ -58,7 +66,7 @@ lambda_6: 1.0
 lr:            1.3e-4
 weight_decay:  0.1
 grad_clip:     1.0
-epochs:        20
+epochs:        33
 batcher_seed:  0
 atom_size_ceil: -1   # -1 = auto (3x largest molecule)
 num_workers: 4

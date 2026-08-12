@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import shutil
 import subprocess
 import time as _time
 from collections.abc import Callable, Iterator
@@ -34,16 +35,17 @@ def _first(x: list):
     return x[0]
 
 
-def _rclone_push(path: str, dest: str | None):
+def _rclone_push(path: str, dest: str | None, delete_after: bool = False):
     """Copy a file or directory to a durable rclone remote so it survives a
     session timeout.
 
-    /kaggle/working is not reliably persisted on a crash, so checkpoints (and
-    the plots directory) are also pushed to a remote (e.g. Drive) via rclone.
-    `rclone copy` handles both cases: a file is copied into `dest`, a
-    directory has its contents mirrored into `dest` (incrementally - files
-    already present from an earlier push are skipped). No-op if `dest` is
-    None or `path` is missing; never raises into the train loop.
+    The local filesystem is not reliably persisted across a crash/instance
+    teardown, so checkpoints (and the plots directory) are also pushed to a
+    remote (e.g. Drive) via rclone. `rclone copy` handles both cases: a file
+    is copied into `dest`, a directory has its contents mirrored into `dest`
+    (incrementally - files already present from an earlier push are
+    skipped). No-op if `dest` is None or `path` is missing; never raises into
+    the train loop.
 
     Parameters
     ----------
@@ -51,6 +53,12 @@ def _rclone_push(path: str, dest: str | None):
         Local path of the file or directory to copy.
     dest : str or None
         rclone remote destination, or None to skip the push.
+    delete_after : bool
+        If True, remove the local copy once the push succeeds, so nothing
+        accumulates on local disk. Only safe for paths never read back
+        locally during the run (e.g. individual checkpoint files) - never
+        pass True for `data_dir`, whose per-epoch metrics.json files are
+        read back every epoch to rebuild the loss-per-epoch plot.
 
     Returns
     -------
@@ -67,6 +75,15 @@ def _rclone_push(path: str, dest: str | None):
         )
     except Exception as e:
         print(f"  [rclone] push of {path} -> {dest} failed: {e}")
+        return
+    if delete_after:
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except OSError as e:
+            print(f"  [rclone] local cleanup of {path} failed: {e}")
 
 
 # profiler
@@ -505,7 +522,7 @@ def evaluate(
                     cfg.lambda_6,
                     cfg.lambda_7,
                 )
-            iq = iq.float()  # R2/metrics accumulate in fp32 regardless of AMP
+            iq = iq.float()  # R2/metrics accumulate in fp32
             n = batch.iqval.shape[0]
             b_loss = loss.item() * n
             b_mols = float(n)
@@ -1252,7 +1269,7 @@ def _worker(cfg: RunConfig):
             },
             ckpt_path,
         )
-        _rclone_push(ckpt_path, cfg.ckpt_rclone_dest)
+        _rclone_push(ckpt_path, cfg.ckpt_rclone_dest, delete_after=True)
 
     # Dump the run's full config at the root of the data dir, so the per-epoch
     # metrics underneath it are self-describing. Written after the resume
@@ -1711,7 +1728,7 @@ def _worker(cfg: RunConfig):
                 },
                 cfg.ckpt_best,
             )
-            _rclone_push(cfg.ckpt_best, cfg.ckpt_rclone_dest)
+            _rclone_push(cfg.ckpt_best,cfg.ckpt_rclone_dest,delete_after=True)
             print(f"  saved best checkpoint (val {val_loss:.4f})")
 
         # phase="test", batch_idx=-1: test done -> whole epoch complete,
@@ -1727,8 +1744,7 @@ def _worker(cfg: RunConfig):
             val_r2=val_r2,
         )
 
-        # This epoch's resume-phase carryover is now fully consumed - later
-        # epochs always start fresh.
+        # This epoch's resume-phase carryover is now fully consumed
         resume_phase = None
         resume_phase_skip = 0
         resume_eval_state = None
@@ -1750,9 +1766,7 @@ def _worker(cfg: RunConfig):
 def main(cfg: RunConfig | None = None):
     """Entry point for training.
 
-    Pass a RunConfig directly (e.g. from a Kaggle notebook), or leave None
-    to parse sys.argv. Runs the training loop in-process on the single
-    available GPU.
+    Pass a RunConfig directl or leave None to parse sys.argv.
 
     Parameters
     ----------

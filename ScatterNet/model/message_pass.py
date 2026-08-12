@@ -419,13 +419,14 @@ class MessagePass(nn.Module):
 
         # r̃_m = r_m / σ_m: scale coords by bandwidth so
         # kernel range is q-dependent. clamp(min=eps) caps the max RFF
-        # frequency and avoids 1/0. Forced to fp32 (autocast disabled) bc
-        # under AMP the fp16 path overflows here. sigslice.clamp(min=eps) can
-        # be ~1e-3, so scaled_coords reaches ~1e5 and the
-        # `@ omega.T` projection blows past fp16's 65504 -> cos(inf) = NaN.
-        # This is a tiny inner-dim-3 -> λ₅ contraction, so fp32 costs almost
-        # nothing; the heavy bmm below still runs in fp16 under the outer
-        # autocast (no-op when AMP is off).
+        # frequency and avoids 1/0. Forced to fp32 (autocast disabled): under
+        # BF16 the magnitude can't overflow (BF16 shares fp32's exponent
+        # range), but sigslice.clamp(min=eps) can be ~1e-3, so scaled_coords
+        # reaches ~1e5 and BF16's ~7 mantissa bits leave the `@ omega.T`
+        # projection too coarse for cos()'s phase to stay accurate at that
+        # range. This is a tiny inner-dim-3 -> λ₅ contraction, so fp32 costs
+        # almost nothing; the heavy bmm below still runs in BF16 under the
+        # outer autocast.
         with torch.autocast(device_type=crdslice.device.type, enabled=False):
             scaled_coords = crdslice.float().unsqueeze(
                 -2
@@ -569,7 +570,7 @@ class MessagePass(nn.Module):
 
         # recompute φ_m for this M-chunk
         # (same as _pass_1, but now glob_ctx is complete).
-        # fp32 (autocast disabled) for the same fp16-overflow
+        # fp32 (autocast disabled) for the same BF16-precision
         # reason as _step1 - see there.
         with torch.autocast(device_type=crdslice.device.type, enabled=False):
             scaled_coords = crdslice.float().unsqueeze(
@@ -929,10 +930,12 @@ class MessagePass(nn.Module):
                     )
                     cont = self.__pass_1(cont, eps)
                     # Mean-normalise the atom-sums. features/glob_ctx are
-                    # Σ over all atoms (O(M): ~1e3-1e4 for a large molecule),
-                    # which overflows fp16's 65504 in the _step2 contractions
-                    # and their backward. Dividing both by the per-molecule
-                    # real-atom count turns them into means (O(1)).
+                    # Σ over all atoms (O(M): ~1e3-1e4 for a large molecule);
+                    # BF16's ~7 mantissa bits lose relative precision at that
+                    # magnitude in the _step2 contractions and their
+                    # backward. Dividing both by the per-molecule real-atom
+                    # count turns them into means (O(1)), keeping values in
+                    # BF16's well-represented range.
                     count = cont.msk_n.sum(
                         dim=1, dtype=cont.features.dtype
                     ).clamp(min=1.0)  # (Nc,)
