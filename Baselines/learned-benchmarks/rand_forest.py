@@ -26,7 +26,8 @@ class RandForestBaseline(Baseline):
     def __init__(
         self,
         n_estimators: int = 200,
-        max_depth: int | None = None,
+        max_depth: int | None = 20,
+        min_samples_leaf: int = 5,
         n_jobs: int = -1,
         random_state: int = 0,
     ) -> None:
@@ -36,8 +37,15 @@ class RandForestBaseline(Baseline):
         n_estimators : int, optional
             Number of trees in the forest, by default 200.
         max_depth : int or None, optional
-            Max tree depth. None (default) grows trees until leaves are
-            pure or hit ``min_samples_split``, sklearn's own default.
+            Max tree depth, by default 20. sklearn stores a ``(n_nodes, 1,
+            Q)`` value array per tree, one row per q-point; with
+            ``max_depth=None`` on a full training pass (tens of thousands
+            of molecules) ``n_nodes`` grows to ~2N per tree and the forest
+            no longer fits in RAM. Bounding depth keeps node count, and
+            therefore memory, roughly constant regardless of N.
+        min_samples_leaf : int, optional
+            Minimum samples per leaf, by default 5. Complements
+            ``max_depth`` in keeping leaf count bounded.
         n_jobs : int, optional
             Parallel jobs for both fit and predict, by default -1 (all
             cores).
@@ -47,6 +55,7 @@ class RandForestBaseline(Baseline):
         """
         self.n_estimators = n_estimators
         self.max_depth = max_depth
+        self.min_samples_leaf = min_samples_leaf
         self.n_jobs = n_jobs
         self.random_state = random_state
         self._forest: RandomForestRegressor | None = None
@@ -122,6 +131,7 @@ class RandForestBaseline(Baseline):
         self._forest = RandomForestRegressor(
             n_estimators=self.n_estimators,
             max_depth=self.max_depth,
+            min_samples_leaf=self.min_samples_leaf,
             n_jobs=self.n_jobs,
             random_state=self.random_state,
         ).fit(X, Y)
