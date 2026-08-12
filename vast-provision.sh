@@ -31,7 +31,9 @@ cd "$REPO_DIR"
 # activate and initialize venv - wait for entrypoint.sh to create it first
 wait_for "venv activate script" "[ -f /venv/main/bin/activate ]"
 source /venv/main/bin/activate
-pip install --no-cache-dir -r requirements.txt
+# --index-url forces the real PyPI, not whatever mirror/proxy the template's
+# venv defaults to - that mirror was missing numpy>=2.0 entirely.
+pip install --no-cache-dir --index-url https://pypi.org/simple/ -r requirements.txt
 
 # download dataset + encodings
 if [ ! -f "Preprocess/I(q)@L=50.h5" ] || [ ! -f "Preprocess/iq_train_set-ENCODING.sqlite3" ]; then
