@@ -1,1 +1,6 @@
-_demo/** linguist-generated=true
+*.toml linguist-language=TOML
+*.toml linguist-detectable=true
+*.yaml linguist-language=YAML
+*.yml linguist-language=YAML
+*.yaml linguist-detectable=true
+*.yml linguist-detectable=true
