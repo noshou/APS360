@@ -1,26 +1,21 @@
 #!/bin/bash
+
+############################################################################################################
+############################################## vast.ai runner ##############################################
+############################################################################################################
+
 set -e
-
-####################
-## vast.ai runner ##
-####################
-
-# Orchestrates the individual provisioning steps (sibling .sh files in this
-# same directory), in order. Each step is sourced (not executed as a
-# subprocess), since
-# later steps depend on state earlier ones set: cwd (clone_repo.sh),
-# the activated venv + VENV_DIR (setup_venv.sh), REPO_DIR, etc.
-#
-# Resolves its own directory via BASH_SOURCE, so this must be run as a real
-# file (`bash .../vast-provision.sh`), not piped via `curl | bash` - a piped
-# script has no on-disk path for its siblings to be found at.
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # capture everything to a persistent log regardless of how/where this script
 # is invoked from (onstart-cmd, manual SSH run, etc).
 exec > >(tee -a /var/log/vast-provision.log) 2>&1
 echo "=== vast-provision.sh started $(date -u) ==="
+
+# computed directly rather than via BASH_SOURCE self-discovery, which
+# resolved to empty in the actual vast.ai onstart-cmd invocation context
+# (SCRIPT_DIR/lib.sh became just "/lib.sh"). We already know exactly where
+# clone_repo.sh puts the repo, so just use that instead of inferring it.
+SCRIPT_DIR="${WORKSPACE:-/workspace}/APS360/_shell_scripts"
 
 source "$SCRIPT_DIR/lib.sh"
 source "$SCRIPT_DIR/clone_repo.sh"

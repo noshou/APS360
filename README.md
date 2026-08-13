@@ -1,10 +1,8 @@
-i
-
 # ScatterNet: Design Reference
 
 GNN that predicts X-ray powder scattering curves I(q) from atomic coordinates and species, using Random Fourier Features for O(M·λ₅) all-pairs kernel aggregation. Single-GPU, BF16 autocast throughout (see §8).
 
----
+For scripting on cloud proviers please refer to `_shell_scrpts/README.md` .
 
 ## Table of Contents
 

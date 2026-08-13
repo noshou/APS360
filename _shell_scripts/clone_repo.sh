@@ -10,6 +10,13 @@
 # step just pulls it to the latest `wip`.
 
 REPO_DIR="${WORKSPACE:-/workspace}/APS360"
+
+# git refuses to operate on a repo owned by a different user than whoever's
+# running it (e.g. /workspace owned by the template's default `user`
+# account, but we run as root) unless it's marked safe. Idempotent, cheap
+# to run every time rather than requiring manual intervention per instance.
+git config --global --add safe.directory "$REPO_DIR"
+
 if [ ! -d "$REPO_DIR" ]; then
   git clone -b wip https://github.com/noshou/APS360.git "$REPO_DIR"
 else
