@@ -39,6 +39,15 @@ lambda_3: 256
 lambda_4: 4
 lambda_5: 128
 msg_seed: 42
+# flipped back on to check whether the earlier beartype violation (inside
+# NoTrilinBilin.forward, via Embed's sigma(embed, f_mag)) actually
+# reproduces at dataset_frac=0.05 - it never surfaced running eager, which
+# could mean the offending batch/molecule just wasn't in this 5% sample
+# rather than the underlying issue being gone. If it recurs, the earlier
+# diagnosis stands: compiling Embed's outer function traces into sigma's
+# beartype-decorated forward() too, since the call goes through normal
+# nn.Module dispatch, not a compile-safe boundary.
+compile: true
 
 # chunking (peak-memory vs launch-count tradeoff; see README Appendix A1). 1024/512
 # OOM'd on 2xT4 (12.13/14.56G already in use, +3.19G alloc). 800/400 was also tried
@@ -67,6 +76,7 @@ lr:            1.3e-4
 weight_decay:  0.1
 grad_clip:     1.0
 epochs:        33
+dataset_frac:  0.05
 batcher_seed:  0
 atom_size_ceil: -1   # -1 = auto (3x largest molecule)
 num_workers: 4

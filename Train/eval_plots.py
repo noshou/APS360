@@ -389,7 +389,7 @@ def save_epoch_metrics(record: dict, data_dir: str, epoch: int) -> None:
     out_path = os.path.join(epoch_dir, "metrics.json")
     with open(out_path, "w") as fh:
         json.dump(record, fh, indent=2)
-    print(f"  [plots] wrote {out_path}", flush=True)
+    print(f"  [data] wrote {out_path}", flush=True)
 
 
 def load_epoch_history(data_dir: str) -> list[dict]:
@@ -422,7 +422,7 @@ def load_epoch_history(data_dir: str) -> list[dict]:
         except (OSError, ValueError):
             # A run killed mid-write leaves a truncated json. Skipping it costs
             # one point on the curve; letting it raise would kill the epoch.
-            print(f"  [plots] skipping unreadable {path}", flush=True)
+            print(f"  [data] skipping unreadable {path}", flush=True)
     history.sort(key=lambda h: h["epoch"])
     return history
 
@@ -473,7 +473,7 @@ def save_epoch_loss_plot(history: list[dict], data_dir: str) -> None:
 
     json_path = os.path.join(data_dir, "loss_per_epoch.json")
     _write_json(history, json_path)
-    print(f"  [plots] wrote {json_path}", flush=True)
+    print(f"  [data] wrote {json_path}", flush=True)
 
     epochs = [h["epoch"] for h in history]
     fig, ax = plt.subplots(figsize=(11, 6))
@@ -664,4 +664,4 @@ def save_run_config_rtf(cfg: RunConfig, data_dir: str) -> None:
     out_path = os.path.join(data_dir, "run_config.rtf")
     with open(out_path, "w", encoding="ascii") as fh:
         fh.write("\n".join(lines))
-    print(f"  [plots] wrote {out_path}", flush=True)
+    print(f"  [data] wrote {out_path}", flush=True)

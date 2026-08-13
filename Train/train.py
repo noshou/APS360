@@ -893,9 +893,7 @@ def _worker(cfg: RunConfig):
     test_mols = sum(len(b) for b in test_set.batches)
     print(
         f"batches/epoch: train={len(train_set)}  "
-        f"val={len(val_loader)}  test={len(test_loader)}"
-        f"  (buckets; same count by design - each bucket "
-        f"contributes one sub-batch per split)",
+        f"val={len(val_loader)}  test={len(test_loader)}",
     )
     print(
         f"molecules:     train={train_mols}  val={val_mols}  "
