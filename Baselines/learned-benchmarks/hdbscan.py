@@ -1,4 +1,6 @@
 import torch
+from beartype import beartype
+from jaxtyping import Float, jaxtyped
 from sklearn.cluster import HDBSCAN  # type: ignore
 
 from Baselines.run.baseline import (
@@ -34,12 +36,12 @@ class Hdbscan(Baseline):
     the HDBSCAN cluster scale.
     """
 
-    _qgrid: torch.Tensor  # shape (Q,)
-    _fmag_table: torch.Tensor  # shape (V, Q)
+    _qgrid: Float[torch.Tensor, "Q"]  # noqa: F821
+    _fmag_table: Float[torch.Tensor, "V Q"]  # noqa: F722
 
     def __init__(
         self,
-        qgrid: torch.Tensor,  # shape (Q,)
+        qgrid: Float[torch.Tensor, "Q"],  # noqa: F821
         energy: float,
     ) -> None:
         """
@@ -50,7 +52,10 @@ class Hdbscan(Baseline):
         self._qgrid = qgrid
         self._fmag_table = build_fmag_table(qgrid, energy)
 
-    def __call__(self, batch: Batch) -> torch.Tensor:  # shape (N, Q)
+    @jaxtyped(typechecker=beartype)
+    def __call__(
+        self, batch: Batch
+    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
         """Return the bead-Debye sum I(q) per molecule."""
 
         device = batch.coord.device
@@ -62,7 +67,7 @@ class Hdbscan(Baseline):
         # autocast_dtype's docstring).
         dtype = autocast_dtype(device)
 
-        preds: list[torch.Tensor] = []  # each shape (Q,)
+        preds: list[Float[torch.Tensor, "Q"]] = []  # noqa: F821
         hscan = HDBSCAN(min_samples=1, copy=False)  # type: ignore[arg-type]
 
         for n in range(batch.coord.shape[0]):

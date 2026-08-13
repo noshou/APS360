@@ -1,9 +1,12 @@
 import re
-from typing import Callable, Tuple
+from typing import Callable
 
 import numpy as np
 import torch
 import xraydb
+from beartype import beartype
+from beartype.typing import Tuple
+from jaxtyping import Float, jaxtyped
 from torch import nn
 
 from Preprocess import VOCAB
@@ -59,10 +62,10 @@ class ScatterNet(nn.Module):
     __out: OutputHead
     __spline: SplineSmooth
     __iq2d: IQ2ndDerivative
-    __eps_embd: float
-    __eps_msgp: float
-    __fmag_table: torch.Tensor  # shape (V, Q)
-    __q_weights_: torch.Tensor  # shape (1, Q)
+    __eps_embd: Float
+    __eps_msgp: Float
+    __fmag_table: Float[torch.Tensor, "V Q"]  # noqa: F722
+    __q_weights_: Float[torch.Tensor, "1 Q"]  # noqa: F722
     __fwd_fn: Callable
 
     def __init__(
@@ -75,7 +78,7 @@ class ScatterNet(nn.Module):
         msg_seed: int,
         atm_chunk: int,
         mol_chunk: int,
-        qgrid: torch.Tensor,  # shape (Q,)
+        qgrid: Float[torch.Tensor, "Q"],  # noqa: F722,F821
         energy: float,
         eps_embd: float,
         eps_msgp: float,
@@ -234,7 +237,7 @@ class ScatterNet(nn.Module):
         )
 
     @staticmethod
-    def __loss_fn(
+    def __loss_fn(  # can't jaxtype here bc of torch.compile graph breaking
         fmag_table: torch.Tensor,
         q_weights: torch.Tensor,
         iq2d: IQ2ndDerivative,
@@ -315,16 +318,17 @@ class ScatterNet(nn.Module):
 
         return (msle_loss + ff_penalty + smooth_penalty).mean()
 
+    @jaxtyped(typechecker=beartype)
     def compute_loss(
         self,
-        output_head: torch.Tensor,  # shape (N, Q)
-        coh: torch.Tensor,  # shape (N, Q)
-        inc: torch.Tensor,  # shape (N, Q)
-        f_mag_pred: torch.Tensor,  # shape (N, M, Q)
+        output_head: Float[torch.Tensor, "N Q"],  # noqa: F722
+        coh: Float[torch.Tensor, "N Q"],  # noqa: F722
+        inc: Float[torch.Tensor, "N Q"],  # noqa: F722
+        f_mag_pred: Float[torch.Tensor, "N M Q"],  # noqa: F722
         batch: Batch,
         lambda_6: float,
         lambda_7: float,
-    ) -> torch.Tensor:  # scalar
+    ) -> Float[torch.Tensor, ""]:  # noqa: F722
         """Compute the total training loss.
 
         Sums the Kratky MSLE, the form-factor penalty, and a 2nd-
@@ -374,14 +378,15 @@ class ScatterNet(nn.Module):
             lambda_7,
         )
 
+    @jaxtyped(typechecker=beartype)
     def forward(
         self, batch: Batch
     ) -> Tuple[
-        torch.Tensor,  # shape (N, Q)
-        torch.Tensor,  # shape (N, Q)
-        torch.Tensor,  # shape (N, Q)
-        torch.Tensor,  # shape (N, M, Q)
-        torch.Tensor,  # shape (N, M, Q)
+        Float[torch.Tensor, "N Q"],  # noqa: F722
+        Float[torch.Tensor, "N Q"],  # noqa: F722
+        Float[torch.Tensor, "N Q"],  # noqa: F722
+        Float[torch.Tensor, "N M Q"],  # noqa: F722
+        Float[torch.Tensor, "N M Q"],  # noqa: F722
     ]:
         """Run the ScatterNet forward pass.
 

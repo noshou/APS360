@@ -1,8 +1,11 @@
 import math
-from typing import Callable, NamedTuple, Tuple, cast
+from typing import Callable, NamedTuple, cast
 
 import numpy as np
 import torch
+from beartype import beartype
+from beartype.typing import Tuple
+from jaxtyping import Bool, Float, jaxtyped
 from pyteals import PTanhShrink, QDiagBilin
 from torch import cos, nn
 from torch.nn.functional import mish
@@ -107,7 +110,7 @@ class MessagePass(nn.Module):
     __proj_agg: nn.ModuleList
 
     # fixed RFF frequency matrix: λ₅ random 3-D directions
-    __omegafrq: torch.Tensor  # shape (λ₅, 3)
+    __omegafrq: Float[torch.Tensor, "λ₅ 3"]  # noqa: F722
 
     # RFF random phase offsets b ∈ R^λ₅
     __biasterm: nn.Parameter
@@ -174,25 +177,25 @@ class MessagePass(nn.Module):
         Mchnk: int
 
         # atom embeddings for this N-chunk
-        emb_n: torch.Tensor  # shape (Nchnk, Mc, Q, λ₁)
+        emb_n: Float[torch.Tensor, "Nchnk Mc Q λ₁"]     # noqa: F722
 
         # padding mask (True = real atom)
-        msk_n: torch.Tensor  # shape (Nchnk, Mc), bool
+        msk_n: Bool[torch.Tensor, "Nchnk Mc"]           # noqa: F722
 
         # form factor magnitudes
-        ffs_n: torch.Tensor  # shape (Nchnk, Mc, Q, 1)
+        ffs_n: Float[torch.Tensor, "Nchnk Mc Q 1"]      # noqa: F722
 
         # per-atom per-q RBF bandwidths
-        sig_n: torch.Tensor  # shape (Nchnk, Mc, Q, 1)
+        sig_n: Float[torch.Tensor, "Nchnk Mc Q 1"]      # noqa: F722
 
         # atom Cartesian coordinates (Å)
-        crd_n: torch.Tensor  # shape (Nchnk, Mc, 3)
+        crd_n: Float[torch.Tensor, "Nchnk Mc 3"]        # noqa: F722
 
         # Σ_m φ_m; kernel weight normaliser
-        features: torch.Tensor  # shape (Nchnk, Q, λ₅)
+        features: Float[torch.Tensor, "Nchnk Q λ₅"]     # noqa: F722
 
         # Σ_m φ_m ⊗ e_m; chemical environment
-        glob_ctx: torch.Tensor  # shape (Nchnk, Q, λ₅, λ₁)
+        glob_ctx: Float[torch.Tensor, "Nchnk Q λ₅ λ₁"]  # noqa: F722
 
     def __init__(
         self,
@@ -361,10 +364,19 @@ class MessagePass(nn.Module):
         # round's ModuleList entry to use), so it produces up to lambda_2x
         # as many distinct compiled graphs as `_step1_fn`; the extra
         # `* lambda_2` factor accounts for that.
+        #
+        # cache_size_limit is a single global torch._dynamo setting, not
+        # scoped to this module - Embed/OutputHead/LambdaHead/SplineSmooth's
+        # own compiled functions draw from the same budget. A live run hit
+        # FailOnRecompileLimitHit at the previous 2x factor (measured
+        # insufficient in practice, not just in theory), so this uses a much
+        # more generous multiplier: the cost of over-provisioning is a bit
+        # more host memory for cached compiled graphs, not a correctness
+        # issue, unlike under-provisioning, which hard-crashes training.
         if compile:
             torch._dynamo.config.cache_size_limit = max(
                 torch._dynamo.config.cache_size_limit,
-                2 * (len(self.__CHUNK_TIERS) + 1) ** 2 * lambda_2,
+                8 * (len(self.__CHUNK_TIERS) + 1) ** 2 * lambda_2,
             )
         self.__step1_fn = (
             torch.compile(self.__step1, fullgraph=True)
@@ -377,7 +389,7 @@ class MessagePass(nn.Module):
             else self.__step2
         )
 
-    def __step1(
+    def __step1( # can't use jaxtyping/beartype due to torch.compile
         self,
         embslice: torch.Tensor,
         crdslice: torch.Tensor,
@@ -482,8 +494,8 @@ class MessagePass(nn.Module):
             accumulated values across all M-chunks.
         """
 
-        features: torch.Tensor  # shape (Nchnk, Q, λ₅)
-        glob_ctx: torch.Tensor  # shape (Nchnk, Q, λ₅, λ₁)
+        features: Float[torch.Tensor, "Nchnk Q λ₅"]     # noqa: F722
+        glob_ctx: Float[torch.Tensor, "Nchnk Q λ₅ λ₁"]  # noqa: F722
 
         features = cont.features
         glob_ctx = cont.glob_ctx
@@ -512,7 +524,7 @@ class MessagePass(nn.Module):
 
         return cont._replace(features=features, glob_ctx=glob_ctx)
 
-    def __step2(
+    def __step2( # can't use jaxtype/beartype due to torch.compile
         self,
         embslice: torch.Tensor,
         crdslice: torch.Tensor,
@@ -819,6 +831,7 @@ class MessagePass(nn.Module):
                 return min(tier, chunk)
         return chunk
 
+    @jaxtyped(typechecker=beartype)
     def forward(
         self,
         batch: Batch,

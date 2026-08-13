@@ -352,8 +352,8 @@ class RunConfig:
 
     def __post_init__(self) -> None:
         # dataclasses don't enforce field types at construction time, so an int
-        # literal silently sails through here and only blows up later,
-        # deep into a training run.
+        # literal silently sails through here and only blows up later inside
+        # beartype-guarded Loss.loss() call, deep into a training run.
         for name in (
             "eps_embd",
             "eps_msgp",

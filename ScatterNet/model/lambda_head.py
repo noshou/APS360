@@ -1,6 +1,8 @@
 from typing import Callable
 
 import torch
+from beartype import beartype
+from jaxtyping import Float, jaxtyped
 from torch import nn
 from torch.nn.functional import softplus
 
@@ -34,7 +36,8 @@ class LambdaHead(nn.Module):
             Hidden width of the single Mish layer. Default 16.
         compile : bool, optional
             If True, `torch.compile` the elementwise/matmul math in
-            `forward`. Default False.
+            `forward`. Default False. `forward` itself stays
+            `@jaxtyped`/`beartype`-checked either way.
 
         Returns
         -------
@@ -62,7 +65,7 @@ class LambdaHead(nn.Module):
         )
 
     @staticmethod
-    def __forward_fn(  # no runtime checks here, torch.compile would break
+    def __forward_fn(  # no jaxtype/beartype here, torch.compile will break
         net: nn.Sequential,
         pooled_sigma: torch.Tensor,
         pooled_fmag: torch.Tensor,
@@ -87,11 +90,12 @@ class LambdaHead(nn.Module):
         x = torch.stack((pooled_sigma, pooled_fmag), dim=-1)  # (N,Q,2)
         return softplus(net(x)).squeeze(-1)  # (N,Q)
 
+    @jaxtyped(typechecker=beartype)
     def forward(
         self,
-        pooled_sigma: torch.Tensor,  # shape (N, Q)
-        pooled_fmag: torch.Tensor,  # shape (N, Q)
-    ) -> torch.Tensor:  # shape (N, Q)
+        pooled_sigma: Float[torch.Tensor, "N Q"],  # noqa: F722
+        pooled_fmag: Float[torch.Tensor, "N Q"],  # noqa: F722
+    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
         """Predict the smoothing penalty Λ for one channel.
 
         Parameters

@@ -95,7 +95,7 @@ The training dataset (`noshou/iq_train_set` on HuggingFace) contains 1,044,583 m
 
 ### 2.1 `Batch`
 
-`Batch` is a frozen dataclass.
+`Batch` is a frozen dataclass with runtime shape checking via jaxtyping + beartype.
 
 
 | Field   | Shape     | Dtype   | Contents                                               |

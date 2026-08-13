@@ -39,12 +39,14 @@ lambda_3: 256
 lambda_4: 4
 lambda_5: 128
 msg_seed: 42
-# Root cause found and fixed: torch.compile on an outer function that
-# calls into any runtime-type-checked function (even indirectly, via
-# normal Python/nn.Module dispatch) forced dynamo to trace into that
-# checker's own internals and crash. Fixed by removing all runtime
-# type-checking from the codebase (and from the pyteals dependency)
-# entirely, rather than working around the compile boundary case by case.
+# flipped back on to check whether the earlier beartype violation (inside
+# NoTrilinBilin.forward, via Embed's sigma(embed, f_mag)) actually
+# reproduces at dataset_frac=0.05 - it never surfaced running eager, which
+# could mean the offending batch/molecule just wasn't in this 5% sample
+# rather than the underlying issue being gone. If it recurs, the earlier
+# diagnosis stands: compiling Embed's outer function traces into sigma's
+# beartype-decorated forward() too, since the call goes through normal
+# nn.Module dispatch, not a compile-safe boundary.
 compile: true
 
 # chunking (peak-memory vs launch-count tradeoff; see README Appendix A1). 1024/512
@@ -66,7 +68,7 @@ eps_embd: 1.0e-8
 eps_msgp: 1.0e-3
 
 # loss (RunConfig.__post_init__ coerces these to float, so an int like `1` won't
-# cause a dtype mismatch later inside compute_loss -- still write 1.0, not 1)
+# crash later inside the beartype-guarded Loss.loss() call -- still write 1.0, not 1)
 lambda_6: 1.0
 
 # optimiser / training loop

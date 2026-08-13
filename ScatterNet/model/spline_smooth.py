@@ -1,6 +1,8 @@
 from typing import Callable
 
 import torch
+from beartype import beartype
+from jaxtyping import Float, jaxtyped
 from pyteals import PPSpline
 from torch import nn
 
@@ -59,7 +61,7 @@ class SplineSmooth(nn.Module):
         )
 
     @staticmethod
-    def __forward_fn(  # no runtime checks here, torch.compile would break
+    def __forward_fn(  # no jaxtype/beartype here, torch.compile will break
         pps_coh: PPSpline,
         pps_inc: PPSpline,
         lmb_coh: LambdaHead,
@@ -105,14 +107,15 @@ class SplineSmooth(nn.Module):
 
         return coh_smooth**2 + inc_smooth
 
+    @jaxtyped(typechecker=beartype)
     def forward(
         self,
-        sigmas: torch.Tensor,  # shape (N, M, Q)
-        f_mags: torch.Tensor,  # shape (N, M, Q)
-        coh: torch.Tensor,  # shape (N, Q)
-        inc: torch.Tensor,  # shape (N, Q)
+        sigmas: Float[torch.Tensor, "N M Q"],  # noqa: F722
+        f_mags: Float[torch.Tensor, "N M Q"],  # noqa: F722
+        coh: Float[torch.Tensor, "N Q"],  # noqa: F722
+        inc: Float[torch.Tensor, "N Q"],  # noqa: F722
         batch: Batch,
-    ) -> torch.Tensor:  # shape (N, Q)
+    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
         """Smooth and combine the coherent/incoherent Debye limits.
 
         Parameters

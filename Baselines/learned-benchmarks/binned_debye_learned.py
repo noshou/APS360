@@ -2,6 +2,8 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
+from beartype import beartype
+from jaxtyping import Float, jaxtyped
 
 from Baselines.run.baseline import Baseline, build_fmag_table
 from ScatterNet.batching import Batch
@@ -20,7 +22,7 @@ class BinnedDebyeLearnedBaseline(Baseline):
 
     def __init__(
         self,
-        qgrid: torch.Tensor,  # shape (Q,)
+        qgrid: Float[torch.Tensor, "Q"],  # noqa: F821
         energy: float,
         n_bins: int = 200,
         hidden: tuple[int, ...] = (256, 128),
@@ -155,7 +157,10 @@ class BinnedDebyeLearnedBaseline(Baseline):
         self._net.eval()
         return self
 
-    def __call__(self, batch: Batch) -> torch.Tensor:  # shape (N, Q)
+    @jaxtyped(typechecker=beartype)
+    def __call__(
+        self, batch: Batch
+    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
         if self._net is None:
             raise RuntimeError(
                 "BinnedDebyeLearnedBaseline must be fit before calling"

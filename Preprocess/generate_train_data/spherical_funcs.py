@@ -1,8 +1,10 @@
 import numpy as np
 import numpy.typing as npt
+from beartype import beartype
 from scipy.special import sph_harm_y, spherical_jn
 
 
+@beartype
 def sphHarm(
     lMax: int,
     theta: npt.NDArray[np.float64],
@@ -59,6 +61,7 @@ def sphHarm(
     return Y
 
 
+@beartype
 def sphBess(
     q: npt.NDArray[np.float64],  # shape (Q,)
     lMax: int,

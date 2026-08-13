@@ -1,6 +1,8 @@
 from typing import Callable
 
 import torch
+from beartype import beartype
+from jaxtyping import Float, jaxtyped
 
 
 class IQ2ndDerivative:
@@ -75,7 +77,7 @@ class IQ2ndDerivative:
 
     def __init__(
         self,
-        q_grid: torch.Tensor,  # shape (Q,)
+        q_grid: Float[torch.Tensor, "Q"], #noqa
         delta_q: float=0.01,
         compile: bool = False
     ) -> None:
@@ -103,7 +105,7 @@ class IQ2ndDerivative:
         )
 
     @staticmethod
-    def __forward_fn(
+    def __forward_fn( # can't use jaxtyping/beartype due to torch.compile
         intensity: torch.Tensor,
         delta: float
     ) -> torch.Tensor:
@@ -147,10 +149,11 @@ class IQ2ndDerivative:
 
         return d2I
 
+    @jaxtyped(typechecker=beartype)
     def forward(
         self,
-        intensity: torch.Tensor,  # shape (N, Q)
-    ) -> torch.Tensor:  # shape (N, Q)
+        intensity: Float[torch.Tensor, "N Q"],  # noqa: F722
+    ) -> Float[torch.Tensor, "N Q"]:  #noqa: F722
         """
         Compute second derivative of the intensity with respect
         to q using central finite differences.

@@ -1,10 +1,11 @@
 import os
 import re
 import sqlite3
-from typing import List, Tuple
 
 import h5py
 import hdf5plugin  # noqa: F401
+from beartype import beartype
+from beartype.typing import List, Tuple
 
 from .vocab import VOCAB
 
@@ -99,6 +100,7 @@ class Encoding:
             cls._instance = super().__new__(cls)
         return cls._instance
 
+    @beartype
     def __init__(self, db_path: str, hdf5_path: str):
         """Build or reuse the encoding database.
 
@@ -204,6 +206,7 @@ class Encoding:
         self._path = _DBPATH
         self._initialized = True
 
+    @beartype
     def _bare(self, _ion: str) -> str:
         """Strip charge suffixes and normalize special-case ion aliases.
 
@@ -229,6 +232,7 @@ class Encoding:
     def _convert_array(self, blob: bytes) -> list:
         return list(blob)
 
+    @beartype
     def _encode_ions(self, ions: List[str]) -> List[int]:
         """Map a list of ion symbols to their 1-based VOCAB indices.
 
@@ -261,6 +265,7 @@ class Encoding:
             raise ValueError("ion list is empty")
         return enc
 
+    @beartype
     def get_in_range(
         self, min_atoms: int, max_atoms: int
     ) -> List[Tuple[str, str, int]]:
@@ -303,6 +308,7 @@ class Encoding:
             conn.close()
         return results
 
+    @beartype
     def get_vocab_for_keys(self, keys: List[Tuple[str, str]]) -> dict:
         """Fetch VOCAB_idx for a specific set of (grp, stem) keys.
 

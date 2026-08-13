@@ -16,6 +16,8 @@ scipy==1.15.3
 h5py==3.16.0
 hdf5plugin==6.0.0
 xraydb==4.5.8
+beartype==0.22.9
+jaxtyping
 tqdm==4.67.3
 plotly==6.7.0
 huggingface_hub==1.20.1

@@ -1,10 +1,13 @@
 from dataclasses import dataclass
-from typing import List
 
 import torch
+from beartype import beartype
+from beartype.typing import List
+from jaxtyping import Bool, Float, Int, jaxtyped
 from torch.nn.utils.rnn import pad_sequence
 
 
+@jaxtyped(typechecker=beartype)
 @dataclass(frozen=True)
 class Batch:
     """Batch of molecules.
@@ -24,15 +27,16 @@ class Batch:
     """
 
     # N molecules, M max atoms (padded)
-    vocab: torch.Tensor  # shape (N, M)
+    vocab: Int[torch.Tensor, "N M"]  # noqa: F722
 
     # N molecules, Q q-points
-    iqval: torch.Tensor  # shape (N, Q)
+    iqval: Float[torch.Tensor, "N Q"]  # noqa: F722
 
     # Cartesian coordinates
-    coord: torch.Tensor  # shape (N, M, 3)
+    coord: Float[torch.Tensor, "N M 3"] # noqa: F722
 
-    def padding_mask(self) -> torch.Tensor:  # shape (N, M), bool
+    @jaxtyped(typechecker=beartype)
+    def padding_mask(self) -> Bool[torch.Tensor, "N M"]: # noqa: F722
         """Compute the boolean mask distinguishing real atoms from padding.
 
         Returns
@@ -43,6 +47,7 @@ class Batch:
         """
         return self.vocab != 0
 
+    @jaxtyped(typechecker=beartype)
     def to(self, device: torch.device) -> "Batch":
         """Return a copy of this Batch with all tensors moved to ``device``.
 
@@ -70,9 +75,9 @@ class Batch:
     @classmethod
     def from_lists(
         cls,
-        vocabs: List[torch.Tensor],  # each shape (M_i,)
-        iqvals: List[torch.Tensor],  # each shape (Q,)
-        coords: List[torch.Tensor],  # each shape (M_i, 3)
+        vocabs: List[Int[torch.Tensor, "M"]],     # noqa: F821, F722
+        iqvals: List[Float[torch.Tensor, "Q"]],   # noqa: F821
+        coords: List[Float[torch.Tensor, "M 3"]], # noqa: F722
     ) -> "Batch":
         """Pad variable-length per-molecule tensors and construct a Batch.
 

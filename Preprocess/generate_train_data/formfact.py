@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import numpy.typing as npt
+from beartype import beartype
 from xraydb import chantler_energies, f0, f1_chantler, f2_chantler
 
 # Strip charge notation to get bare element symbol (e.g. Mn2+ → Mn, Na+ → Na)
@@ -154,6 +155,7 @@ class FormFactors:
         return np.asarray(f0_ + f1_ + 1j * f2_, dtype=np.complex128)
 
     @classmethod
+    @beartype
     def fromIons(
         cls,
         ions: list[str],
