@@ -1,6 +1,4 @@
 import torch
-from beartype import beartype
-from jaxtyping import Float, jaxtyped
 
 from Baselines.run.baseline import Baseline, autocast_dtype, build_fmag_table
 from ScatterNet.batching import Batch
@@ -23,13 +21,13 @@ class BinnedDebyeBaseline(Baseline):
     structure beyond a coarse-grained histogram of pairwise distances.
     """
 
-    _qgrid: Float[torch.Tensor, "Q"]  # noqa: F722,F821
-    _fmag_table: Float[torch.Tensor, "V Q"]  # noqa: F722
+    _qgrid: torch.Tensor  # shape (Q,)
+    _fmag_table: torch.Tensor  # shape (V, Q)
     _n_bins: int
 
     def __init__(
         self,
-        qgrid: Float[torch.Tensor, "Q"],  # noqa: F722,F821
+        qgrid: torch.Tensor,  # shape (Q,)
         energy: float,
         n_bins: int = 200,
     ) -> None:
@@ -47,8 +45,7 @@ class BinnedDebyeBaseline(Baseline):
         self._n_bins = n_bins
         self._fmag_table = build_fmag_table(qgrid, energy)
 
-    @jaxtyped(typechecker=beartype)
-    def __call__(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
+    def __call__(self, batch: Batch) -> torch.Tensor:  # shape (N, Q)
         """Return the binned-Debye-sum I(q) per molecule. O(M²) per molecule.
 
         Parameters
@@ -72,7 +69,7 @@ class BinnedDebyeBaseline(Baseline):
         # reduction (binning, sinc, the tiny (Q,n_bins) matmul) stays fp32.
         dtype = autocast_dtype(device)
 
-        preds: list[Float[torch.Tensor, "Q"]] = []  # noqa: F722,F821
+        preds: list[torch.Tensor] = []  # each shape (Q,)
 
         for n in range(batch.coord.shape[0]):
             coords_n = batch.coord[n][mask[n]]  # (m, 3)

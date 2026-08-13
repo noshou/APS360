@@ -1,10 +1,7 @@
 from collections import OrderedDict
-from typing import Callable
+from typing import Callable, Tuple
 
 import torch
-from beartype import beartype
-from beartype.typing import Tuple
-from jaxtyping import Float, jaxtyped
 from numpy import floor, log2
 from pyteals import NoTrilinBilin, PBId, SqrP
 from torch import nn
@@ -134,7 +131,7 @@ class OutputHead(nn.Module):
         )
 
     @staticmethod
-    def __forward_fn(  # no jaxtype/beartype cuz torch.compile will break
+    def __forward_fn(  # no runtime checks here, torch.compile would break
         bilinear: NoTrilinBilin,
         mlp: torch.nn.Sequential,
         pbid: PBId,
@@ -143,8 +140,8 @@ class OutputHead(nn.Module):
         fmag_c: torch.Tensor,
         mask_c: torch.Tensor,
     ) -> Tuple[
-        Float[torch.Tensor, "N Q"],  # noqa: F722
-        Float[torch.Tensor, "N Q"],  # noqa: F722
+        torch.Tensor,  # shape (N, Q)
+        torch.Tensor,  # shape (N, Q)
     ]:
         """Compute the coherent and incoherent partial sums for one chunk.
 
@@ -235,14 +232,13 @@ class OutputHead(nn.Module):
             inc_c = (c.float() * fmc**2 * maskf).sum(dim=1) # f^2, (N, Q) fp32
             return coh_c, inc_c
 
-    @jaxtyped(typechecker=beartype)
     def forward(
         self,
         batch: Batch,
         msg_head: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> Tuple[
-        Float[torch.Tensor, "N Q"],   # noqa: F722
-        Float[torch.Tensor, "N Q"],   # noqa: F722
+        torch.Tensor,   # shape (N, Q)
+        torch.Tensor,   # shape (N, Q)
     ]:
         """Accumulate the two Debye limits over atom chunks.
 

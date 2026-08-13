@@ -1,6 +1,4 @@
 import torch
-from beartype import beartype
-from jaxtyping import Float, jaxtyped
 
 from Baselines.run.baseline import (
     Baseline,
@@ -29,13 +27,13 @@ class PropoEstBaseline(Baseline):
         6046    # max molecule size in the dataset caps atoms
                 # per molecule to bound O(M^2) memory, no real subsampling
     )
-    _qgrid: Float[torch.Tensor, "Q"]  # noqa: F722,F821
-    _fmag_table: Float[torch.Tensor, "V Q"]  # noqa: F722
+    _qgrid: torch.Tensor  # shape (Q,)
+    _fmag_table: torch.Tensor  # shape (V, Q)
     _E: float
 
     def __init__(
         self,
-        qgrid: Float[torch.Tensor, "Q"],  # noqa: F722,F821
+        qgrid: torch.Tensor,  # shape (Q,)
         energy: float,
         e: float = 0.380,
     ) -> None:
@@ -47,8 +45,7 @@ class PropoEstBaseline(Baseline):
         self._fmag_table = build_fmag_table(qgrid, energy)
         self._E = e
 
-    @jaxtyped(typechecker=beartype)
-    def __call__(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
+    def __call__(self, batch: Batch) -> torch.Tensor:  # shape (N, Q)
         """Predict I(q) per molecule, unnormalized non-negative.
 
         Shape (N, Q).
@@ -65,7 +62,7 @@ class PropoEstBaseline(Baseline):
         # one; the (Q,)-shaped setup math above/below it stays fp32.
         dtype = autocast_dtype(device)
 
-        preds: list[Float[torch.Tensor, "Q"]] = []  # noqa: F722,F821
+        preds: list[torch.Tensor] = []  # each shape (Q,)
 
         for n in range(batch.coord.shape[0]):
             coords_n = batch.coord[n][mask[n]]  # (m, 3)

@@ -4,7 +4,6 @@ from typing import cast
 import numpy as np
 import numpy.typing as npt
 import torch
-from beartype import beartype
 
 from .formfact import FormFactors
 from .spherical_funcs import sphBess, sphHarm
@@ -70,7 +69,6 @@ class StuhrmannMixin:
     @property
     def r(self) -> npt.NDArray[np.float64]: ...
 
-    @beartype
     def stuhrmann(
         self,
         ff: FormFactors,

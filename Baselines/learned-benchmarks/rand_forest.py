@@ -2,8 +2,6 @@ from collections.abc import Iterable
 
 import numpy as np
 import torch
-from beartype import beartype
-from jaxtyping import Float, jaxtyped
 from sklearn.ensemble import RandomForestRegressor
 
 from Baselines.run.baseline import Baseline
@@ -127,10 +125,7 @@ class RandForestBaseline(Baseline):
         ).fit(X, Y)
         return self
 
-    @jaxtyped(typechecker=beartype)
-    def __call__(
-        self, batch: Batch
-    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
+    def __call__(self, batch: Batch) -> torch.Tensor:  # shape (N, Q)
         """Predict I(q) for a batch of molecules.
 
         Parameters

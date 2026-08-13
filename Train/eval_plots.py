@@ -6,8 +6,6 @@ from collections.abc import Callable, Iterable
 from dataclasses import replace as dc_replace
 
 import torch
-from beartype import beartype
-from jaxtyping import Float, jaxtyped
 
 from Baselines.run.baseline import Baseline
 from Baselines.run.metrics import evaluate as _bl_evaluate
@@ -143,8 +141,7 @@ class ScatterNetBaseline(Baseline):
         r2 = 1.0 - self._ss_res / ss_tot if ss_tot > 0 else 0.0
         return mean_loss, r2
 
-    @jaxtyped(typechecker=beartype)
-    def __call__(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:  # noqa: F722,F821
+    def __call__(self, batch: Batch) -> torch.Tensor:  # shape (N, Q)
         """Predict I(q) for every molecule in `batch`.
 
         Parameters

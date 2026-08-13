@@ -2,8 +2,6 @@ from collections.abc import Iterable
 
 import numpy as np
 import torch
-from beartype import beartype
-from jaxtyping import Float, jaxtyped
 from sklearn.kernel_approximation import Nystroem
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVR
@@ -248,10 +246,7 @@ class Linsvm(Baseline):
 
         return self
 
-    @jaxtyped(typechecker=beartype)
-    def __call__(
-        self, batch: Batch
-    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
+    def __call__(self, batch: Batch) -> torch.Tensor:  # shape (N, Q)
         """Predict I(q) for a batch of molecules.
 
         Parameters

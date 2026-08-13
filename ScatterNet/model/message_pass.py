@@ -1,11 +1,8 @@
 import math
-from typing import Callable, NamedTuple, cast
+from typing import Callable, NamedTuple, Tuple, cast
 
 import numpy as np
 import torch
-from beartype import beartype
-from beartype.typing import Tuple
-from jaxtyping import Bool, Float, jaxtyped
 from pyteals import PTanhShrink, QDiagBilin
 from torch import cos, nn
 from torch.nn.functional import mish
@@ -110,7 +107,7 @@ class MessagePass(nn.Module):
     __proj_agg: nn.ModuleList
 
     # fixed RFF frequency matrix: λ₅ random 3-D directions
-    __omegafrq: Float[torch.Tensor, "λ₅ 3"]  # noqa: F722
+    __omegafrq: torch.Tensor  # shape (λ₅, 3)
 
     # RFF random phase offsets b ∈ R^λ₅
     __biasterm: nn.Parameter
@@ -177,25 +174,25 @@ class MessagePass(nn.Module):
         Mchnk: int
 
         # atom embeddings for this N-chunk
-        emb_n: Float[torch.Tensor, "Nchnk Mc Q λ₁"]     # noqa: F722
+        emb_n: torch.Tensor  # shape (Nchnk, Mc, Q, λ₁)
 
         # padding mask (True = real atom)
-        msk_n: Bool[torch.Tensor, "Nchnk Mc"]           # noqa: F722
+        msk_n: torch.Tensor  # shape (Nchnk, Mc), bool
 
         # form factor magnitudes
-        ffs_n: Float[torch.Tensor, "Nchnk Mc Q 1"]      # noqa: F722
+        ffs_n: torch.Tensor  # shape (Nchnk, Mc, Q, 1)
 
         # per-atom per-q RBF bandwidths
-        sig_n: Float[torch.Tensor, "Nchnk Mc Q 1"]      # noqa: F722
+        sig_n: torch.Tensor  # shape (Nchnk, Mc, Q, 1)
 
         # atom Cartesian coordinates (Å)
-        crd_n: Float[torch.Tensor, "Nchnk Mc 3"]        # noqa: F722
+        crd_n: torch.Tensor  # shape (Nchnk, Mc, 3)
 
         # Σ_m φ_m; kernel weight normaliser
-        features: Float[torch.Tensor, "Nchnk Q λ₅"]     # noqa: F722
+        features: torch.Tensor  # shape (Nchnk, Q, λ₅)
 
         # Σ_m φ_m ⊗ e_m; chemical environment
-        glob_ctx: Float[torch.Tensor, "Nchnk Q λ₅ λ₁"]  # noqa: F722
+        glob_ctx: torch.Tensor  # shape (Nchnk, Q, λ₅, λ₁)
 
     def __init__(
         self,
@@ -380,7 +377,7 @@ class MessagePass(nn.Module):
             else self.__step2
         )
 
-    def __step1( # can't use jaxtyping/beartype due to torch.compile
+    def __step1(
         self,
         embslice: torch.Tensor,
         crdslice: torch.Tensor,
@@ -485,8 +482,8 @@ class MessagePass(nn.Module):
             accumulated values across all M-chunks.
         """
 
-        features: Float[torch.Tensor, "Nchnk Q λ₅"]     # noqa: F722
-        glob_ctx: Float[torch.Tensor, "Nchnk Q λ₅ λ₁"]  # noqa: F722
+        features: torch.Tensor  # shape (Nchnk, Q, λ₅)
+        glob_ctx: torch.Tensor  # shape (Nchnk, Q, λ₅, λ₁)
 
         features = cont.features
         glob_ctx = cont.glob_ctx
@@ -515,7 +512,7 @@ class MessagePass(nn.Module):
 
         return cont._replace(features=features, glob_ctx=glob_ctx)
 
-    def __step2( # can't use jaxtype/beartype due to torch.compile
+    def __step2(
         self,
         embslice: torch.Tensor,
         crdslice: torch.Tensor,
@@ -822,7 +819,6 @@ class MessagePass(nn.Module):
                 return min(tier, chunk)
         return chunk
 
-    @jaxtyped(typechecker=beartype)
     def forward(
         self,
         batch: Batch,
