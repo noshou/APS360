@@ -1,6 +1,4 @@
 import torch
-from beartype import beartype
-from jaxtyping import Float, jaxtyped
 
 from Baselines.run.baseline import Baseline, autocast_dtype, build_fmag_table
 from ScatterNet.batching import Batch
@@ -17,12 +15,12 @@ class NNBaseline(Baseline):
     information.
     """
 
-    _qgrid: Float[torch.Tensor, "Q"]  # noqa: F821
-    _fmag_table: Float[torch.Tensor, "V Q"]  # noqa: F722
+    _qgrid: torch.Tensor  # shape (Q,)
+    _fmag_table: torch.Tensor  # shape (V, Q)
 
     def __init__(
         self,
-        qgrid: Float[torch.Tensor, "Q"],  # noqa: F821
+        qgrid: torch.Tensor,  # shape (Q,)
         energy: float,
     ) -> None:
         """
@@ -33,10 +31,7 @@ class NNBaseline(Baseline):
         self._qgrid = qgrid
         self._fmag_table = build_fmag_table(qgrid, energy)
 
-    @jaxtyped(typechecker=beartype)
-    def __call__(
-        self, batch: Batch
-    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
+    def __call__(self, batch: Batch) -> torch.Tensor:  # shape (N, Q)
         """Return I(0)*sinc(q*r_nn) per molecule using mean NN distance."""
         device = batch.coord.device
         mask = batch.padding_mask()  # (N, M)
@@ -47,7 +42,7 @@ class NNBaseline(Baseline):
         # autocast_dtype's docstring).
         dtype = autocast_dtype(device)
 
-        preds: list[Float[torch.Tensor, "Q"]] = []  # noqa: F821
+        preds: list[torch.Tensor] = []  # each shape (Q,)
 
         for n in range(batch.coord.shape[0]):
             coords_n = batch.coord[n][mask[n]]  # (m, 3)

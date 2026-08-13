@@ -6,8 +6,6 @@ from collections.abc import Iterable
 import numpy as np
 import torch
 import xraydb
-from beartype import beartype
-from jaxtyping import Float, jaxtyped
 
 from Preprocess import VOCAB
 from ScatterNet.batching import Batch
@@ -53,11 +51,10 @@ def autocast_dtype(device: "torch.device | str") -> "torch.dtype | None":
     return torch.bfloat16 if major >= 8 else None
 
 
-@jaxtyped(typechecker=beartype)
 def build_fmag_table(
-    qgrid: Float[torch.Tensor, "Q"],  # noqa: F821
+    qgrid: torch.Tensor,  # shape (Q,)
     energy: float,
-) -> Float[torch.Tensor, "V Q"]:  # noqa: F722
+) -> torch.Tensor:  # shape (V, Q)
     """Build atomic form factor magnitude table for all VOCAB ions.
 
     Index 0 is the padding sentinel (all zeros). For transuranic ions the
@@ -140,10 +137,9 @@ class Baseline(ABC):
         return self
 
     @abstractmethod
-    @jaxtyped(typechecker=beartype)
     def __call__(
         self, batch: Batch
-    ) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
+    ) -> torch.Tensor:  # shape (N, Q)
         """Predict I(q) for every molecule in a batch.
 
         Parameters
@@ -162,7 +158,7 @@ class Baseline(ABC):
     def timed_call(
         self,
         batch: Batch,
-    ) -> tuple[Float[torch.Tensor, "N Q"], float]:  # noqa: F722
+    ) -> tuple[torch.Tensor, float]:  # (N, Q), seconds
         """Predict I(q) for a batch, measuring wall-clock time per atom.
 
         Wraps ``__call__`` so every baseline - existing and future, with no

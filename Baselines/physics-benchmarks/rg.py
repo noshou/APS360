@@ -1,18 +1,13 @@
 import torch
-from beartype import beartype
-from jaxtyping import Float, jaxtyped
 
 from Baselines.run.baseline import Baseline, build_fmag_table
 from ScatterNet.batching import Batch
 
 
-@jaxtyped(typechecker=beartype)
 def _guinier_stats(
     batch: Batch,
-    ftable: Float[torch.Tensor, "V Q"],  # noqa: F722
-) -> tuple[
-    Float[torch.Tensor, "N 1"], Float[torch.Tensor, "N 1"]  # noqa: F722
-]:
+    ftable: torch.Tensor,  # shape (V, Q)
+) -> tuple[torch.Tensor, torch.Tensor]:  # each shape (N, 1)
     """Per-molecule Rg^2 and I(0), shared by both Rg baselines.
 
     Parameters
@@ -53,13 +48,12 @@ class RgBaseline(Baseline):
     structure beyond global size.
     """
 
-    _qgrid: Float[torch.Tensor, "Q"]  # noqa: F722,F821
-    _fmag_table: Float[torch.Tensor, "V Q"]  # noqa: F722
+    _qgrid: torch.Tensor  # shape (Q,)
+    _fmag_table: torch.Tensor  # shape (V, Q)
 
-    @jaxtyped(typechecker=beartype)
     def __init__(
         self,
-        qgrid: Float[torch.Tensor, "Q"],  # noqa: F722,F821
+        qgrid: torch.Tensor,  # shape (Q,)
         energy: float,
     ) -> None:
         """
@@ -70,8 +64,7 @@ class RgBaseline(Baseline):
         self._qgrid = qgrid
         self._fmag_table = build_fmag_table(qgrid, energy)
 
-    @jaxtyped(typechecker=beartype)
-    def __call__(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
+    def __call__(self, batch: Batch) -> torch.Tensor:  # shape (N, Q)
         """Return Guinier-approximated I(q) for each molecule."""
         device = batch.vocab.device
         rg2, i0 = _guinier_stats(batch, self._fmag_table.to(device))
@@ -103,14 +96,13 @@ class GuinierPorodBaseline(Baseline):
     low-q Guinier region.
     """
 
-    _qgrid: Float[torch.Tensor, "Q"]  # noqa: F722,F821
-    _fmag_table: Float[torch.Tensor, "V Q"]  # noqa: F722
+    _qgrid: torch.Tensor  # shape (Q,)
+    _fmag_table: torch.Tensor  # shape (V, Q)
     _porod_exponent: float
 
-    @jaxtyped(typechecker=beartype)
     def __init__(
         self,
-        qgrid: Float[torch.Tensor, "Q"],  # noqa: F722,F821
+        qgrid: torch.Tensor,  # shape (Q,)
         energy: float,
         porod_exponent: float = 4.0,
     ) -> None:
@@ -130,8 +122,7 @@ class GuinierPorodBaseline(Baseline):
         self._fmag_table = build_fmag_table(qgrid, energy)
         self._porod_exponent = porod_exponent
 
-    @jaxtyped(typechecker=beartype)
-    def __call__(self, batch: Batch) -> Float[torch.Tensor, "N Q"]:  # noqa: F722
+    def __call__(self, batch: Batch) -> torch.Tensor:  # shape (N, Q)
         """Return the Guinier-Porod unified-model I(q) for each molecule.
 
         Parameters

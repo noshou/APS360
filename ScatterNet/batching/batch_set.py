@@ -1,6 +1,7 @@
+from typing import List
+
 import h5py
 import torch
-from beartype.typing import List
 from torch.utils.data import Dataset
 
 from Preprocess import Encoding
