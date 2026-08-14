@@ -133,6 +133,23 @@ class ScatterNet(nn.Module):
 
         super().__init__()
         q_points = qgrid.shape[0]
+
+        # torch._dynamo.config.cache_size_limit is a single global setting,
+        # not scoped per module - Embed/OutputHead/LambdaHead/SplineSmooth
+        # (via MessagePass's SplineSmooth) all compile their own functions
+        # and draw from the same budget. The default (8) is too small: a
+        # live run hit FailOnRecompileLimitHit in OutputHead during the
+        # test-set pass, which has enough bucket-shape diversity to exceed
+        # 8 recompiles even though train/val hadn't yet. Raised here, once,
+        # for whichever submodule needs it, rather than in one submodule's
+        # __init__ (previously lived in MessagePass's; broke silently for
+        # every other module when MessagePass stopped compiling anything).
+        if compile:
+            torch._dynamo.config.cache_size_limit = max(
+                torch._dynamo.config.cache_size_limit,
+                8 * (lambda_2 + 1),
+            )
+
         self.__msg = MessagePass(
             lambda_1,
             lambda_2,
