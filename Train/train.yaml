@@ -84,3 +84,4 @@ dataset_frac:  0.05
 batcher_seed:  0
 atom_size_ceil: -1   # -1 = auto (3x largest molecule)
 num_workers: 4
+verbosity: batch   # "epoch" | "batch" | "diagnostic"; batch = per-batch loss/mem/ckpt prints
