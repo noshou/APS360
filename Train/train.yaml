@@ -55,11 +55,15 @@ compile: true
 # 512/256 was the best measured point, but that was under small-bucket tiering
 # (MessagePass rounded a bucket's real N/M down to a shared tier instead of the
 # full chunk). Tiering was removed (it caused a separate torch.compile recompile-
-# limit crash), so every batch now pads all the way up to (atm_chunk, mol_chunk)
-# regardless of its real size, which is far more memory-hungry per batch. 512/256
-# OOM'd on a 40G A100 (39.35G in use, +1.59G alloc) under this always-full-pad
-# scheme. Halved to 256/128; if this OOMs again, halve further (or try 384/192)
-# before reaching for anything else - compute is still invariant to chunk size.
+# limit crash) in favor of always padding to the full (atm_chunk, mol_chunk),
+# which OOM'd on a 40G A100 at 512/256, then again at 256/128 - the real problem
+# was forcing tiny buckets (e.g. 7 molecules) to pad up to the full chunk size
+# (18x+ blowup), not the chunk size itself. Fixed properly by compiling
+# MessagePass's step functions with dynamic=True and padding small buckets only
+# to a small alignment instead of the full chunk (see message_pass.py's
+# "Compile shapes" docstring). Left at 256/128, conservatively, until a live run
+# confirms real headroom - raise back toward 512/256 only once that's measured.
+
 atm_chunk: 256
 mol_chunk: 128
 

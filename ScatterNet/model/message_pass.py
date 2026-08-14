@@ -73,30 +73,41 @@ class MessagePass(nn.Module):
 
     Compile shapes
     --------------
-    `forward` pads N and M up to multiples of `n_chunk`/`m_chunk` before
-    chunking, so every N-chunk is exactly `n_chunk` molecules and every
-    M-chunk is exactly `m_chunk` atoms, every call - regardless of which
-    dataset bucket the batch came from. `_step1_fn`/`_step2_fn` (the compiled
-    step functions) therefore only ever see one shape for the life of the
-    module: no recompiles from a ragged tail chunk or from bucket-to-bucket
-    shape variety. `_step2` additionally takes `rnd_idx` (a Python int
-    selecting that round's entry of `_proj_agg`/`_sigbilin`/`_rms_norm`,
-    since message-passing rounds have distinct, not shared, weights) as a
-    static argument, so `_step2_fn` compiles up to `lambda_2` separate
-    graphs instead of one; `__init__` scales
-    `torch._dynamo.config.cache_size_limit` up by a `lambda_2` factor to
-    cover it.
+    `_step1`/`_step2` are run eager, never `torch.compile`d (see
+    `__init__`). Several compiled configurations were tried and all hit
+    real crashes:
 
-    A small-bucket tiering scheme (rounding N_real/M_real up to the
-    nearest of a handful of shared tiers instead of the full chunk size)
-    was tried and reverted: it bounded per-bucket padding waste, but each
-    tier multiplied `_step1_fn`/`_step2_fn`'s distinct-shape count, and a
-    live run still hit `FailOnRecompileLimitHit` even after scaling
-    `cache_size_limit` generously. Always padding to the full chunk size
-    is wasteful on buckets far smaller than `n_chunk`/`m_chunk`, but it is
-    the only way to guarantee exactly one shape per axis, so it is
-    guaranteed not to blow the recompile budget regardless of the
-    dataset's bucket distribution.
+    - Static compilation (`dynamic=False`), padding every chunk to the
+      full `n_chunk`/`m_chunk`: guaranteed one shape per axis, but forced
+      small buckets (e.g. 7 molecules against a 128-molecule chunk) to pad
+      18x+ past their real size, which OOM'd on a live run.
+    - A small-bucket tiering scheme (round up to the nearest of a handful
+      of shared tiers instead of the full chunk): bounded that padding
+      waste, but under static compilation each tier was its own compiled
+      graph, and a live run hit `FailOnRecompileLimitHit`.
+    - `dynamic=True` with alignment-only padding (round up to a small
+      granularity, not the full chunk): fixed the OOM, but a live run
+      still hit the recompile cap. `cache_size_limit`, raised in
+      `__init__`, measurably held at both construction and the start of
+      `forward` (confirmed via debug prints), yet the crash's own error
+      message reported the pre-raise default at the moment it was hit.
+    - `fullgraph=False` (fall back to eager past the recompile cap instead
+      of hard-failing) plus disabling dynamo's eval_frame LRU cache
+      (`torch._C._dynamo.eval_frame._set_lru_cache(False)`, the workaround
+      suggested by pytorch/pytorch#166926): still hit a `CheckpointError`,
+      backward's recompute pass produced tensors with different shapes
+      (in several cases transposed or a different rank entirely) than
+      what forward had saved.
+
+    All of these point to the same underlying interaction: this module
+    nests checkpointing (`forward`'s outer per-N-chunk `checkpoint`,
+    `__pass_1`/`__pass_2`'s inner per-M-chunk `checkpoint` around
+    `_step1_fn`/`_step2_fn`), and checkpoint-inside-checkpoint under
+    `torch.compile`'s backward recompute is a far less battle-tested path
+    than either alone. Running `_step1`/`_step2` eager sidesteps the whole
+    class of bug at some speed cost; `Embed`/`OutputHead`/`LambdaHead`/
+    `SplineSmooth` do not nest checkpointing and are unaffected, so they
+    stay compiled.
     """
 
     __lambda_1: int  # atom embedding dimension (λ₁)
@@ -129,12 +140,7 @@ class MessagePass(nn.Module):
     # number of q-points (Q)
     __q_points: int
 
-    # precomputed here so torch.compile never sees Python
-    # arithmetic on lambda_5. Under dynamic=True it treats
-    # lambda_5 as a SymInt, and `(2/lambda_5) ** 0.5` would then trace as a
-    # SymFloat that specializes to float64, which Triton's
-    # pow() can't mix with the float32 RFF tensor
-    # (Triton has no (float32, float64) overload).
+    # precomputed once here rather than recomputed inside _step1/_step2.
     __rffscale: float
 
     __step1_fn: Callable
@@ -241,7 +247,11 @@ class MessagePass(nn.Module):
             update is a small offset in log space rather than a saturating
             one. Default 0.1.
         compile : bool, optional
-            If True, torch.compile `_step1`/`_step2`. Default is False.
+            Accepted for interface consistency with Embed/OutputHead/
+            LambdaHead/SplineSmooth (`ScatterNet.__init__` passes the same
+            `compile` value to all five uniformly) but otherwise unused:
+            `_step1`/`_step2` are never torch.compiled here, see the class
+            docstring's "Compile shapes" section for why. Default is False.
 
         Returns
         -------
@@ -357,33 +367,18 @@ class MessagePass(nn.Module):
 
         self.__rffscale = (2 / lambda_5) ** 0.5
 
-        # forward() pads every N-/M-chunk fed to these to exactly
-        # n_chunk/m_chunk atoms/molecules every call (no small-bucket
-        # tiering), so `_step1_fn` sees exactly one shape for the module's
-        # whole lifetime. `_step2_fn` is additionally called once per round
-        # with a distinct `rnd_idx` (a static/specialized int arg, since it
-        # selects which round's ModuleList entry to use), so it produces up
-        # to lambda_2 distinct compiled graphs.
-        #
-        # cache_size_limit is a single global torch._dynamo setting, not
-        # scoped to this module - Embed/OutputHead/LambdaHead/SplineSmooth's
-        # own compiled functions draw from the same budget, so this leaves
-        # headroom above the lambda_2 shapes this module alone needs.
-        if compile:
-            torch._dynamo.config.cache_size_limit = max(
-                torch._dynamo.config.cache_size_limit,
-                8 * (lambda_2 + 1),
-            )
-        self.__step1_fn = (
-            torch.compile(self.__step1, fullgraph=True)
-            if compile
-            else self.__step1
-        )
-        self.__step2_fn = (
-            torch.compile(self.__step2, fullgraph=True)
-            if compile
-            else self.__step2
-        )
+        # _step1/_step2 are never torch.compiled (see the class docstring's
+        # "Compile shapes" section): every combination tried (static
+        # padding, dynamic shapes with alignment padding, fullgraph=False,
+        # disabling dynamo's eval_frame LRU cache) still hit real crashes
+        # from the interaction between this module's nested checkpointing
+        # (forward()'s outer per-N-chunk checkpoint, __pass_1/__pass_2's
+        # inner per-M-chunk checkpoint around _step1_fn/_step2_fn) and
+        # torch.compile's backward recompute path. Running eager here costs
+        # some speed but is unconditionally correct; Embed/OutputHead/
+        # LambdaHead/SplineSmooth are unaffected and stay compiled.
+        self.__step1_fn = self.__step1
+        self.__step2_fn = self.__step2
 
     def __step1(
         self,
@@ -748,6 +743,43 @@ class MessagePass(nn.Module):
         return cont._replace(emb_n=new_emb, sig_n=new_sig)
 
     @staticmethod
+    def __align_chunk(real: int, chunk: int, align: int = 8) -> int:
+        """
+        Effective chunk size for a bucket whose real N or M may be far
+        smaller than the configured chunk.
+
+        Padding a bucket's real size all the way up to the full `chunk`
+        wastes `chunk/real` memory and compute when `real` is a small
+        fraction of `chunk` (a live run OOM'd on exactly this: a 7-molecule
+        bucket forced to pad to a 128-molecule chunk, an 18x blowup).
+        Rounding up to the nearest multiple of `align` instead bounds the
+        padding waste to under `align` extra rows, independent of `chunk`.
+        This produces a different concrete shape per distinct `real` value;
+        that used to matter for `torch.compile`'s recompile budget, but
+        `_step1_fn`/`_step2_fn` run eager now (see the class docstring's
+        "Compile shapes" section), so shape variety here is free.
+
+        Parameters
+        ----------
+        real : int
+            The real (unpadded) size along this axis.
+        chunk : int
+            The configured chunk size (`n_chunk` or `m_chunk`). Only called
+            when `real <= chunk`; the result is capped at `chunk`.
+        align : int, optional
+            Rounding granularity. Default 8.
+
+        Returns
+        -------
+        int
+            `real` rounded up to the next multiple of `align`, capped at
+            `chunk`.
+        """
+
+        aligned = -(-real // align) * align  # ceil division
+        return min(aligned, chunk)
+
+    @staticmethod
     def __pad_to_multiple(
         t: torch.Tensor,
         chunk: int,
@@ -756,13 +788,11 @@ class MessagePass(nn.Module):
         """
         Zero-pad `t` along `dim` up to the next multiple of `chunk`.
 
-        Lets every N-chunk/M-chunk fed to the compiled step functions
-        be `chunk` elements wide, every call, so torch.compile only
-        ever sees one shape per compiled function
-        Padded rows are all-zero; the padding_mask entries built
-        from them are False (real atom/molecule = True), so _step1/_step2 zero
-        their RFF contribution and  caller slices the padding back off
-        before returning.
+        Lets every N-chunk/M-chunk fed to `_step1_fn`/`_step2_fn` be
+        `chunk` elements wide, every call. Padded rows are all-zero; the
+        padding_mask entries built from them are False (real atom/molecule
+        = True), so _step1/_step2 zero their RFF contribution and the
+        caller slices the padding back off before returning.
 
         Parameters
         ----------
@@ -829,25 +859,16 @@ class MessagePass(nn.Module):
         Cn = self.__nchunk
         Cm = self.__mchunk
 
-        # Always pad up to the full configured chunk size, regardless of
-        # how small N_real/M_real is. A small-bucket tiering scheme (round
-        # up to the nearest of a handful of shared tiers instead of the
-        # full chunk) was tried and reverted: it bounded per-bucket
-        # padding waste, but each tier multiplied `_step1_fn`/`_step2_fn`'s
-        # distinct compiled-shape count, and a live run hit
-        # `FailOnRecompileLimitHit` anyway. Always padding to (Cn, Cm)
-        # gives exactly one shape per axis, so the compiled functions can
-        # never accumulate more than `lambda_2` recompiles total (see
-        # `__init__`'s cache_size_limit comment), independent of the
-        # dataset's bucket distribution. This wastes Cn/N_real (or
-        # Cm/M_real) memory/compute on buckets far smaller than the
-        # configured chunk size.
-        Cn_eff = Cn
-        Cm_eff = Cm
+        # Pad only up to a small alignment (see __align_chunk), not all the
+        # way to the full configured chunk, when the bucket's real N/M is
+        # smaller than the chunk. _step1/_step2 run eager (see __init__),
+        # so the resulting shape variety costs nothing extra.
+        Cn_eff = self.__align_chunk(N_real, Cn) if N_real <= Cn else Cn
+        Cm_eff = self.__align_chunk(M_real, Cm) if M_real <= Cm else Cm
 
         # Pad N (molecules) and M (atoms) up to multiples of Cn_eff/Cm_eff
-        # so every N-chunk/M-chunk fed to the compiled step functions is
-        # exactly (Cn_eff, Cm_eff) every call.
+        # so every N-chunk/M-chunk fed to _step1_fn/_step2_fn is exactly
+        # (Cn_eff, Cm_eff) every call.
         for dim, chunk in ((0, Cn_eff), (1, Cm_eff)):
             embeds_raw = self.__pad_to_multiple(embeds_raw, chunk, dim)
             sigmas = self.__pad_to_multiple(sigmas, chunk, dim)
