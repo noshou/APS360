@@ -8,8 +8,17 @@
 # mathtext if this is missing (loud warning, not a crash), so a flaky
 # apt/network hiccup here shouldn't block training from starting.
 
-if ! command -v xelatex >/dev/null 2>&1; then
-  if apt-get update -q && apt-get install -y -q texlive-xetex texlive-latex-recommended texlive-fonts-recommended; then
+# poppler-utils (pdftocairo) is a separate dependency from xelatex itself:
+# matplotlib's pgf backend compiles text through xelatex into a PDF, then
+# needs pdftocairo (or ghostscript) to rasterize that PDF into the PNG
+# savefig() actually writes. Colab/Kaggle base images ship this already
+# (which is why colab_baselines.ipynb's setup cell doesn't install it
+# explicitly); the vast.ai template does not, and its absence crashed
+# training with "RuntimeError: No suitable pdf to png renderer found" -
+# past _configure_mpl()'s toolchain probe, since that probe only calls
+# canvas.draw(), which never exercises the PDF->PNG conversion path.
+if ! command -v xelatex >/dev/null 2>&1 || ! command -v pdftocairo >/dev/null 2>&1; then
+  if apt-get update -q && apt-get install -y -q texlive-xetex texlive-latex-recommended texlive-fonts-recommended poppler-utils; then
     mkdir -p ~/.fonts
     if curl -fsSL https://github.com/cormullion/juliamono/releases/latest/download/JuliaMono-ttf.tar.gz | tar -xz -C ~/.fonts; then
       fc-cache -f ~/.fonts
@@ -17,6 +26,6 @@ if ! command -v xelatex >/dev/null 2>&1; then
       echo "WARNING: JuliaMono font download failed - plots will render without it" >&2
     fi
   else
-    echo "WARNING: texlive install failed - plots will fall back to mathtext" >&2
+    echo "WARNING: texlive/poppler-utils install failed - plots will fall back to mathtext" >&2
   fi
 fi
