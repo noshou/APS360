@@ -622,10 +622,21 @@ def _configure_mpl():
     # over a font. Probe once with a real render and degrade to Agg +
     # mathtext instead: the plots still come out, just not in JuliaMono.
     # Loud on purpose, since report figures are expected in JuliaMono.
+    #
+    # canvas.draw() alone is not enough: it exercises xelatex/fontspec but
+    # not the separate PDF->PNG rasterization step (pdftocairo/ghostscript)
+    # that savefig(..., format="png") needs. A live run had xelatex working
+    # fine but no pdftocairo installed, which canvas.draw() never caught -
+    # every plot's savefig() call crashed instead of degrading. Probing
+    # with an actual PNG savefig closes that gap.
     try:
+        import io
+
         fig = plt.figure()
         fig.text(0.5, 0.5, r"R$^2$ probe")
-        fig.canvas.draw()  # forces the xelatex round trip
+        fig.savefig(io.BytesIO(), format="png")  # forces the full xelatex
+        # -> PDF -> PNG round trip, not just the xelatex text-measurement
+        # half of it.
         plt.close(fig)
     except Exception as exc:
         plt.close("all")
