@@ -10,7 +10,6 @@ from Preprocess import VOCAB
 
 from .batching import Batch
 from .model import Embed, MessagePass, OutputHead, SplineSmooth
-from .utils.iq_2nd_derivative import IQ2ndDerivative
 
 
 class ScatterNet(nn.Module):
@@ -58,7 +57,6 @@ class ScatterNet(nn.Module):
     __msg: MessagePass
     __out: OutputHead
     __spline: SplineSmooth
-    __iq2d: IQ2ndDerivative
     __eps_embd: float
     __eps_msgp: float
     __fmag_table: torch.Tensor  # shape (V, Q)
@@ -167,7 +165,6 @@ class ScatterNet(nn.Module):
         )
         delta_q = float(qgrid[1] - qgrid[0])
         self.__spline = SplineSmooth(q_points, delta_q, compile=compile)
-        self.__iq2d = IQ2ndDerivative(qgrid, delta_q, compile=compile)
         self.__eps_embd = eps_embd
         self.__eps_msgp = eps_msgp
 
@@ -254,7 +251,6 @@ class ScatterNet(nn.Module):
     def __loss_fn(
         fmag_table: torch.Tensor,
         q_weights: torch.Tensor,
-        iq2d: IQ2ndDerivative,
         output_head: torch.Tensor,
         coh: torch.Tensor,
         inc: torch.Tensor,
@@ -278,8 +274,6 @@ class ScatterNet(nn.Module):
             q-point, shape (V, Q).
         q_weights : torch.Tensor
             Kratky weighting (1 + q^2), shape (1, Q).
-        iq2d : IQ2ndDerivative
-            Central-difference second derivative, applied to `coh`/`inc`.
         output_head : torch.Tensor
             Predicted I(q), shape (N, Q).
         coh : torch.Tensor
@@ -325,12 +319,24 @@ class ScatterNet(nn.Module):
             (lambda_6 * ((f_mag_pred - f_mag_real) ** 2)) * mask_2d
         ).sum(dim=1) / n_atoms  # (N, Q)
 
-        # 2nd-derivative roughness penalty, pre-smoothing coh/inc.
-        d2_coh = iq2d.forward(coh)
-        d2_inc = iq2d.forward(inc)
-        smooth_penalty = lambda_7 * (d2_coh**2 + d2_inc**2)  # (N, Q)
+        # 2nd-derivative roughness penalty, pre-smoothing coh/inc, in log
+        # space like the terms above (raw coh/inc can be O(1e6)+ from
+        # molecule size alone, which blew this term up to ~1e13 on a live
+        # run). coh is signed (PBId), so log1p(coh**2) instead of log1p(coh).
+        # Plain discrete 2nd difference, not a calculus-accurate derivative:
+        # this is a roughness regularizer, not a physical quantity, so no
+        # /delta_q**2 (that reintroduces the same scale problem via
+        # lambda_7 instead) and no boundary stencil (dropped, like
+        # PPSpline's D).
+        log_coh = torch.log1p(coh**2)
+        log_inc = torch.log1p(inc)
+        d2_coh = log_coh[:, 2:] - 2.0 * log_coh[:, 1:-1] + log_coh[:, :-2]
+        d2_inc = log_inc[:, 2:] - 2.0 * log_inc[:, 1:-1] + log_inc[:, :-2]
+        smooth_penalty = lambda_7 * (d2_coh**2 + d2_inc**2)  # (N, Q-2)
 
-        return (msle_loss + ff_penalty + smooth_penalty).mean()
+        return (
+            msle_loss.mean() + ff_penalty.mean() + smooth_penalty.mean()
+        )
 
     def compute_loss(
         self,
@@ -379,7 +385,6 @@ class ScatterNet(nn.Module):
         return self.__fwd_fn(
             self.__fmag_table,
             self.__q_weights_,
-            self.__iq2d,
             output_head.contiguous(),
             coh.contiguous(),
             inc.contiguous(),
