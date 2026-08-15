@@ -79,7 +79,7 @@ lambda_7: 0.055
 # optimiser / training loop
 lr:            1.3e-4
 weight_decay:  0.1
-grad_clip:     1.0
+grad_clip:     2000.0
 epochs:        33
 dataset_frac:  0.05
 batcher_seed:  0

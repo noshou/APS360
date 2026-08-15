@@ -1279,6 +1279,8 @@ def _worker(cfg: RunConfig):
         save_run_config_rtf(cfg, cfg.data_dir)
         _rclone_push(cfg.data_dir, cfg.data_rclone_dest)
 
+    _epoch_time_total = 0.0
+    _epoch_count = 0
     for epoch in range(start_epoch, start_epoch + cfg.epochs):
         # Only the very first iteration of this loop can be a resume target -
         # every later epoch starts fresh regardless of what interrupted the
@@ -1660,11 +1662,17 @@ def _worker(cfg: RunConfig):
             )
             torch.cuda.empty_cache()
 
+        _epoch_dt = _time.time() - _t0
+        _epoch_time_total += _epoch_dt
+        _epoch_count += 1
+        avg_min = _epoch_time_total / _epoch_count / 60.0
+
         print(
             f"epoch {epoch:3d}"
             f"  train loss {train_loss:.4f}  r2 {train_r2:.4f}"
             f"  |  val loss {val_loss:.4f}  r2 {val_r2:.4f}"
             f"  |  test loss {test_loss:.4f}  r2 {test_r2:.4f}"
+            f"  |  avg {avg_min:.1f} min/epoch"
         )
 
         # This epoch's numbers go in this epoch's own dir, one json per
