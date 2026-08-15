@@ -158,6 +158,9 @@ class RunConfig:
         counts as better only if val_loss < best * (1 - lr_threshold).
     lr_min : float
         Floor the LR is never reduced below.
+    smoothing_lr_cut_trigger : int
+        Number of LR cuts (without escaping the plateau) before delayed
+        smoothing switches on. See ScatterNet.smoothing_enabled.
 
         Plateau decay rather than a horizon schedule because cfg.epochs is
         the epoch count for THIS invocation, not the run's total horizon (a
@@ -182,8 +185,11 @@ class RunConfig:
         Adam's denominator epsilon. Default 1e-12 rather than torch's
         1e-8, so parameters whose gradient RMS is small are not frozen by
         the epsilon dominating sqrt(v) in the update.
-    epochs : int
-        Number of full passes over all batches.
+    epochs : int or None
+        Hard cap on full passes over all batches THIS invocation. None
+        (default) runs until fully converged instead - see
+        smoothing_lr_cut_trigger and Train/train.py's
+        _destroy_vast_instance.
     batcher_seed : int
         RNG seed for the train/val/test molecule split (reproducible
         splits).
@@ -314,7 +320,24 @@ class RunConfig:
     # the form-factor heads ran at ~1e0, which froze 59% of the parameters.
     # The init fixes removed most of that imbalance; this is the insurance.
     adam_eps: float = 1e-12
-    epochs: int = 20
+    # Smoothing (SplineSmooth's Λ, and lambda_7's roughness penalty) starts
+    # OFF. It stays off until the raw, pre-smoothing model has plateaued
+    # through this many LR cuts without escaping - i.e. more learning rate
+    # genuinely isn't fixing it, not just "loss looks flat for a bit". At
+    # that point LR resets to `lr`, lambda_7 turns on, and ScatterNet's
+    # `smoothing_enabled` flips true for the rest of the run. See
+    # Train/train.py's scheduler.step() block.
+    smoothing_lr_cut_trigger: int = 2
+    # None (default): run until fully converged - the raw phase plateaus
+    # (smoothing_lr_cut_trigger LR cuts), smoothing switches on, the
+    # smoothed phase plateaus the same way, then the run stops and
+    # auto-destroys the vast.ai instance (see Train/train.py's
+    # _destroy_vast_instance). Set an int to override with a hard cap on
+    # epochs run THIS invocation instead (a resume still runs that many
+    # MORE from wherever it left off) - the run stops at the cap
+    # regardless of convergence state, and does NOT auto-destroy the
+    # instance (a manual cap implies you want to inspect the result).
+    epochs: Optional[int] = None
     batcher_seed: int = 0
     atom_size_ceil: int = -1
     dataset_frac: float = 1.0  # fraction of TRAIN's batches to use, (0.0, 1.0]

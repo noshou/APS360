@@ -3,10 +3,12 @@ import os
 import random
 import shutil
 import subprocess
+import sys
 import time as _time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace as dc_replace
+from itertools import count as _count
 from time import perf_counter
 
 import h5py
@@ -84,6 +86,43 @@ def _rclone_push(path: str, dest: str | None, delete_after: bool = False):
                 os.remove(path)
         except OSError as e:
             print(f"  [rclone] local cleanup of {path} failed: {e}")
+
+
+def _destroy_vast_instance() -> None:
+    """Destroy this vast.ai instance once training has fully converged.
+
+    All local disk is wiped on destroy, but by this point every
+    checkpoint/log/plot this run produced has already been pushed to
+    Drive via the normal per-epoch `_rclone_push` calls, so nothing is
+    lost. Uses the `vastai` CLI (installed into the venv by
+    `_shell_scripts/setup_vastai_cli.sh`, authenticated via VAST_API_KEY)
+    rather than the `vastai` Python SDK, matching this file's existing
+    rclone-via-subprocess style. Resolved via `sys.executable`'s
+    directory (not bare "vastai" on $PATH) since `run_train.sh` execs
+    this file directly, not through an activated shell.
+
+    No-op (with a print, never raises) if CONTAINER_ID isn't in the
+    environment - e.g. running training locally, off vast.ai.
+
+    Returns
+    -------
+    None
+    """
+    container_id = os.environ.get("CONTAINER_ID")
+    if not container_id:
+        print("  [auto-kill] CONTAINER_ID not set, skipping (not on vast.ai?)")
+        return
+    vastai_bin = os.path.join(os.path.dirname(sys.executable), "vastai")
+    print(
+        f"  [auto-kill] training converged, destroying instance {container_id}"
+    )
+    try:
+        subprocess.run(
+            [vastai_bin, "destroy", "instance", container_id],
+            check=True,
+        )
+    except Exception as e:
+        print(f"  [auto-kill] destroy of instance {container_id} failed: {e}")
 
 
 # profiler
@@ -404,6 +443,7 @@ def _parse_args():
     p.add_argument("--weight_decay", type=float, default=None)
     p.add_argument("--grad_clip", type=float, default=None)
     p.add_argument("--adam_eps", type=float, default=None)
+    p.add_argument("--smoothing_lr_cut_trigger", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batcher_seed", type=int, default=None)
     p.add_argument("--atom_size_ceil", type=int, default=None)
@@ -983,6 +1023,23 @@ def _worker(cfg: RunConfig):
 
     start_epoch = 1
     best_val = float("inf")
+    # Delayed smoothing: off until smoothing_lr_cut_trigger LR cuts fail to
+    # escape the plateau. target_lambda_7 preserves the configured value
+    # while cfg.lambda_7 is forced to 0.0 during the pre-smoothing phase
+    # (every read site - evaluate(), the training loop, save_epoch_plots -
+    # just reads cfg.lambda_7 directly, so mutating it here is what makes
+    # the switch take effect everywhere without threading a new parameter
+    # through each call site).
+    target_lambda_7 = cfg.lambda_7
+    lr_cut_count = 0
+    smoothing_triggered = False
+    # Separate counter for the SAME kind of stall once smoothing is on:
+    # smoothing_lr_cut_trigger more cuts with no escape post-smoothing means
+    # the model is fully converged (raw phase converged, then the smoothed
+    # phase converged too), which is what ends the run and auto-kills the
+    # instance - see the scheduler.step() block and _destroy_vast_instance.
+    post_smoothing_lr_cut_count = 0
+    fully_converged = False
     # batches to skip in the first resumed epoch (exact mid-epoch resume)
     resume_skip = 0
     # (batch_idx, grad_norm) already recorded for the interrupted epoch,
@@ -1034,6 +1091,11 @@ def _worker(cfg: RunConfig):
         # checkpoints wrote this same quantity under the misleading key
         # "val_loss", so fall back to that for backward compatibility.
         best_val = ckpt.get("best_val", ckpt.get("val_loss", float("inf")))
+        lr_cut_count = ckpt.get("lr_cut_count", 0)
+        smoothing_triggered = ckpt.get("smoothing_triggered", False)
+        post_smoothing_lr_cut_count = ckpt.get(
+            "post_smoothing_lr_cut_count", 0
+        )
         saved_bi = ckpt.get("batch_idx", -1)
         # Older checkpoints (pre phase-machine) never wrote "phase" - they
         # only ever checkpointed mid-training, so "train" is the correct
@@ -1075,6 +1137,16 @@ def _worker(cfg: RunConfig):
             f"best_val {best_val:.4f}, lr {resumed_lr:.4g})",
         )
         del ckpt
+
+    # Delayed smoothing: off until smoothing_lr_cut_trigger LR cuts fail to
+    # escape the plateau. Every read site (evaluate(), the training loop,
+    # save_epoch_plots) just reads cfg.lambda_7 directly, so mutating it
+    # here is what makes the switch take effect everywhere without
+    # threading a new parameter through each call site. model.smoothing_
+    # enabled is set the same way since it is not part of state_dict().
+    if not smoothing_triggered:
+        cfg.lambda_7 = 0.0
+    model.smoothing_enabled = smoothing_triggered
 
     # profiler - diagnostic mode. Two decoupled layers:
     #
@@ -1259,6 +1331,9 @@ def _worker(cfg: RunConfig):
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "best_val": best_val,
+                "lr_cut_count": lr_cut_count,
+                "smoothing_triggered": smoothing_triggered,
+                "post_smoothing_lr_cut_count": post_smoothing_lr_cut_count,
                 "grad_norms": batch_grad_norms,
                 "lr": optimizer.param_groups[0]["lr"],
                 "q_grid": q_grid,
@@ -1281,7 +1356,14 @@ def _worker(cfg: RunConfig):
 
     _epoch_time_total = 0.0
     _epoch_count = 0
-    for epoch in range(start_epoch, start_epoch + cfg.epochs):
+    # cfg.epochs is now an optional override cap, not the primary stopping
+    # mechanism - default (None) is "run until fully converged" (raw phase
+    # plateaus -> smoothing switches on -> smoothed phase plateaus -> stop
+    # and auto-kill the instance, see the scheduler.step() block below and
+    # _destroy_vast_instance). itertools.count gives the unbounded default;
+    # the cap (if set) is checked as this iteration's break condition,
+    # alongside fully_converged, at the end of the loop body.
+    for epoch in _count(start_epoch):
         # Only the very first iteration of this loop can be a resume target -
         # every later epoch starts fresh regardless of what interrupted the
         # previous run.
@@ -1766,6 +1848,40 @@ def _worker(cfg: RunConfig):
         new_lr = optimizer.param_groups[0]["lr"]
         if new_lr != prev_lr:
             print(f"  val loss plateaued, lr {prev_lr:.3g} -> {new_lr:.3g}")
+            if not smoothing_triggered:
+                lr_cut_count += 1
+                if lr_cut_count >= cfg.smoothing_lr_cut_trigger:
+                    smoothing_triggered = True
+                    model.smoothing_enabled = True
+                    cfg.lambda_7 = target_lambda_7
+                    for g in optimizer.param_groups:
+                        g["lr"] = cfg.lr
+                    scheduler._reset()  # clears best/num_bad_epochs/cooldown
+                    print(
+                        f"  {lr_cut_count} lr cuts without escaping the "
+                        f"plateau - enabling smoothing (lambda_7="
+                        f"{cfg.lambda_7:.3g}), lr reset to {cfg.lr:.3g}"
+                    )
+            else:
+                # Same stall signature, now under smoothing: this many
+                # cuts with no escape means the smoothed model has itself
+                # converged, not just the raw one - training is done.
+                post_smoothing_lr_cut_count += 1
+                if post_smoothing_lr_cut_count >= cfg.smoothing_lr_cut_trigger:
+                    fully_converged = True
+                    print(
+                        f"  {post_smoothing_lr_cut_count} lr cuts post-"
+                        "smoothing without escaping - model fully "
+                        "converged, ending run"
+                    )
+
+        if fully_converged:
+            break
+        if cfg.epochs is not None and epoch - start_epoch + 1 >= cfg.epochs:
+            break
+
+    if fully_converged:
+        _destroy_vast_instance()
 
 
 # entry point

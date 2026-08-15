@@ -62,6 +62,7 @@ class ScatterNet(nn.Module):
     __fmag_table: torch.Tensor  # shape (V, Q)
     __q_weights_: torch.Tensor  # shape (1, Q)
     __fwd_fn: Callable
+    __smoothing_enabled: bool
 
     def __init__(
         self,
@@ -167,6 +168,10 @@ class ScatterNet(nn.Module):
         self.__spline = SplineSmooth(q_points, delta_q, compile=compile)
         self.__eps_embd = eps_embd
         self.__eps_msgp = eps_msgp
+        # Starts disabled: Train/train.py delays turning this on until the
+        # raw (pre-smoothing) model has plateaued through several LR cuts
+        # without escaping. See the `smoothing_enabled` property.
+        self.__smoothing_enabled = False
 
         fmag_table = torch.zeros(len(VOCAB) + 1, len(qgrid))
 
@@ -396,6 +401,22 @@ class ScatterNet(nn.Module):
             lambda_7,
         )
 
+    @property
+    def smoothing_enabled(self) -> bool:
+        """Whether `forward()` runs coh/inc through `SplineSmooth`.
+
+        Mutable at runtime (not just at construction): Train/train.py
+        flips this once, mid-run, when the delayed-smoothing trigger
+        fires (see `Train/train.py`'s `smoothing_lr_cut_trigger`). Not a
+        `torch.nn.Parameter`/buffer, so it is not part of `state_dict()`
+        - the caller (train.py) is responsible for restoring it on resume.
+        """
+        return self.__smoothing_enabled
+
+    @smoothing_enabled.setter
+    def smoothing_enabled(self, value: bool) -> None:
+        self.__smoothing_enabled = value
+
     def forward(
         self, batch: Batch
     ) -> Tuple[
@@ -436,7 +457,16 @@ class ScatterNet(nn.Module):
         sigmas = sigmas.squeeze(-1)
         # whole molecule on one device, so coh already covers every atom
         coh, inc = self.__out(batch, msg_head)
-        iq = self.__spline(sigmas, f_mags, coh, inc, batch)
+        if self.__smoothing_enabled:
+            iq = self.__spline(sigmas, f_mags, coh, inc, batch)
+        else:
+            # SplineSmooth at Λ=0 is the identity (its linear system
+            # reduces to I @ y = y), so this is exactly what it would
+            # produce anyway - skipping it avoids running LambdaHead/
+            # PPSpline at all while smoothing is off, and guarantees no
+            # smoothing effect during that phase regardless of what
+            # LambdaHead would have predicted.
+            iq = coh**2 + inc
         # I(q) is a physical scattering intensity - it cannot be negative.
         # SplineSmooth's linear solve has no such guarantee on its own output
         # (a penalized smoother can undershoot near sharp features and dip

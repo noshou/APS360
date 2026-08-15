@@ -90,7 +90,9 @@
 1. Make sure you start with the "PyTorch (Vast)" template
 2. Edit the file
 3. Under Environment Varialbes, add RCLONE_CONFIG_B64 and set it to your base64 encoded rclone
-4. **Make sure you've selected private so you don't leak your API token!**
+   - Optionally also add `VAST_API_KEY` (from https://cloud.vast.ai/manage-keys/) so the instance can auto-destroy itself once training fully converges - see "Auto-kill on convergence" below. Without it, training runs the same, it just won't tear the instance down for you at the end.
+   - Optionally also add `HF_TOKEN` (from https://huggingface.co/settings/tokens) so `download_dataset.sh`'s HuggingFace download is authenticated. Nothing to wire up beyond adding it here - `hf` reads it straight from the environment on its own, and it persists across every restart/reprovision this way (unlike `export HF_TOKEN=...` in one SSH session, which is gone the moment that shell closes). Without it, the download still works, just under HuggingFace's stricter unauthenticated rate limits.
+4. **Make sure you've selected private so you don't leak your API token(s)!**
 5. Under `Advanced Options`, copy below into `On-start Bash Commands`:
 
 ```shell
@@ -115,16 +117,12 @@ bash "${WORKSPACE:-/workspace}/APS360/_shell_scripts/vast-provision.sh"
    - `bash _shell_scripts/vast-provision.sh` reruns the full provisioning chain; safe to rerun anytime, every step is idempotent.
    - `bash _shell_scripts/register_supervisor.sh` / `register_log_sync.sh` re-registers just one service after a script change, without a full reprovision.
    - `df -h /workspace` checks disk space.
-10. If `download_dataset.sh`'s HuggingFace download hangs at `0%` for minutes: it's usually because `hf` got invoked outside the venv (a bare `hf` on `$PATH` isn't the same install as the venv's), not real HF-side throttling - confirm with `which hf`, then run it explicitly through the venv:
+10. `download_dataset.sh` now always calls `$VENV_DIR/bin/hf` explicitly (not bare `hf`), so it no longer depends on the invoking shell having the venv active. If you're running a HuggingFace download manually from your own SSH session and it hangs at `0%` for minutes, that same venv-vs-bare-`hf` mismatch is still the likely cause - confirm with `which hf`, then run it explicitly through the venv:
     ```shell
     source /workspace/venv/bin/activate
     /workspace/venv/bin/hf download noshou/iq_train_set "I(q)@L=50.h5" iq_train_set-ENCODING.sqlite3 --repo-type dataset --local-dir Preprocess/
     ```
-    If it's still stuck after that, set `HF_TOKEN` (unauthenticated requests get stricter rate limits, get a free one at https://huggingface.co/settings/tokens):
-    ```shell
-    export HF_TOKEN=hf_xxxxxxxxxxxx
-    ```
-    That only lasts for the current shell session; to make it survive future restarts automatically, add `HF_TOKEN=hf_xxx` to your `vastai create instance --env` string, the same way `RCLONE_CONFIG_B64` is already passed in - `hf` reads it straight from the environment, no script changes needed.
+    If it's still stuck after that, you're likely hitting unauthenticated rate limits - see `HF_TOKEN` under step 3 above (get a free one at https://huggingface.co/settings/tokens). For a one-off manual session, `export HF_TOKEN=hf_xxxxxxxxxxxx` works too, but only lasts that shell - prefer setting it as an instance env var so it survives restarts.
 11. `supervisorctl status` also shows the vast.ai template's own default services (`caddy`, `cron`, `instance_portal`, `jupyter`, `syncthing`, `tensorboard`, `tunnel_manager`), alongside `scatternet-train`/`scatternet-log-sync`. None of these are used by this repo's workflow (SSH + `supervisorctl` + `rclone`, not the vast.ai web portal), so they're safe to `supervisorctl stop <name>` for tidiness if you want:
     - `jupyter`, `tensorboard`, `syncthing` - unused (metrics/plots go to Drive via `rclone`, not TensorBoard or syncthing).
     - `tunnel_manager` - manages public tunnel URLs for the vast.ai web portal; irrelevant if you're purely SSH-based.
@@ -132,3 +130,12 @@ bash "${WORKSPACE:-/workspace}/APS360/_shell_scripts/vast-provision.sh"
     - Leave `cron` alone - near-zero overhead, may handle internal template housekeeping unrelated to us.
 
     None of these compete with GPU training for resources (all lightweight; the only heavy process is `scatternet-train` itself), so stopping them is about tidiness, not performance. A stopped service comes back on the next reboot or `vast-provision.sh` rerun unless its own `autostart` is disabled in its conf file (template-managed, outside `_shell_scripts/`).
+12. Starting a genuinely fresh run (new hyperparameters, archived the old Drive folder, etc.) needs more than just renaming/moving the old `ScatterNet_Train` folder on Drive and restarting. `Train/train.py` deletes each **checkpoint** locally right after it's pushed (see `_rclone_push` call sites), so a restart with no Drive checkpoints does start training from scratch correctly. But `data_dir` (`scatternet_data/` - the per-epoch metrics/plots directory) is *never* deleted locally, by design, so the loss-vs-epoch curve can be redrawn from disk on a real resume. If you archive the Drive folder away and restart without also clearing the local copy, the new run's first `_rclone_push(data_dir, ...)` re-uploads the old run's leftover `epoch_NNN/` directories straight into the freshly-created Drive folder - it looks like old data is somehow being "pulled back in", but it's actually just stale local state getting re-pushed, nothing cached or restored from Drive. Before restarting for a truly clean run:
+    ```shell
+    rm -rf /workspace/APS360/scatternet_data
+    supervisorctl restart scatternet-train
+    ```
+13. **Auto-kill on convergence.** `Train/train.yaml` no longer sets `epochs` - training now runs until it's actually converged, not a fixed count. Concretely: smoothing (`SplineSmooth`'s Λ, `lambda_7`) starts OFF; when the raw model plateaus through `smoothing_lr_cut_trigger` (default 2) LR cuts with no escape, smoothing switches on and LR resets to its starting value (`lr`) so the model isn't stuck fine-tuning at whatever tiny LR it plateaued at. If the now-smoothed model plateaus the same way again, training stops - by that point every checkpoint/log/plot has already been pushed to Drive (the normal per-epoch `_rclone_push` calls), so the instance is safe to destroy, and it destroys itself automatically via the `vastai` CLI (installed by `requirements.txt`, authenticated by `setup_vastai_cli.sh` from `VAST_API_KEY`).
+    - If `VAST_API_KEY` wasn't set, this is a no-op (a printed warning, not a crash) - the run still stops, you just have to destroy the instance yourself from the vast.ai console.
+    - To go back to a fixed-length run instead (no convergence detection, no auto-kill), set `epochs: N` in `Train/train.yaml` like before - it becomes a hard cap regardless of convergence state and disables auto-destroy, since a manual cap implies you want to inspect the result yourself.
+    - You can destroy an instance manually the same way training does, from your own machine or another instance: `vastai destroy instance $CONTAINER_ID` (needs `vastai set api-key ...` run once first, same as `setup_vastai_cli.sh` does automatically).
