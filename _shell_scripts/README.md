@@ -115,3 +115,13 @@ bash "${WORKSPACE:-/workspace}/APS360/_shell_scripts/vast-provision.sh"
    - `bash _shell_scripts/vast-provision.sh` reruns the full provisioning chain; safe to rerun anytime, every step is idempotent.
    - `bash _shell_scripts/register_supervisor.sh` / `register_log_sync.sh` re-registers just one service after a script change, without a full reprovision.
    - `df -h /workspace` checks disk space.
+10. If `download_dataset.sh`'s HuggingFace download hangs at `0%` for minutes: it's usually because `hf` got invoked outside the venv (a bare `hf` on `$PATH` isn't the same install as the venv's), not real HF-side throttling - confirm with `which hf`, then run it explicitly through the venv:
+    ```shell
+    source /workspace/venv/bin/activate
+    /workspace/venv/bin/hf download noshou/iq_train_set "I(q)@L=50.h5" iq_train_set-ENCODING.sqlite3 --repo-type dataset --local-dir Preprocess/
+    ```
+    If it's still stuck after that, set `HF_TOKEN` (unauthenticated requests get stricter rate limits, get a free one at https://huggingface.co/settings/tokens):
+    ```shell
+    export HF_TOKEN=hf_xxxxxxxxxxxx
+    ```
+    That only lasts for the current shell session; to make it survive future restarts automatically, add `HF_TOKEN=hf_xxx` to your `vastai create instance --env` string, the same way `RCLONE_CONFIG_B64` is already passed in - `hf` reads it straight from the environment, no script changes needed.
