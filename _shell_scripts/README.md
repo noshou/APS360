@@ -103,3 +103,15 @@ bash "${WORKSPACE:-/workspace}/APS360/_shell_scripts/vast-provision.sh"
 6. Click `save` and make sure you use it for all subsequent ScatterNet runs
 7. Make sure you've set up SSH auth if you want to monitor the run (**highly reccomended**)
 8. Good upload/download speeds are important; minimum of 34 GB of VRAM and 120GB of disk space is reccomended. Highly reccomend an A100 or better.
+9. Helpful commands after `ssh`-ing into your instance:
+   - `nvtop` shows live GPU utilization/memory.
+   - `htop` shows live CPU/memory usage.
+   - `watch -n 1 supervisorctl status` shows every supervisor-managed service (`scatternet-train`, `scatternet-log-sync`, etc.) and whether it's `RUNNING`/`STOPPED`/`FATAL`.
+   - `tail -f /var/log/scatternet-train.log` streams training's stdout (batch/loss/checkpoint prints).
+   - `tail -f /var/log/scatternet-train.err.log` streams training's stderr (where crashes/tracebacks show up).
+   - `tail -f /var/log/scatternet-log-sync.log` / `.err.log` streams the log-sync service that pushes both logs above to `gdrive:ScatterNet_Train/logs/` every 2 minutes.
+   - `: > /var/log/<log>` truncates a log file in place; use this before a restart if you want to watch fresh output only, not the previous run's history.
+   - `supervisorctl restart scatternet-train` restarts training (auto-resumes from the latest checkpoint on Drive, see `run_train.sh`).
+   - `bash _shell_scripts/vast-provision.sh` reruns the full provisioning chain; safe to rerun anytime, every step is idempotent.
+   - `bash _shell_scripts/register_supervisor.sh` / `register_log_sync.sh` re-registers just one service after a script change, without a full reprovision.
+   - `df -h /workspace` checks disk space.
