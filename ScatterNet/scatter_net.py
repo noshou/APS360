@@ -437,4 +437,15 @@ class ScatterNet(nn.Module):
         # whole molecule on one device, so coh already covers every atom
         coh, inc = self.__out(batch, msg_head)
         iq = self.__spline(sigmas, f_mags, coh, inc, batch)
+        # I(q) is a physical scattering intensity - it cannot be negative.
+        # SplineSmooth's linear solve has no such guarantee on its own output
+        # (a penalized smoother can undershoot near sharp features and dip
+        # negative even from a strictly non-negative input); nothing enforced
+        # this constraint anywhere in the pipeline. A live run hit log1p(iq)
+        # with iq <= -1 (NaN, log1p's domain boundary) from exactly this.
+        # Clamped here, not inside SplineSmooth: SplineSmooth is a generic
+        # P-spline smoother with no notion that its output represents a
+        # non-negative physical quantity - that knowledge belongs where iq
+        # is actually established as I(q).
+        iq = iq.clamp(min=0.0)
         return iq, coh, inc, f_mags, sigmas
