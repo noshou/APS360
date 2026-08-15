@@ -125,3 +125,10 @@ bash "${WORKSPACE:-/workspace}/APS360/_shell_scripts/vast-provision.sh"
     export HF_TOKEN=hf_xxxxxxxxxxxx
     ```
     That only lasts for the current shell session; to make it survive future restarts automatically, add `HF_TOKEN=hf_xxx` to your `vastai create instance --env` string, the same way `RCLONE_CONFIG_B64` is already passed in - `hf` reads it straight from the environment, no script changes needed.
+11. `supervisorctl status` also shows the vast.ai template's own default services (`caddy`, `cron`, `instance_portal`, `jupyter`, `syncthing`, `tensorboard`, `tunnel_manager`), alongside `scatternet-train`/`scatternet-log-sync`. None of these are used by this repo's workflow (SSH + `supervisorctl` + `rclone`, not the vast.ai web portal), so they're safe to `supervisorctl stop <name>` for tidiness if you want:
+    - `jupyter`, `tensorboard`, `syncthing` - unused (metrics/plots go to Drive via `rclone`, not TensorBoard or syncthing).
+    - `tunnel_manager` - manages public tunnel URLs for the vast.ai web portal; irrelevant if you're purely SSH-based.
+    - `caddy`, `instance_portal` - serve the vast.ai web console UI itself; stopping these breaks the "Open" buttons in vast.ai's own dashboard for this instance, keep them if you ever want that fallback.
+    - Leave `cron` alone - near-zero overhead, may handle internal template housekeeping unrelated to us.
+
+    None of these compete with GPU training for resources (all lightweight; the only heavy process is `scatternet-train` itself), so stopping them is about tidiness, not performance. A stopped service comes back on the next reboot or `vast-provision.sh` rerun unless its own `autostart` is disabled in its conf file (template-managed, outside `_shell_scripts/`).
