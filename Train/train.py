@@ -1834,6 +1834,7 @@ def _worker(cfg: RunConfig):
                 {
                     "epoch": epoch,
                     "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
                     "val_loss": val_loss,
                     "q_grid": q_grid,
                     "energy": energy,
@@ -1841,7 +1842,13 @@ def _worker(cfg: RunConfig):
                 },
                 cfg.ckpt_best,
             )
-            _rclone_push(cfg.ckpt_best,cfg.ckpt_rclone_dest,delete_after=True)
+            # delete_after=False, unlike every other checkpoint push: the
+            # delayed-smoothing trigger reads this file back locally
+            # (rolls back to it before switching smoothing on), so it does
+            # NOT meet _rclone_push's own documented condition for
+            # delete_after=True ("never safe for paths read back locally
+            # during the run").
+            _rclone_push(cfg.ckpt_best, cfg.ckpt_rclone_dest)
             print(f"  saved best checkpoint (val {val_loss:.4f})")
 
         # phase="test", batch_idx=-1: test done -> whole epoch complete,
@@ -1883,8 +1890,44 @@ def _worker(cfg: RunConfig):
                 lr_consecutive_fires += 1
                 if lr_consecutive_fires >= cfg.smoothing_lr_cut_trigger:
                     smoothing_triggered = True
+                    # The 2 consecutive unproductive cuts it took to get
+                    # here mean the CURRENT weights are, by construction,
+                    # worse than the best point this run already found -
+                    # roll back to that point rather than starting
+                    # smoothing from a state training has since drifted
+                    # past. Model AND optimizer state together, not just
+                    # weights: Adam's momentum/variance were built for the
+                    # trajectory that led to the current (worse) point, so
+                    # reloading only the weights would pair rolled-back
+                    # weights with a mismatched optimizer state.
+                    if os.path.exists(cfg.ckpt_best):
+                        best_ckpt = torch.load(
+                            cfg.ckpt_best, map_location=device
+                        )
+                        model.load_state_dict(best_ckpt["model"])
+                        if "optimizer" in best_ckpt:
+                            optimizer.load_state_dict(
+                                best_ckpt["optimizer"]
+                            )
+                        print(
+                            f"  rolled back to best checkpoint (epoch "
+                            f"{best_ckpt['epoch']}, val "
+                            f"{best_ckpt['val_loss']:.4f}) before "
+                            "enabling smoothing"
+                        )
+                        del best_ckpt
+                    else:
+                        print(
+                            "  WARNING: no ckpt_best found to roll back "
+                            "to - enabling smoothing from current "
+                            "(non-best) weights"
+                        )
                     model.smoothing_enabled = True
                     cfg.lambda_7 = target_lambda_7
+                    # AFTER the optimizer rollback, not before - loading
+                    # best_ckpt's optimizer state_dict restores whatever LR
+                    # was active back at that epoch, which would silently
+                    # undo this reset if it ran first.
                     for g in optimizer.param_groups:
                         g["lr"] = cfg.lr
                     scheduler._reset()  # clears best/num_bad_epochs/cooldown
