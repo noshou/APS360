@@ -8,8 +8,8 @@ from dataclasses import replace as dc_replace
 import torch
 
 from Baselines.run.baseline import Baseline
+from Baselines.run.metrics import _PCT_ERR_FLOOR, run_all_plots
 from Baselines.run.metrics import evaluate as _bl_evaluate
-from Baselines.run.metrics import run_all_plots
 from ScatterNet import ScatterNet
 from ScatterNet.batching import Batch
 from ScatterNet.utils.config import RunConfig
@@ -106,6 +106,8 @@ class ScatterNetBaseline(Baseline):
         self._sum_y = 0.0
         self._sum_y2 = 0.0
         self._n_elem = 0.0
+        self._pct_err_sum = 0.0
+        self._pct_err_n = 0.0
         if resume_loss_state:
             self._loss_sum = resume_loss_state["loss_sum"]
             self._mols = resume_loss_state["mols"]
@@ -113,6 +115,8 @@ class ScatterNetBaseline(Baseline):
             self._sum_y = resume_loss_state["sum_y"]
             self._sum_y2 = resume_loss_state["sum_y2"]
             self._n_elem = resume_loss_state["n_elem"]
+            self._pct_err_sum = resume_loss_state.get("pct_err_sum", 0.0)
+            self._pct_err_n = resume_loss_state.get("pct_err_n", 0.0)
 
     def loss_state(self) -> dict:
         """Return the loss/R2 accumulator state, for mid-pass checkpointing.
@@ -127,19 +131,27 @@ class ScatterNetBaseline(Baseline):
             "sum_y": self._sum_y,
             "sum_y2": self._sum_y2,
             "n_elem": self._n_elem,
+            "pct_err_sum": self._pct_err_sum,
+            "pct_err_n": self._pct_err_n,
         }
 
-    def loss_r2(self) -> tuple[float, float]:
-        """Return (mean composite loss, log1p R2) accumulated over all calls.
+    def loss_r2(self) -> tuple[float, float, float]:
+        """Return (mean composite loss, log1p R2, mean percent error)
+        accumulated over all calls.
 
         Returns NaNs if `compute_loss` was False or nothing was evaluated.
         """
         if not self._compute_loss or self._mols == 0:
-            return float("nan"), float("nan")
+            return float("nan"), float("nan"), float("nan")
         mean_loss = self._loss_sum / self._mols
         ss_tot = self._sum_y2 - self._sum_y**2 / self._n_elem
         r2 = 1.0 - self._ss_res / ss_tot if ss_tot > 0 else 0.0
-        return mean_loss, r2
+        pct_err = (
+            self._pct_err_sum / self._pct_err_n
+            if self._pct_err_n > 0
+            else float("nan")
+        )
+        return mean_loss, r2, pct_err
 
     def __call__(self, batch: Batch) -> torch.Tensor:  # shape (N, Q)
         """Predict I(q) for every molecule in `batch`.
@@ -198,6 +210,16 @@ class ScatterNetBaseline(Baseline):
                 self._sum_y += log_target.sum().item()
                 self._sum_y2 += (log_target**2).sum().item()
                 self._n_elem += log_target.numel()
+                self._pct_err_sum += (
+                    (
+                        100.0
+                        * (iqf - batch.iqval).abs()
+                        / batch.iqval.clamp(min=_PCT_ERR_FLOOR)
+                    )
+                    .sum()
+                    .item()
+                )
+                self._pct_err_n += log_target.numel()
         self._seen += 1
         if (
             self._progress
@@ -231,10 +253,10 @@ def save_epoch_plots(
     resume_state: dict | None = None,
     ckpt_cb: "Callable[[dict, int], None] | None" = None,
     ckpt_interval_sec: float = 0,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     """
     Evaluate `model` on `loader`, write this epoch's diagnostic plots, and
-    return the test loss/R2 computed in the same single pass.
+    return the test loss/R2/percent-error computed in the same single pass.
 
     Mirrors Baselines/run/colab_baselines.ipynb own evaluate()/run_all_plots()
     call, so training progress is comparable to the baseline notebook's
@@ -273,9 +295,9 @@ def save_epoch_plots(
     epoch : int
         Current epoch number, used to name the per-epoch subdirectory.
     compute_loss : bool, optional
-        If True, the pass also returns (test_loss, test_r2). If False
-        (default), the return value is (nan, nan) and only plots are
-        produced.
+        If True, the pass also returns (test_loss, test_r2, test_pct_err).
+        If False (default), the return value is (nan, nan, nan) and only
+        plots are produced.
     lambda_6 : float, optional
         Loss weight, required when `compute_loss` is True.
     lambda_7 : float, optional
@@ -303,9 +325,10 @@ def save_epoch_plots(
 
     Returns
     -------
-    tuple of (float, float)
-        (test_loss, test_r2) in log1p space, or (nan, nan) if
-        compute_loss is False.
+    tuple of (float, float, float)
+        (test_loss, test_r2) in log1p space and mean absolute percent
+        error in raw I(q) space, or (nan, nan, nan) if compute_loss is
+        False.
     """
     baseline = ScatterNetBaseline(
         model,
@@ -511,6 +534,79 @@ def save_epoch_loss_plot(history: list[dict], data_dir: str) -> None:
     )
     fig.tight_layout()
     out_path = os.path.join(data_dir, "loss_per_epoch.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
+    plt.close(fig)
+    print(f"  [plots] wrote {out_path}", flush=True)
+
+
+def save_epoch_pct_err_plot(history: list[dict], data_dir: str) -> None:
+    """Update the run-wide train/val/test percent-error-vs-epoch trend.
+
+    Same pattern as `save_epoch_loss_plot` (cheap, reads `history` off
+    disk, written once at the ROOT of data_dir since it's a running trend
+    not a per-epoch snapshot) - deliberately does NOT write its own JSON
+    sidecar, since `history`'s records (and therefore
+    `loss_per_epoch.json`, already written by `save_epoch_loss_plot`)
+    already carry "train_pct_err"/"val_pct_err"/"test_pct_err" alongside
+    the loss fields; a second JSON would just be a duplicate of the same
+    per-epoch records.
+
+    Parameters
+    ----------
+    history : list of dict
+        Per-epoch records, each with "epoch", "train_pct_err",
+        "val_pct_err", "test_pct_err"; typically
+        `load_epoch_history(data_dir)`.
+    data_dir : str
+        Root plots directory.
+
+    Returns
+    -------
+    None
+    """
+    if len(history) <= 1:
+        return
+
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    from Baselines.run.metrics import TEXT_PRIMARY, _configure_mpl, _style_axes
+
+    _configure_mpl()
+    os.makedirs(data_dir, exist_ok=True)
+
+    epochs = [h["epoch"] for h in history]
+    fig, ax = plt.subplots(figsize=(11, 6))
+    for (key, label, marker), linestyle in zip(
+        [
+            ("train_pct_err", "train", "o"),
+            ("val_pct_err", "val", "D"),
+            ("test_pct_err", "test", "s"),
+        ],
+        ["-", "--", ":"],
+    ):
+        ax.plot(
+            epochs,
+            [h.get(key, float("nan")) for h in history],
+            marker=marker,
+            markersize=8.5,
+            linewidth=2,
+            color=TEXT_PRIMARY,
+            linestyle=linestyle,
+            label=label,
+        )
+    ax.set_xlabel("epoch", color=TEXT_PRIMARY)
+    ax.set_ylabel("mean percent error (%)", color=TEXT_PRIMARY)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    _style_axes(ax)
+    ax.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1),
+        frameon=True,
+        labelcolor=TEXT_PRIMARY,
+    )
+    fig.tight_layout()
+    out_path = os.path.join(data_dir, "pct_err_per_epoch.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
     print(f"  [plots] wrote {out_path}", flush=True)

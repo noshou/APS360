@@ -15,6 +15,7 @@ import h5py
 import torch
 from torch.utils.data import DataLoader, Subset
 
+from Baselines.run.metrics import _PCT_ERR_FLOOR
 from Preprocess import Encoding
 from ScatterNet import ScatterNet
 from ScatterNet.batching import Batcher, BatchSet
@@ -440,6 +441,7 @@ def _parse_args():
     p.add_argument("--lr_patience", type=int, default=None)
     p.add_argument("--lr_threshold", type=float, default=None)
     p.add_argument("--lr_min", type=float, default=None)
+    p.add_argument("--lr_ema_alpha", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
     p.add_argument("--grad_clip", type=float, default=None)
     p.add_argument("--adam_eps", type=float, default=None)
@@ -484,8 +486,9 @@ def evaluate(
     start_batch: int = 0,
     resume_state: dict | None = None,
     ckpt_cb: "Callable[[dict, int], None] | None" = None,
-) -> tuple[float, float]:
-    """Run one pass over `loader` without gradients and return (mean_loss, R2).
+) -> tuple[float, float, float]:
+    """Run one pass over `loader` without gradients and return (mean_loss,
+    R2, mean percent error).
 
     Parameters
     ----------
@@ -511,8 +514,9 @@ def evaluate(
         themselves are seeded from `resume_state`, not recomputed.
     resume_state : dict or None
         Accumulator state saved by an earlier `ckpt_cb` call
-        (total_loss/total_mols/ss_res/sum_y/sum_y2/n_elem), folded in
-        before this pass's own batches are added. None for a fresh pass.
+        (total_loss/total_mols/ss_res/sum_y/sum_y2/n_elem/pct_err_sum/
+        pct_err_n), folded in before this pass's own batches are added.
+        None for a fresh pass.
     ckpt_cb : callable or None
         If given, called periodically (same cadence as the training
         loop's mid-epoch checkpoint) as `ckpt_cb(state, batch_idx)` with
@@ -521,9 +525,11 @@ def evaluate(
 
     Returns
     -------
-    tuple of (float, float)
-        Mean loss over all molecules, and the R2 score computed in
-        log1p space.
+    tuple of (float, float, float)
+        Mean loss over all molecules, the R2 score computed in log1p
+        space, and mean absolute percent error in raw I(q) space (same
+        formula as Baselines/run/metrics.py's per-q percent error,
+        collapsed to one scalar).
     """
     model.eval()
     total_loss = 0.0
@@ -532,6 +538,8 @@ def evaluate(
     sum_y = 0.0
     sum_y2 = 0.0
     n_elem = 0.0
+    pct_err_sum = 0.0
+    pct_err_n = 0.0
     if resume_state:
         total_loss = resume_state["total_loss"]
         total_mols = resume_state["total_mols"]
@@ -539,6 +547,8 @@ def evaluate(
         sum_y = resume_state["sum_y"]
         sum_y2 = resume_state["sum_y2"]
         n_elem = resume_state["n_elem"]
+        pct_err_sum = resume_state.get("pct_err_sum", 0.0)
+        pct_err_n = resume_state.get("pct_err_n", 0.0)
     verbose = cfg.verbosity in ("batch", "diagnostic")
     n_batch = start_batch + len(loader)
     t0 = _time.time()
@@ -572,6 +582,19 @@ def evaluate(
             b_sum_y = log_target.sum().item()
             b_sum_y2 = (log_target**2).sum().item()
             b_n_elem = float(log_target.numel())
+            # Raw-space (not log1p) mean absolute percent error, same
+            # formula/floor as Baselines/run/metrics.py's evaluate() so
+            # this is directly comparable to the test-set diagnostic
+            # plots' per-q percent error.
+            b_pct_err = (
+                (
+                    100.0
+                    * (iq - batch.iqval).abs()
+                    / batch.iqval.clamp(min=_PCT_ERR_FLOOR)
+                )
+                .sum()
+                .item()
+            )
 
             total_loss += b_loss
             total_mols += b_mols
@@ -579,6 +602,8 @@ def evaluate(
             sum_y += b_sum_y
             sum_y2 += b_sum_y2
             n_elem += b_n_elem
+            pct_err_sum += b_pct_err
+            pct_err_n += b_n_elem
             del iq, coh, inc, fmags, sigmas, loss, log_pred, log_target
 
             if verbose and (_bi + 1) % 20 == 0:
@@ -606,6 +631,8 @@ def evaluate(
                         "sum_y": sum_y,
                         "sum_y2": sum_y2,
                         "n_elem": n_elem,
+                        "pct_err_sum": pct_err_sum,
+                        "pct_err_n": pct_err_n,
                     },
                     _bi,
                 )
@@ -613,7 +640,8 @@ def evaluate(
     mean_loss = total_loss / total_mols
     ss_tot = sum_y2 - sum_y**2 / n_elem
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    return mean_loss, r2
+    pct_err = pct_err_sum / pct_err_n if pct_err_n > 0 else float("nan")
+    return mean_loss, r2, pct_err
 
 
 # training worker
@@ -1023,6 +1051,14 @@ def _worker(cfg: RunConfig):
 
     start_epoch = 1
     best_val = float("inf")
+    # EMA of val_loss fed to scheduler.step() instead of the raw value -
+    # see RunConfig.lr_ema_alpha's docstring for why (ReduceLROnPlateau
+    # compares one epoch against the all-time best with no windowing, so
+    # a single noisy-but-better epoch can reset num_bad_epochs on its
+    # own). None means "not seeded yet" - the first val_loss becomes the
+    # EMA's starting point outright rather than blending against a
+    # nonexistent prior value.
+    val_loss_ema = None
     # Delayed smoothing: off until smoothing_lr_cut_trigger LR cuts fail to
     # escape the plateau. target_lambda_7 preserves the configured value
     # while cfg.lambda_7 is forced to 0.0 during the pre-smoothing phase
@@ -1059,8 +1095,8 @@ def _worker(cfg: RunConfig):
     resume_phase: str | None = None
     resume_phase_skip = 0
     resume_eval_state: dict | None = None
-    resume_train_loss = resume_train_r2 = None
-    resume_val_loss = resume_val_r2 = None
+    resume_train_loss = resume_train_r2 = resume_train_pct_err = None
+    resume_val_loss = resume_val_r2 = resume_val_pct_err = None
     _PHASE_ORDER = ["train", "val", "test"]
 
     if cfg.resume:
@@ -1098,6 +1134,11 @@ def _worker(cfg: RunConfig):
         # checkpoints wrote this same quantity under the misleading key
         # "val_loss", so fall back to that for backward compatibility.
         best_val = ckpt.get("best_val", ckpt.get("val_loss", float("inf")))
+        # No fallback to raw val_loss if missing - an old checkpoint that
+        # predates this feature has no EMA history to seed from, so start
+        # fresh at None (seeded outright by the next val_loss, same as a
+        # brand new run) rather than silently guessing a starting point.
+        val_loss_ema = ckpt.get("val_loss_ema")
         # No fallback to the old cumulative "lr_cut_count"/
         # "post_smoothing_lr_cut_count" keys - those counted ANY cuts ever,
         # not consecutive-since-last-improvement, so an old value isn't a
@@ -1129,8 +1170,10 @@ def _worker(cfg: RunConfig):
             resume_eval_state = ckpt.get("eval_state")
             resume_train_loss = ckpt.get("train_loss")
             resume_train_r2 = ckpt.get("train_r2")
+            resume_train_pct_err = ckpt.get("train_pct_err")
             resume_val_loss = ckpt.get("val_loss")
             resume_val_r2 = ckpt.get("val_r2")
+            resume_val_pct_err = ckpt.get("val_pct_err")
         else:
             # saved_phase fully completed as of this checkpoint.
             phase_i = _PHASE_ORDER.index(saved_phase)
@@ -1141,8 +1184,10 @@ def _worker(cfg: RunConfig):
                 resume_phase = _PHASE_ORDER[phase_i + 1]
                 resume_train_loss = ckpt.get("train_loss")
                 resume_train_r2 = ckpt.get("train_r2")
+                resume_train_pct_err = ckpt.get("train_pct_err")
                 resume_val_loss = ckpt.get("val_loss")
                 resume_val_r2 = ckpt.get("val_r2")
+                resume_val_pct_err = ckpt.get("val_pct_err")
         if resume_phase == "train":
             resume_skip = resume_phase_skip
             resume_phase = None  # training loop needs no phase-skip logic
@@ -1281,8 +1326,10 @@ def _worker(cfg: RunConfig):
         eval_state: dict | None = None,
         train_loss: float | None = None,
         train_r2: float | None = None,
+        train_pct_err: float | None = None,
         val_loss: float | None = None,
         val_r2: float | None = None,
+        val_pct_err: float | None = None,
     ):
         """Write the resume checkpoint (weights, optimizer, position) and
         push it off-box.
@@ -1314,7 +1361,8 @@ def _worker(cfg: RunConfig):
             `ckpt_cb` (test). None when `phase` is "train", or when
             `batch_idx` is -1 (phase already folded into its scalar
             result below).
-        train_loss, train_r2, val_loss, val_r2 : float or None
+        train_loss, train_r2, train_pct_err, val_loss, val_r2, val_pct_err
+        : float or None
             This epoch's already-computed scalar results, carried forward
             so a resume into "val" or "test" phase doesn't need to redo
             earlier phases just to reconstruct the printed summary line
@@ -1342,12 +1390,15 @@ def _worker(cfg: RunConfig):
                 "eval_state": eval_state,
                 "train_loss": train_loss,
                 "train_r2": train_r2,
+                "train_pct_err": train_pct_err,
                 "val_loss": val_loss,
                 "val_r2": val_r2,
+                "val_pct_err": val_pct_err,
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "best_val": best_val,
+                "val_loss_ema": val_loss_ema,
                 "lr_consecutive_fires": lr_consecutive_fires,
                 "smoothing_triggered": smoothing_triggered,
                 "post_smoothing_lr_consecutive_fires": (
@@ -1404,6 +1455,8 @@ def _worker(cfg: RunConfig):
         train_sum_y = 0.0
         train_sum_y2 = 0.0
         train_n_elem = 0
+        train_pct_err_sum = 0.0
+        train_pct_err_n = 0
         # (batch_idx, grad_norm) PRE-clip, for this epoch. Recorded because
         # grad_clip is only meaningful relative to the norms actually seen:
         # at grad_clip=1.0 against a measured |g| of 10-18 the clip fires on
@@ -1592,6 +1645,18 @@ def _worker(cfg: RunConfig):
                 train_sum_y += log_target.sum().item()
                 train_sum_y2 += (log_target**2).sum().item()
                 train_n_elem += log_target.numel()
+                # Raw-space mean absolute percent error, same formula/floor
+                # as evaluate() and Baselines/run/metrics.py.
+                train_pct_err_sum += (
+                    (
+                        100.0
+                        * (iq - batch.iqval).abs()
+                        / batch.iqval.clamp(min=_PCT_ERR_FLOOR)
+                    )
+                    .sum()
+                    .item()
+                )
+                train_pct_err_n += log_target.numel()
 
             del iq, coh, inc, fmags, sigmas, loss, log_pred, log_target
 
@@ -1630,12 +1695,21 @@ def _worker(cfg: RunConfig):
             break  # diagnostic run: stop after profiling, no eval/checkpoint
 
         if skip_train_entirely:
-            train_loss, train_r2 = resume_train_loss, resume_train_r2
+            train_loss, train_r2, train_pct_err = (
+                resume_train_loss,
+                resume_train_r2,
+                resume_train_pct_err,
+            )
         else:
             train_loss = train_loss_sum / train_mols
             train_ss_tot = train_sum_y2 - train_sum_y**2 / train_n_elem
             train_r2 = (
                 1.0 - train_ss_res / train_ss_tot if train_ss_tot > 0 else 0.0
+            )
+            train_pct_err = (
+                train_pct_err_sum / train_pct_err_n
+                if train_pct_err_n > 0
+                else float("nan")
             )
             # Marks training done for this epoch, so a crash during val
             # or test resumes straight into that phase instead of
@@ -1646,10 +1720,15 @@ def _worker(cfg: RunConfig):
                 phase="train",
                 train_loss=train_loss,
                 train_r2=train_r2,
+                train_pct_err=train_pct_err,
             )
 
         if skip_val_entirely:
-            val_loss, val_r2 = resume_val_loss, resume_val_r2
+            val_loss, val_r2, val_pct_err = (
+                resume_val_loss,
+                resume_val_r2,
+                resume_val_pct_err,
+            )
         else:
             val_start = (
                 resume_phase_skip
@@ -1662,7 +1741,7 @@ def _worker(cfg: RunConfig):
                 else None
             )
             val_sampler.skip = val_start
-            val_loss, val_r2 = evaluate(
+            val_loss, val_r2, val_pct_err = evaluate(
                 val_loader,
                 model,
                 cfg,
@@ -1678,6 +1757,7 @@ def _worker(cfg: RunConfig):
                         eval_state=st,
                         train_loss=train_loss,
                         train_r2=train_r2,
+                        train_pct_err=train_pct_err,
                     )
                 ),
             )
@@ -1690,8 +1770,10 @@ def _worker(cfg: RunConfig):
                 phase="val",
                 train_loss=train_loss,
                 train_r2=train_r2,
+                train_pct_err=train_pct_err,
                 val_loss=val_loss,
                 val_r2=val_r2,
+                val_pct_err=val_pct_err,
             )
 
         # Test set is walked exactly once per epoch. When diagnostic plots are
@@ -1726,14 +1808,16 @@ def _worker(cfg: RunConfig):
                 eval_state=st,
                 train_loss=train_loss,
                 train_r2=train_r2,
+                train_pct_err=train_pct_err,
                 val_loss=val_loss,
                 val_r2=val_r2,
+                val_pct_err=val_pct_err,
             )
 
         if cfg.data_dir:
             from Train.eval_plots import save_epoch_plots
 
-            test_loss, test_r2 = save_epoch_plots(
+            test_loss, test_r2, test_pct_err = save_epoch_plots(
                 model,
                 test_loader,
                 q_grid,
@@ -1751,7 +1835,7 @@ def _worker(cfg: RunConfig):
             )
             torch.cuda.empty_cache()
         else:
-            test_loss, test_r2 = evaluate(
+            test_loss, test_r2, test_pct_err = evaluate(
                 test_loader,
                 model,
                 cfg,
@@ -1771,8 +1855,11 @@ def _worker(cfg: RunConfig):
         print(
             f"epoch {epoch:3d}"
             f"  train loss {train_loss:.4f}  r2 {train_r2:.4f}"
+            f"  pct_err {train_pct_err:.2f}%"
             f"  |  val loss {val_loss:.4f}  r2 {val_r2:.4f}"
+            f"  pct_err {val_pct_err:.2f}%"
             f"  |  test loss {test_loss:.4f}  r2 {test_r2:.4f}"
+            f"  pct_err {test_pct_err:.2f}%"
             f"  |  avg {avg_min:.1f} min/epoch"
         )
 
@@ -1797,6 +1884,7 @@ def _worker(cfg: RunConfig):
                 load_epoch_history,
                 save_epoch_loss_plot,
                 save_epoch_metrics,
+                save_epoch_pct_err_plot,
             )
 
             save_epoch_metrics(
@@ -1804,17 +1892,20 @@ def _worker(cfg: RunConfig):
                     "epoch": epoch,
                     "train_loss": train_loss,
                     "train_r2": train_r2,
+                    "train_pct_err": train_pct_err,
                     "val_loss": val_loss,
                     "val_r2": val_r2,
+                    "val_pct_err": val_pct_err,
                     "test_loss": test_loss,
                     "test_r2": test_r2,
+                    "test_pct_err": test_pct_err,
                 },
                 cfg.data_dir,
                 epoch,
             )
-            save_epoch_loss_plot(
-                load_epoch_history(cfg.data_dir), cfg.data_dir
-            )
+            _history = load_epoch_history(cfg.data_dir)
+            save_epoch_loss_plot(_history, cfg.data_dir)
+            save_epoch_pct_err_plot(_history, cfg.data_dir)
             _rclone_push(cfg.data_dir, cfg.data_rclone_dest)
 
         # update best BEFORE the resume save so the latter records the
@@ -1868,18 +1959,27 @@ def _worker(cfg: RunConfig):
         resume_phase = None
         resume_phase_skip = 0
         resume_eval_state = None
-        resume_train_loss = resume_train_r2 = None
-        resume_val_loss = resume_val_r2 = None
+        resume_train_loss = resume_train_r2 = resume_train_pct_err = None
+        resume_val_loss = resume_val_r2 = resume_val_pct_err = None
 
         # val_loss/val_r2 are always floats by this point (either just
         # computed, or carried forward from a checkpoint written after val
         # phase completed - never None).
         assert val_loss is not None
+        val_loss_ema = (
+            val_loss
+            if val_loss_ema is None
+            else cfg.lr_ema_alpha * val_loss
+            + (1.0 - cfg.lr_ema_alpha) * val_loss_ema
+        )
         prev_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(val_loss)
+        scheduler.step(val_loss_ema)
         new_lr = optimizer.param_groups[0]["lr"]
         if new_lr != prev_lr:
-            print(f"  val loss plateaued, lr {prev_lr:.3g} -> {new_lr:.3g}")
+            print(
+                f"  val loss plateaued (ema {val_loss_ema:.4f}, raw "
+                f"{val_loss:.4f}), lr {prev_lr:.3g} -> {new_lr:.3g}"
+            )
             # lr_consecutive_fires/post_smoothing_lr_consecutive_fires are
             # NOT reset here on a cut - only a genuine improvement resets
             # them (see the "update best" block above). A cut simply
@@ -2015,6 +2115,7 @@ def main(cfg: RunConfig | None = None):
             lr_patience=A.lr_patience,
             lr_threshold=A.lr_threshold,
             lr_min=A.lr_min,
+            lr_ema_alpha=A.lr_ema_alpha,
             weight_decay=A.weight_decay,
             grad_clip=A.grad_clip,
             epochs=A.epochs,

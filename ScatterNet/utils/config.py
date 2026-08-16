@@ -158,6 +158,11 @@ class RunConfig:
         counts as better only if val_loss < best * (1 - lr_threshold).
     lr_min : float
         Floor the LR is never reduced below.
+    lr_ema_alpha : float
+        Smoothing factor for the EMA of val_loss fed to
+        scheduler.step(), so a single noisy-but-better epoch can't reset
+        ReduceLROnPlateau's num_bad_epochs on its own. Does not affect
+        best_val/scatternet_best.pt, which use raw val_loss.
     smoothing_lr_cut_trigger : int
         Number of CONSECUTIVE LR cuts (each one followed by no new
         best_val - a genuine improvement resets the streak) before
@@ -306,6 +311,21 @@ class RunConfig:
     lr_patience: int = 2
     lr_threshold: float = 1e-3  # relative; val loss must beat best by this
     lr_min: float = 1e-6
+    # ReduceLROnPlateau.step() compares a SINGLE epoch's value against the
+    # all-time best (torch source: `if is_better(current, best): best =
+    # current; num_bad_epochs = 0` - no windowing/aggregation at all). At
+    # dataset_frac=0.05, val loss is noisy enough that one barely-better
+    # epoch can reset num_bad_epochs to 0 indefinitely even while the
+    # aggregate trend across any patience-length window is flat or
+    # worsening. scheduler.step() is fed an EMA of val_loss instead of the
+    # raw value (this config knob is its smoothing factor - higher reacts
+    # faster to genuine trend changes, lower is more resistant to
+    # single-epoch noise), so a plateau decision reflects the trend, not
+    # one lucky epoch. best_val/scatternet_best.pt (which checkpoint is
+    # truly the best model) still use RAW val_loss, not the EMA - that is
+    # a different question (which weights to keep) from whether the
+    # trend has genuinely stalled (whether to cut LR).
+    lr_ema_alpha: float = 0.3
     weight_decay: float = 0.1
     # 5.0, not 1.0. train.py records PRE-clip norms in `batch_grad_norms`
     # precisely because a clip below the norms actually seen is gradient
