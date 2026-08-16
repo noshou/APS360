@@ -159,8 +159,9 @@ class RunConfig:
     lr_min : float
         Floor the LR is never reduced below.
     smoothing_lr_cut_trigger : int
-        Number of LR cuts (without escaping the plateau) before delayed
-        smoothing switches on. See ScatterNet.smoothing_enabled.
+        Number of CONSECUTIVE LR cuts (each one followed by no new
+        best_val - a genuine improvement resets the streak) before
+        delayed smoothing switches on. See ScatterNet.smoothing_enabled.
 
         Plateau decay rather than a horizon schedule because cfg.epochs is
         the epoch count for THIS invocation, not the run's total horizon (a
@@ -322,15 +323,18 @@ class RunConfig:
     adam_eps: float = 1e-12
     # Smoothing (SplineSmooth's Λ, and lambda_7's roughness penalty) starts
     # OFF. It stays off until the raw, pre-smoothing model has plateaued
-    # through this many LR cuts without escaping - i.e. more learning rate
-    # genuinely isn't fixing it, not just "loss looks flat for a bit". At
-    # that point LR resets to `lr`, lambda_7 turns on, and ScatterNet's
+    # through this many CONSECUTIVE LR cuts without escaping - a cut
+    # followed by a genuine new best_val resets the streak, so this is not
+    # a cumulative "2 cuts ever" count, it is "2 cuts in a row with no real
+    # progress between them", i.e. more learning rate genuinely isn't
+    # fixing it, not just "loss looks flat for a bit". At that point LR
+    # resets to `lr`, lambda_7 turns on, and ScatterNet's
     # `smoothing_enabled` flips true for the rest of the run. See
     # Train/train.py's scheduler.step() block.
     smoothing_lr_cut_trigger: int = 2
     # None (default): run until fully converged - the raw phase plateaus
-    # (smoothing_lr_cut_trigger LR cuts), smoothing switches on, the
-    # smoothed phase plateaus the same way, then the run stops and
+    # (smoothing_lr_cut_trigger CONSECUTIVE LR cuts), smoothing switches
+    # on, the smoothed phase plateaus the same way, then the run stops and
     # auto-destroys the vast.ai instance (see Train/train.py's
     # _destroy_vast_instance). Set an int to override with a hard cap on
     # epochs run THIS invocation instead (a resume still runs that many

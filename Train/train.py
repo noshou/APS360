@@ -1031,14 +1031,21 @@ def _worker(cfg: RunConfig):
     # the switch take effect everywhere without threading a new parameter
     # through each call site).
     target_lambda_7 = cfg.lambda_7
-    lr_cut_count = 0
+    # CONSECUTIVE, not cumulative: a cut that gets followed by a new
+    # best_val means the cut worked, so the streak resets to 0 (see the
+    # "update best" block below). Without this, one early cut that
+    # actually helped, plus one unrelated cut much later after a long
+    # stretch of real progress, would count as "2 unproductive cuts" and
+    # trigger smoothing on a run that was never actually stuck.
+    lr_consecutive_fires = 0
     smoothing_triggered = False
-    # Separate counter for the SAME kind of stall once smoothing is on:
-    # smoothing_lr_cut_trigger more cuts with no escape post-smoothing means
-    # the model is fully converged (raw phase converged, then the smoothed
-    # phase converged too), which is what ends the run and auto-kills the
-    # instance - see the scheduler.step() block and _destroy_vast_instance.
-    post_smoothing_lr_cut_count = 0
+    # Same "consecutive, resets on improvement" logic for the SAME kind of
+    # stall once smoothing is on: smoothing_lr_cut_trigger more consecutive
+    # unproductive cuts post-smoothing means the model is fully converged
+    # (raw phase converged, then the smoothed phase converged too), which
+    # is what ends the run and auto-kills the instance - see the
+    # scheduler.step() block and _destroy_vast_instance.
+    post_smoothing_lr_consecutive_fires = 0
     fully_converged = False
     # batches to skip in the first resumed epoch (exact mid-epoch resume)
     resume_skip = 0
@@ -1091,10 +1098,20 @@ def _worker(cfg: RunConfig):
         # checkpoints wrote this same quantity under the misleading key
         # "val_loss", so fall back to that for backward compatibility.
         best_val = ckpt.get("best_val", ckpt.get("val_loss", float("inf")))
-        lr_cut_count = ckpt.get("lr_cut_count", 0)
+        # No fallback to the old cumulative "lr_cut_count"/
+        # "post_smoothing_lr_cut_count" keys - those counted ANY cuts ever,
+        # not consecutive-since-last-improvement, so an old value isn't a
+        # valid starting point under the new semantics (it could easily be
+        # stale-high, e.g. one cut that actually worked plus one unrelated
+        # later cut). Starting at 0 on a checkpoint written before this
+        # change is the correct behavior, not just a safe default: the
+        # streak resets on any improvement, and every checkpoint that
+        # predates this change happened while training was still (by
+        # definition) making progress.
+        lr_consecutive_fires = ckpt.get("lr_consecutive_fires", 0)
         smoothing_triggered = ckpt.get("smoothing_triggered", False)
-        post_smoothing_lr_cut_count = ckpt.get(
-            "post_smoothing_lr_cut_count", 0
+        post_smoothing_lr_consecutive_fires = ckpt.get(
+            "post_smoothing_lr_consecutive_fires", 0
         )
         saved_bi = ckpt.get("batch_idx", -1)
         # Older checkpoints (pre phase-machine) never wrote "phase" - they
@@ -1331,9 +1348,11 @@ def _worker(cfg: RunConfig):
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "best_val": best_val,
-                "lr_cut_count": lr_cut_count,
+                "lr_consecutive_fires": lr_consecutive_fires,
                 "smoothing_triggered": smoothing_triggered,
-                "post_smoothing_lr_cut_count": post_smoothing_lr_cut_count,
+                "post_smoothing_lr_consecutive_fires": (
+                    post_smoothing_lr_consecutive_fires
+                ),
                 "grad_norms": batch_grad_norms,
                 "lr": optimizer.param_groups[0]["lr"],
                 "q_grid": q_grid,
@@ -1805,6 +1824,12 @@ def _worker(cfg: RunConfig):
         assert val_loss is not None
         if val_loss < best_val:
             best_val = val_loss
+            # A cut that gets followed by real improvement worked - the
+            # unproductive-cut streak breaks. Reset whichever counter is
+            # currently active (the other is already 0, so this is a
+            # no-op for it either way).
+            lr_consecutive_fires = 0
+            post_smoothing_lr_consecutive_fires = 0
             torch.save(
                 {
                     "epoch": epoch,
@@ -1848,9 +1873,15 @@ def _worker(cfg: RunConfig):
         new_lr = optimizer.param_groups[0]["lr"]
         if new_lr != prev_lr:
             print(f"  val loss plateaued, lr {prev_lr:.3g} -> {new_lr:.3g}")
+            # lr_consecutive_fires/post_smoothing_lr_consecutive_fires are
+            # NOT reset here on a cut - only a genuine improvement resets
+            # them (see the "update best" block above). A cut simply
+            # extends the current streak; whether that streak is actually
+            # "consecutive and unproductive" is enforced by that reset,
+            # not by anything in this block.
             if not smoothing_triggered:
-                lr_cut_count += 1
-                if lr_cut_count >= cfg.smoothing_lr_cut_trigger:
+                lr_consecutive_fires += 1
+                if lr_consecutive_fires >= cfg.smoothing_lr_cut_trigger:
                     smoothing_triggered = True
                     model.smoothing_enabled = True
                     cfg.lambda_7 = target_lambda_7
@@ -1858,21 +1889,26 @@ def _worker(cfg: RunConfig):
                         g["lr"] = cfg.lr
                     scheduler._reset()  # clears best/num_bad_epochs/cooldown
                     print(
-                        f"  {lr_cut_count} lr cuts without escaping the "
-                        f"plateau - enabling smoothing (lambda_7="
-                        f"{cfg.lambda_7:.3g}), lr reset to {cfg.lr:.3g}"
+                        f"  {lr_consecutive_fires} consecutive lr cuts "
+                        "without escaping the plateau - enabling "
+                        f"smoothing (lambda_7={cfg.lambda_7:.3g}), lr "
+                        f"reset to {cfg.lr:.3g}"
                     )
             else:
                 # Same stall signature, now under smoothing: this many
-                # cuts with no escape means the smoothed model has itself
-                # converged, not just the raw one - training is done.
-                post_smoothing_lr_cut_count += 1
-                if post_smoothing_lr_cut_count >= cfg.smoothing_lr_cut_trigger:
+                # consecutive cuts with no escape means the smoothed model
+                # has itself converged, not just the raw one - training is
+                # done.
+                post_smoothing_lr_consecutive_fires += 1
+                if (
+                    post_smoothing_lr_consecutive_fires
+                    >= cfg.smoothing_lr_cut_trigger
+                ):
                     fully_converged = True
                     print(
-                        f"  {post_smoothing_lr_cut_count} lr cuts post-"
-                        "smoothing without escaping - model fully "
-                        "converged, ending run"
+                        f"  {post_smoothing_lr_consecutive_fires} "
+                        "consecutive lr cuts post-smoothing without "
+                        "escaping - model fully converged, ending run"
                     )
 
         if fully_converged:
