@@ -1905,15 +1905,23 @@ def _worker(cfg: RunConfig):
                             cfg.ckpt_best, map_location=device
                         )
                         model.load_state_dict(best_ckpt["model"])
-                        if "optimizer" in best_ckpt:
+                        has_opt = "optimizer" in best_ckpt
+                        if has_opt:
                             optimizer.load_state_dict(
                                 best_ckpt["optimizer"]
                             )
+                        opt_note = (
+                            "weights + optimizer"
+                            if has_opt
+                            else "weights ONLY - ckpt_best predates "
+                            "optimizer-state saving, momentum/variance "
+                            "left at their current (non-best) values"
+                        )
                         print(
                             f"  rolled back to best checkpoint (epoch "
                             f"{best_ckpt['epoch']}, val "
                             f"{best_ckpt['val_loss']:.4f}) before "
-                            "enabling smoothing"
+                            f"enabling smoothing - {opt_note}"
                         )
                         del best_ckpt
                     else:
