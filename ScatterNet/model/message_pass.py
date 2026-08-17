@@ -3,7 +3,7 @@ from typing import Callable, NamedTuple, Tuple, cast
 
 import numpy as np
 import torch
-from pyteals import PTanhShrink, QDiagBilin
+from pyteals import PBId, QDiagBilin
 from torch import cos, nn
 from torch.nn.functional import mish
 from torch.utils.checkpoint import checkpoint
@@ -127,10 +127,11 @@ class MessagePass(nn.Module):
     # RFF random phase offsets b ∈ R^λ₅
     __biasterm: nn.Parameter
 
-    # updates σ from (updated embedding, form factor).
-    # one NoTrilinBilin per message-passing round (length λ₂); rounds do NOT
-    # share weights.
+    # updates σ from (updated embedding, form factor): QDiagBilin -> PBId.
+    # one instance of each per message-passing round (length λ₂); rounds do
+    # NOT share weights.
     __sigbilin: nn.ModuleList
+    __sigact: nn.ModuleList
 
     # normalises aggregated context before gating.
     # one nn.RMSNorm per message-passing round (length λ₂); rounds do NOT
@@ -327,27 +328,39 @@ class MessagePass(nn.Module):
         # torch.compile graph break (aten::_trilinear isn't Inductor-
         # supported), so this fuses into the surrounding compiled graph.
         #
+        # PBId, not PTanhShrink: the hard bound on the sigma update lives in
+        # arctan_log_sigma_window downstream (see __pass_1's "Sigma update"
+        # comment), so PTanhShrink's dead zone near 0 wasn't adding safety -
+        # it was just killing gradient in the "small controlled nudge"
+        # regime this update is supposed to live in (measured: sigma's
+        # per-element grad RMS was 9.4e-13 against ~1e0 elsewhere, and
+        # PTanhShrink's learned width `c` never moved off its init across
+        # multiple independent runs - it wasn't using the escape hatch
+        # either). PBId's f'(0) = 1 regardless of its bend `w`, so small
+        # inputs pass through near-identity; the bend only engages at large
+        # |x|, exactly where arctan_log_sigma_window already bounds things.
+        #
         # The last round is skipped: nothing consumes its sigma. Sigma feeds
         # the RFF kernel of the NEXT round, and OutputHead ignores sigmas
         # entirely, so round lambda_2-1's sigma parameters measured
         # grad = None / |g| = 0.0 and sat permanently at init.
         self.__sigbilin = nn.ModuleList(
             [
-                PTanhShrink(
-                    QDiagBilin(
-                        in1_features=lambda_1,
-                        in2_features=q_points,
-                        q_points=q_points,
-                        bias=True,
-                    ),
-                    out_features=q_points,
+                QDiagBilin(
+                    in1_features=lambda_1,
+                    in2_features=q_points,
+                    q_points=q_points,
+                    bias=True,
                 )
                 for _ in range(lambda_2 - 1)
             ]
         )
+        self.__sigact = nn.ModuleList(
+            [PBId(q_points) for _ in range(lambda_2 - 1)]
+        )
         with torch.no_grad():
-            for shrink in self.__sigbilin:
-                bilin = cast(QDiagBilin, shrink.bilinear)
+            for bilin in self.__sigbilin:
+                bilin = cast(QDiagBilin, bilin)
                 bilin.weight.mul_(sigma_init_gain)
                 if bilin.bias is not None:
                     bilin.bias.mul_(sigma_init_gain)
@@ -633,10 +646,11 @@ class MessagePass(nn.Module):
 
         # Sigma update, in LOG space and inside the same window Embed uses.
         #
-        # The update is an additive offset on log sigma, produced by a
-        # parametric tanh shrink (`PTanhShrink`: y - c*tanh(y/c), cubic near
-        # 0) so a small bilinear output barely moves sigma, then squashed
-        # back into (sigma_floor, sigma_max) by `arctan_log_sigma_window`.
+        # The update is an additive offset on log sigma: QDiagBilin's raw
+        # output through `PBId` (near-identity at small |x|, bounded bend
+        # at large |x| - see the `_sigbilin`/`_sigact` construction
+        # comment for why this replaced PTanhShrink), then squashed back
+        # into (sigma_floor, sigma_max) by `arctan_log_sigma_window`.
         #
         # The bound is load-bearing, not cosmetic. sigma is the RBF
         # bandwidth: _step1/_step2 form r/sigma, whose backward carries
@@ -660,8 +674,8 @@ class MessagePass(nn.Module):
         # slot, so QDiagBilin takes it without the expand a generic bilinear
         # would need.
         f_in = ffsslice.squeeze(-1)
-        delta = self.__sigbilin[rnd_idx](
-            self.__sig_norm[rnd_idx](new_emb), f_in
+        delta = self.__sigact[rnd_idx](
+            self.__sigbilin[rnd_idx](self.__sig_norm[rnd_idx](new_emb), f_in)
         ).unsqueeze(-1)  # (Nc, mc, Q, 1)
 
         # clamp before log: Embed masks padded sigma to exactly 0.
