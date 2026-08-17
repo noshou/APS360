@@ -448,6 +448,7 @@ def _parse_args():
     p.add_argument("--grad_clip_multiplier", type=float, default=None)
     p.add_argument("--adam_eps", type=float, default=None)
     p.add_argument("--smoothing_lr_cut_trigger", type=int, default=None)
+    p.add_argument("--smoothing_n_stages", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batcher_seed", type=int, default=None)
     p.add_argument("--atom_size_ceil", type=int, default=None)
@@ -1056,29 +1057,28 @@ def _worker(cfg: RunConfig):
     best_val_ema = float("inf")
     val_loss_ema = None  # None = not seeded yet
     grad_norm_ema = None  # None = not seeded yet
-    # Delayed smoothing: off until smoothing_lr_cut_trigger LR cuts fail to
-    # escape the plateau. target_lambda_7 preserves the configured value
-    # while cfg.lambda_7 is forced to 0.0 during the pre-smoothing phase
-    # (every read site - evaluate(), the training loop, save_epoch_plots -
+    # Staged lambda_7 ramp: target_lambda_7 preserves the configured
+    # value while cfg.lambda_7 is held at a fraction of it
+    # (lambda_7_stage / smoothing_n_stages) until the ramp completes.
+    # Every read site (evaluate(), the training loop, save_epoch_plots)
     # just reads cfg.lambda_7 directly, so mutating it here is what makes
-    # the switch take effect everywhere without threading a new parameter
-    # through each call site).
+    # each step take effect everywhere without threading a new parameter
+    # through each call site.
     target_lambda_7 = cfg.lambda_7
     # CONSECUTIVE, not cumulative: a cut that gets followed by a new
     # best_val means the cut worked, so the streak resets to 0 (see the
     # "update best" block below). Without this, one early cut that
     # actually helped, plus one unrelated cut much later after a long
-    # stretch of real progress, would count as "2 unproductive cuts" and
-    # trigger smoothing on a run that was never actually stuck.
+    # stretch of real progress, would count as "N unproductive cuts" and
+    # fire a ramp step on a run that was never actually stuck.
     lr_consecutive_fires = 0
-    smoothing_triggered = False
-    # Same "consecutive, resets on improvement" logic for the SAME kind of
-    # stall once smoothing is on: smoothing_lr_cut_trigger more consecutive
-    # unproductive cuts post-smoothing means the model is fully converged
-    # (raw phase converged, then the smoothed phase converged too), which
-    # is what ends the run and auto-kills the instance - see the
+    # 0..smoothing_n_stages. Each plateau (lr_consecutive_fires hitting
+    # smoothing_lr_cut_trigger) advances this by 1 and rolls cfg.lambda_7
+    # forward to target_lambda_7 * lambda_7_stage / smoothing_n_stages.
+    # A plateau that fires while already at smoothing_n_stages means the
+    # fully-ramped model has also converged, which ends the run - see the
     # scheduler.step() block and _destroy_vast_instance.
-    post_smoothing_lr_consecutive_fires = 0
+    lambda_7_stage = 0
     fully_converged = False
     # batches to skip in the first resumed epoch (exact mid-epoch resume)
     resume_skip = 0
@@ -1145,10 +1145,11 @@ def _worker(cfg: RunConfig):
         # predates this change happened while training was still (by
         # definition) making progress.
         lr_consecutive_fires = ckpt.get("lr_consecutive_fires", 0)
-        smoothing_triggered = ckpt.get("smoothing_triggered", False)
-        post_smoothing_lr_consecutive_fires = ckpt.get(
-            "post_smoothing_lr_consecutive_fires", 0
-        )
+        # No fallback to the old "smoothing_triggered" bool either - a
+        # True there meant "fully ramped" under the old on/off scheme, but
+        # that isn't a safe stand-in for smoothing_n_stages under the new
+        # one, so pre-ramp checkpoints just restart the ramp from 0.
+        lambda_7_stage = ckpt.get("lambda_7_stage", 0)
         saved_bi = ckpt.get("batch_idx", -1)
         # Older checkpoints (pre phase-machine) never wrote "phase" - they
         # only ever checkpointed mid-training, so "train" is the correct
@@ -1195,15 +1196,10 @@ def _worker(cfg: RunConfig):
         )
         del ckpt
 
-    # Delayed smoothing: off until smoothing_lr_cut_trigger LR cuts fail to
-    # escape the plateau. Every read site (evaluate(), the training loop,
-    # save_epoch_plots) just reads cfg.lambda_7 directly, so mutating it
-    # here is what makes the switch take effect everywhere without
-    # threading a new parameter through each call site. model.smoothing_
-    # enabled is set the same way since it is not part of state_dict().
-    if not smoothing_triggered:
-        cfg.lambda_7 = 0.0
-    model.smoothing_enabled = smoothing_triggered
+    # Restore cfg.lambda_7 to wherever the ramp had gotten to (see
+    # target_lambda_7/lambda_7_stage above); every read site just reads
+    # cfg.lambda_7 directly.
+    cfg.lambda_7 = target_lambda_7 * lambda_7_stage / cfg.smoothing_n_stages
 
     # profiler - diagnostic mode. Two decoupled layers:
     #
@@ -1397,10 +1393,7 @@ def _worker(cfg: RunConfig):
                 "val_loss_ema": val_loss_ema,
                 "grad_norm_ema": grad_norm_ema,
                 "lr_consecutive_fires": lr_consecutive_fires,
-                "smoothing_triggered": smoothing_triggered,
-                "post_smoothing_lr_consecutive_fires": (
-                    post_smoothing_lr_consecutive_fires
-                ),
+                "lambda_7_stage": lambda_7_stage,
                 "grad_norms": batch_grad_norms,
                 "lr": optimizer.param_groups[0]["lr"],
                 "q_grid": q_grid,
@@ -1865,51 +1858,6 @@ def _worker(cfg: RunConfig):
             f"  |  avg {avg_min:.1f} min/epoch"
         )
 
-        # This epoch's numbers go in this epoch's own dir, one json per
-        # epoch, and
-        # the loss-vs-epoch curve is then drawn from the jsons READ BACK
-        # OFF DISK
-        # (not from an in-memory history list). That is what makes a resume
-        # safe:
-        # a resumed process has no memory of the epochs it did not run, so
-        # a
-        # single run-level metrics file would be rewritten with only the
-        # post-resume epochs, silently truncating everything before it.
-        # Concatenate
-        # the per-epoch jsons after the run for the full history. Both
-        # steps are
-        # cheap (no forward passes), as is the off-box push (rclone copy is
-        # incremental: earlier epochs' files are already uploaded and get
-        # skipped).
-        if cfg.data_dir:
-            from Train.eval_plots import (
-                load_epoch_history,
-                save_epoch_loss_plot,
-                save_epoch_metrics,
-                save_epoch_pct_err_plot,
-            )
-
-            save_epoch_metrics(
-                {
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    "train_r2": train_r2,
-                    "train_pct_err": train_pct_err,
-                    "val_loss": val_loss,
-                    "val_r2": val_r2,
-                    "val_pct_err": val_pct_err,
-                    "test_loss": test_loss,
-                    "test_r2": test_r2,
-                    "test_pct_err": test_pct_err,
-                },
-                cfg.data_dir,
-                epoch,
-            )
-            _history = load_epoch_history(cfg.data_dir)
-            save_epoch_loss_plot(_history, cfg.data_dir)
-            save_epoch_pct_err_plot(_history, cfg.data_dir)
-            _rclone_push(cfg.data_dir, cfg.data_rclone_dest)
-
         # update best BEFORE the resume save so the latter records it
         assert val_loss is not None
         if val_loss < best_val:
@@ -1962,7 +1910,6 @@ def _worker(cfg: RunConfig):
         if val_loss_ema < best_val_ema:
             best_val_ema = val_loss_ema
             lr_consecutive_fires = 0
-            post_smoothing_lr_consecutive_fires = 0
             torch.save(
                 {
                     "epoch": epoch,
@@ -1980,12 +1927,21 @@ def _worker(cfg: RunConfig):
         prev_lr = optimizer.param_groups[0]["lr"]
         scheduler.step(val_loss_ema)
         new_lr = optimizer.param_groups[0]["lr"]
-        if new_lr != prev_lr:
+        # Both recorded into this epoch's metrics.json, for the loss plot's
+        # LR-cut/lambda_7-stage markers (see save_epoch_loss_plot).
+        lr_cut_this_epoch = new_lr != prev_lr
+        lambda_7_stage_fired = False
+        if lr_cut_this_epoch:
             print(f"  lr cut: {prev_lr:.3g} -> {new_lr:.3g}")
-            if not smoothing_triggered:
-                lr_consecutive_fires += 1
-                if lr_consecutive_fires >= cfg.smoothing_lr_cut_trigger:
-                    smoothing_triggered = True
+            lr_consecutive_fires += 1
+            if lr_consecutive_fires >= cfg.smoothing_lr_cut_trigger:
+                lr_consecutive_fires = 0
+                if lambda_7_stage >= cfg.smoothing_n_stages:
+                    fully_converged = True
+                    print("  converged, ending run")
+                else:
+                    lambda_7_stage += 1
+                    lambda_7_stage_fired = True
                     # Rewind to the best point found, weights + optimizer
                     # (not just weights - Adam's momentum/variance were
                     # built for the worse trajectory since).
@@ -1999,20 +1955,63 @@ def _worker(cfg: RunConfig):
                         del best_ckpt
                     else:
                         print("  WARNING: no ckpt_best_ema, no rollback")
-                    model.smoothing_enabled = True
-                    cfg.lambda_7 = target_lambda_7
+                    cfg.lambda_7 = (
+                        target_lambda_7
+                        * lambda_7_stage
+                        / cfg.smoothing_n_stages
+                    )
                     for g in optimizer.param_groups:
                         g["lr"] = cfg.lr
                     scheduler._reset()
-                    print(f"  smoothing on, lambda_7={cfg.lambda_7:.3g}")
-            else:
-                post_smoothing_lr_consecutive_fires += 1
-                if (
-                    post_smoothing_lr_consecutive_fires
-                    >= cfg.smoothing_lr_cut_trigger
-                ):
-                    fully_converged = True
-                    print("  converged, ending run")
+                    print(
+                        f"  lambda_7 stage {lambda_7_stage}/"
+                        f"{cfg.smoothing_n_stages}, "
+                        f"lambda_7={cfg.lambda_7:.3g}"
+                    )
+
+        # This epoch's numbers go in this epoch's own dir, one json per
+        # epoch, and the loss-vs-epoch curve is then drawn from the jsons
+        # READ BACK OFF DISK (not from an in-memory history list). That is
+        # what makes a resume safe: a resumed process has no memory of the
+        # epochs it did not run, so a single run-level metrics file would
+        # be rewritten with only the post-resume epochs, silently
+        # truncating everything before it. Concatenate the per-epoch jsons
+        # after the run for the full history. Both steps are cheap (no
+        # forward passes), as is the off-box push (rclone copy is
+        # incremental: earlier epochs' files are already uploaded and get
+        # skipped). Written AFTER the scheduler/trigger block above so
+        # lr_cut_this_epoch/lambda_7_stage_fired reflect this epoch's
+        # actual outcome.
+        if cfg.data_dir:
+            from Train.eval_plots import (
+                load_epoch_history,
+                save_epoch_loss_plot,
+                save_epoch_metrics,
+                save_epoch_pct_err_plot,
+            )
+
+            save_epoch_metrics(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "train_r2": train_r2,
+                    "train_pct_err": train_pct_err,
+                    "val_loss": val_loss,
+                    "val_r2": val_r2,
+                    "val_pct_err": val_pct_err,
+                    "test_loss": test_loss,
+                    "test_r2": test_r2,
+                    "test_pct_err": test_pct_err,
+                    "lr_cut": lr_cut_this_epoch,
+                    "lambda_7_stage_fired": lambda_7_stage_fired,
+                },
+                cfg.data_dir,
+                epoch,
+            )
+            _history = load_epoch_history(cfg.data_dir)
+            save_epoch_loss_plot(_history, cfg.data_dir)
+            save_epoch_pct_err_plot(_history, cfg.data_dir)
+            _rclone_push(cfg.data_dir, cfg.data_rclone_dest)
 
         if fully_converged:
             break
@@ -2072,6 +2071,8 @@ def main(cfg: RunConfig | None = None):
             weight_decay=A.weight_decay,
             grad_clip_ema_alpha=A.grad_clip_ema_alpha,
             grad_clip_multiplier=A.grad_clip_multiplier,
+            smoothing_lr_cut_trigger=A.smoothing_lr_cut_trigger,
+            smoothing_n_stages=A.smoothing_n_stages,
             epochs=A.epochs,
             batcher_seed=A.batcher_seed,
             atom_size_ceil=A.atom_size_ceil,

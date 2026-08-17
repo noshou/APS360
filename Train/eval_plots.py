@@ -517,6 +517,32 @@ def save_epoch_loss_plot(history: list[dict], data_dir: str) -> None:
             linestyle=linestyle,
             label=label,
         )
+    # LR cuts (blue) and lambda_7 ramp-step fires (red) as vertical
+    # markers, so the stage-transition machinery (see Train/train.py's
+    # scheduler.step() block) is visible against the loss trend. .get():
+    # epochs recorded before these keys existed just don't get a line.
+    lr_cut_epochs = [h["epoch"] for h in history if h.get("lr_cut")]
+    lambda_7_fire_epochs = [
+        h["epoch"] for h in history if h.get("lambda_7_stage_fired")
+    ]
+    for i, ep in enumerate(lr_cut_epochs):
+        ax.axvline(
+            ep,
+            color="tab:blue",
+            linestyle="-",
+            linewidth=1.2,
+            alpha=0.7,
+            label="lr cut" if i == 0 else None,
+        )
+    for i, ep in enumerate(lambda_7_fire_epochs):
+        ax.axvline(
+            ep,
+            color="tab:red",
+            linestyle="-",
+            linewidth=1.2,
+            alpha=0.7,
+            label="lambda_7 stage" if i == 0 else None,
+        )
     ax.set_xlabel("epoch", color=TEXT_PRIMARY)
     ax.set_ylabel("loss", color=TEXT_PRIMARY)
     # epoch numbers are integers; matplotlib's default locator otherwise
@@ -642,7 +668,15 @@ _CFG_SECTIONS: list[tuple[str, tuple[str, ...]]] = [
             "eps_msgp",
         ),
     ),
-    ("Loss", ("lambda_6", "lambda_7")),
+    (
+        "Loss",
+        (
+            "lambda_6",
+            "lambda_7",
+            "smoothing_lr_cut_trigger",
+            "smoothing_n_stages",
+        ),
+    ),
     (
         "Training",
         (

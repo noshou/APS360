@@ -143,8 +143,10 @@ class RunConfig:
         Weight on the form-factor penalty term. See
         ScatterNet/scatter_net.py's ScatterNet.compute_loss.
     lambda_7 : float
-        Weight on the 2nd-derivative roughness penalty term, applied to
-        the pre-`SplineSmooth` coherent/incoherent curves. See
+        FINAL/target weight on the 2nd-derivative roughness penalty
+        term, applied to the pre-`SplineSmooth` coherent/incoherent
+        curves. Ramps from 0 to this value over smoothing_n_stages
+        plateaus - see smoothing_lr_cut_trigger, smoothing_n_stages, and
         ScatterNet/scatter_net.py's ScatterNet.compute_loss.
 
     Training
@@ -168,8 +170,13 @@ class RunConfig:
         best_val/scatternet_best.pt, which use raw val_loss.
     smoothing_lr_cut_trigger : int
         Number of CONSECUTIVE LR cuts (each one followed by no new
-        best_val - a genuine improvement resets the streak) before
-        delayed smoothing switches on. See ScatterNet.smoothing_enabled.
+        best_val - a genuine improvement resets the streak) before each
+        lambda_7 ramp step fires. See Train/train.py's scheduler.step()
+        block.
+    smoothing_n_stages : int
+        Number of equal steps from lambda_7=0 up to its target value,
+        one per smoothing_lr_cut_trigger-plateau. Once lambda_7 is at
+        target and another plateau fires, the run is fully converged.
 
         Plateau decay rather than a horizon schedule because cfg.epochs is
         the epoch count for THIS invocation, not the run's total horizon (a
@@ -294,6 +301,12 @@ class RunConfig:
 
     # loss
     lambda_6: float = 1.0
+    # SplineSmooth always runs (LambdaHead needs live gradients from epoch
+    # 0 to learn Λ, see ScatterNet.forward). This lambda_7 is the
+    # FINAL/target roughness-penalty weight, not the starting one: it
+    # ramps from 0 up to this value over smoothing_n_stages plateaus (see
+    # smoothing_lr_cut_trigger, smoothing_n_stages below). Train/train.py's
+    # lambda_7_stage tracks ramp progress.
     lambda_7: float = 0.25
 
     # training
@@ -311,7 +324,7 @@ class RunConfig:
     # less progress in it, and makes a fixed relative threshold harder to
     # clear -> earlier cuts in step-terms. Loosen them when frac is small.
     lr_factor: float = 0.5
-    lr_patience: int = 2
+    lr_patience: int = 4
     lr_threshold: float = 1e-3  # relative; val loss must beat best by this
     lr_min: float = 1e-6
     # ReduceLROnPlateau.step() compares a SINGLE epoch's value against the
@@ -343,26 +356,29 @@ class RunConfig:
     # the form-factor heads ran at ~1e0, which froze 59% of the parameters.
     # The init fixes removed most of that imbalance; this is the insurance.
     adam_eps: float = 1e-12
-    # Smoothing (SplineSmooth's Λ, and lambda_7's roughness penalty) starts
-    # OFF. It stays off until the raw, pre-smoothing model has plateaued
-    # through this many CONSECUTIVE LR cuts without escaping - a cut
-    # followed by a genuine new best_val resets the streak, so this is not
-    # a cumulative "2 cuts ever" count, it is "2 cuts in a row with no real
-    # progress between them", i.e. more learning rate genuinely isn't
-    # fixing it, not just "loss looks flat for a bit". At that point LR
-    # resets to `lr`, lambda_7 turns on, and ScatterNet's
-    # `smoothing_enabled` flips true for the rest of the run. See
+    # Each ramp step (see lambda_7 above) fires after this many
+    # CONSECUTIVE LR cuts fail to escape the plateau - a cut followed by
+    # a genuine new best_val resets
+    # the streak, so this is not a cumulative "N cuts ever" count, it is
+    # "N cuts in a row with no real progress between them", i.e. more
+    # learning rate genuinely isn't fixing it. At that point LR resets to
+    # `lr`, weights/optimizer roll back to the best EMA checkpoint, and
+    # lambda_7 steps up by target_lambda_7/smoothing_n_stages. See
     # Train/train.py's scheduler.step() block.
     smoothing_lr_cut_trigger: int = 2
-    # None (default): run until fully converged - the raw phase plateaus
-    # (smoothing_lr_cut_trigger CONSECUTIVE LR cuts), smoothing switches
-    # on, the smoothed phase plateaus the same way, then the run stops and
-    # auto-destroys the vast.ai instance (see Train/train.py's
-    # _destroy_vast_instance). Set an int to override with a hard cap on
-    # epochs run THIS invocation instead (a resume still runs that many
-    # MORE from wherever it left off) - the run stops at the cap
-    # regardless of convergence state, and does NOT auto-destroy the
-    # instance (a manual cap implies you want to inspect the result).
+    # Number of equal steps from lambda_7=0 up to its target value (one
+    # step per smoothing_lr_cut_trigger-plateau). Once lambda_7 is at
+    # target AND another plateau fires, the run is fully converged.
+    smoothing_n_stages: int = 4
+    # None (default): run until fully converged - lambda_7 ramps to its
+    # target over smoothing_n_stages plateaus, then one more plateau at
+    # full lambda_7 ends the run and auto-destroys the vast.ai instance
+    # (see Train/train.py's _destroy_vast_instance). Set an int to
+    # override with a hard cap on epochs run THIS invocation instead (a
+    # resume still runs that many MORE from wherever it left off) - the
+    # run stops at the cap regardless of convergence state, and does NOT
+    # auto-destroy the instance (a manual cap implies you want to inspect
+    # the result).
     epochs: Optional[int] = None
     batcher_seed: int = 0
     atom_size_ceil: int = -1
