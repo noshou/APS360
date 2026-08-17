@@ -79,7 +79,7 @@ lambda_7: 0.055
 # optimiser / training loop
 lr:            1.3e-4
 weight_decay:  0.1
-grad_clip:     5.0
+# grad_clip_ema_alpha/grad_clip_multiplier omitted: defaults (0.02, 4.0)
 # epochs omitted: default (None) is "run until fully converged" - see
 # ScatterNet/utils/config.py's epochs/smoothing_lr_cut_trigger docstrings.
 dataset_frac:  0.05

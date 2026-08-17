@@ -666,10 +666,10 @@ Form factor table construction: `q -> s = q/(4π)` converts to crystallographic 
 **Term 1: Kratky-weighted MSLE**, on the final (post-smoothing) `iq`:
 
 ```{Latex}
-L_kratky(n, q) = (1 + q²) * (log1p(Î(q)) - log1p(I(q)))²
+L_kratky(n, q) = (1/n_atoms) * (1 + q²) * (log1p(Î(q)) - log1p(I(q)))²
 ```
 
-`log1p` handles the multi-decade dynamic range of I(q). The `(1+q²)` Kratky weight emphasises high-q structure; without it the Guinier region (low-q, high intensity) would dominate all gradients.
+`log1p` handles the multi-decade dynamic range of I(q). The `(1+q²)` Kratky weight emphasises high-q structure; without it the Guinier region (low-q, high intensity) would dominate all gradients. `1/n_atoms` keeps a molecule's gradient contribution from scaling with its size (coh/inc scale ~atom count near q->0), same reasoning as term 2's normalization.
 
 **Term 2: Form-factor penalty**, weight `lambda_6`:
 
@@ -682,7 +682,7 @@ Anchors predicted per-atom form factors to xraydb reference values, preventing t
 **Term 3: 2nd-derivative smoothness penalty**, weight `lambda_7`, applied to `coh`/`inc` *before* `SplineSmooth`:
 
 ```{Latex}
-L_smooth(n, q) = λ₇ * (coh''(q)² + inc''(q)²)
+L_smooth(n, q) = (1/n_atoms) * λ₇ * (coh''(q)² + inc''(q)²)
 ```
 
 `coh''`/`inc''` come from `IQ2ndDerivative`, a central-difference second derivative (`(f[q+Δq] - 2f[q] + f[q-Δq]) / Δq²`, second-order one-sided at the grid boundaries). This penalizes `OutputHead`'s raw curves directly rather than the post-`SplineSmooth` output, so the term nudges `OutputHead` itself toward an already-reasonable curve instead of letting `SplineSmooth`'s learned Λ compensate for a rough raw prediction. Default `lambda_7 = 0.25`.
@@ -736,7 +736,7 @@ A reactive mid-epoch cut (windowed train-loss plateau detection) previously ran 
        iq, coh, inc, fmags, sigmas = model(batch)
        loss = model.compute_loss(iq, coh, inc, fmags, batch, lambda_6, lambda_7)
 4. loss.backward()
-5. clip_grad_norm_(model.parameters(), grad_clip)
+5. clip_grad_norm_(model.parameters(), grad_clip_multiplier * grad_norm_ema)
 6. optimizer.step()
 ```
 
@@ -755,7 +755,8 @@ Evaluation is done once per epoch for both val and test. Val is used for checkpo
 
 | File                                                                                                  | Contents                                                                                                                                                  | Saved when                                                   |
 | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `ckpt_best`                                                                                           | model weights only                                                                                                                                        | val_loss improves                                            |
+| `ckpt_best`                                                                                           | weights + optimizer                                                                                                                                       | raw val_loss improves                                        |
+| `ckpt_best_ema`                                                                                       | weights + optimizer                                                                                                                                       | EMA-smoothed val_loss improves; rollback source when smoothing triggers |
 | `ckpt_dir/checkpoint_<epoch>_<batch>.pt` (train) / `checkpoint_<epoch>_<phase>_<batch>.pt` (val/test) | weights + optimizer + scheduler + epoch + phase + batch_idx +`best_val` + this epoch's already-known train/val/test scalars + phase's partial accumulator | every`ckpt_interval_sec` seconds and at every phase boundary |
 
 Each epoch runs three phases in order - `train`, `val`, `test` (test also covers the diagnostic-plots pass) - and every phase gets the same mid-phase checkpointing, not just training: val and test are thousands of batches long too (walking the full val/test set once per epoch), so losing a whole pass to a late Kaggle-session timeout used to be as costly as losing the training tail. `phase` records which of the three the checkpoint belongs to; `batch_idx` is -1 at a phase boundary (that phase is done, the run moves on to the next one) or the last-processed batch mid-phase. A mid-val/test checkpoint also carries `eval_state` - that phase's accumulator (running sums, or for the test/plots pass also the growing per-molecule error-distribution lists) - and this epoch's `train_loss`/`train_r2`/`val_loss`/`val_r2` scalars already computed by earlier phases, so a resume into `val` or `test` never has to redo an earlier phase just to reconstruct them.
@@ -810,7 +811,8 @@ If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remo
 | `lr_min`            | 1e-6    | Floor the LR is never reduced below.                                                                                                                                                                                                     |
 | `lr_ema_alpha`      | 0.3     | Smoothing factor for the EMA of val_loss fed to the scheduler, so ReduceLROnPlateau's single-epoch-vs-best comparison isn't reset by one noisy-but-lucky epoch. Does not affect `best_val`/`scatternet_best.pt`, which use raw val_loss.                                                                                                                                                                                                |
 | `weight_decay`      | 0.1     | AdamW decoupled decay. Applied to weight matrices only: not`_mbd`, biases, norm/gain params, or the RFF phases.                                                                                                                          |
-| `grad_clip`         | 5.0     | Max gradient L2 norm before clipping. Set off the p99 of `batch_grad_norms` (recorded pre-clip every step) - too low and the clip fires on every step (gradient normalisation, not a safety valve), and since buckets are size-sorted, systematically downweights large molecules.                                                                                                                                                                       |
+| `grad_clip_ema_alpha` | 0.02  | EMA smoothing factor for recent pre-clip grad norms.                                                                                                                                                                                     |
+| `grad_clip_multiplier` | 4.0  | Clip threshold = multiplier x that EMA. Adaptive, not fixed - a static threshold couldn't fit the per-epoch p99 grad norm's 68x swing across this run.                                                                                                                                                       |
 | `smoothing_lr_cut_trigger` | 2 | Consecutive LR cuts (no genuine improvement between them) before delayed smoothing switches on; same count again post-smoothing means fully converged. See "Delayed smoothing + auto-kill" below.                                                                                                                                                                                                                    |
 | `epochs`            | None    | Hard cap on epochs THIS invocation. None (default) runs until fully converged instead - see `smoothing_lr_cut_trigger`.                                                                                                                                                                                                                 |
 | `batcher_seed`      | 0       | Seed for train/val/test split and per-epoch shuffle.                                                                                                                                                                                     |
@@ -826,9 +828,9 @@ If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remo
 
 `SplineSmooth`'s Λ and `lambda_7`'s roughness penalty start OFF (`ScatterNet.smoothing_enabled = False`; `forward()` uses `coh**2 + inc` directly, which is exactly what `SplineSmooth` would produce at Λ=0 anyway). This lets the raw model train and converge on its own, the same as it did pre-smoothing, instead of fighting smoothing pressure from step 1.
 
-`scheduler.step()` is fed an EMA of val_loss (`lr_ema_alpha`), not the raw per-epoch value - `ReduceLROnPlateau` itself only ever compares one epoch against the all-time best with no windowing, so at `dataset_frac=0.05`'s noise level a single barely-better epoch could otherwise reset its bad-epoch counter indefinitely even while the aggregate trend is flat or worsening. `best_val`/`scatternet_best.pt` still use raw val_loss - which checkpoint is truly the best model is a different question from whether the trend has genuinely stalled.
+`scheduler.step()` is fed an EMA of val_loss (`lr_ema_alpha`), not the raw per-epoch value - `ReduceLROnPlateau` itself only ever compares one epoch against the all-time best with no windowing, so at `dataset_frac=0.05`'s noise level a single barely-better epoch could otherwise reset its bad-epoch counter indefinitely even while the aggregate trend is flat or worsening. `best_val`/`ckpt_best` still track raw val_loss (a separate, diagnostic "best single epoch" record); `best_val_ema`/`ckpt_best_ema` track the EMA and are what the consecutive-fire counter and rollback actually use, for the same noise-robustness reason.
 
-`Train/train.py` tracks `ReduceLROnPlateau`'s LR cuts, CONSECUTIVELY: a cut followed by a genuine new best_val means it worked, so the streak resets to 0 - this is not a cumulative "N cuts ever" count, an early cut that actually helped plus one unrelated cut much later (after real progress in between) does not count as 2 unproductive cuts. When `smoothing_lr_cut_trigger` cuts (default 2) happen back-to-back with no escape from the plateau, that's the "raw model is genuinely stuck, not just still learning" signal: smoothing switches on, LR resets to its starting value (`lr`, so the model isn't stuck fine-tuning at whatever tiny LR it plateaued at, but the scheduler is still free to cut it again from there), and training continues. If the now-smoothed model plateaus the same way again (same trigger count, counted fresh, same consecutive-with-reset rule), that means it's fully converged and the run stops.
+`Train/train.py` tracks `ReduceLROnPlateau`'s LR cuts, CONSECUTIVELY: a cut followed by a genuine new `best_val_ema` means it worked, so the streak resets to 0 - not a cumulative "N cuts ever" count. When `smoothing_lr_cut_trigger` cuts (default 2) happen back-to-back with no escape, that's the "raw model is genuinely stuck" signal: weights + optimizer roll back to `ckpt_best_ema`, smoothing switches on, LR resets to `lr` (scheduler still free to cut again from there), and training continues. If the now-smoothed model plateaus the same way again, that means it's fully converged and the run stops.
 
 `epochs` is no longer the primary stopping mechanism - it's `None` by default (run until converged) and only acts as a hard override cap if set, in which case the run stops at the cap regardless of convergence state and does not auto-destroy the instance.
 
@@ -885,7 +887,7 @@ Loss
   └─ _smooth_penalty: λ₇*(d²coh_accum + d²inc_accum)², pre-spline curvature via IQ2ndDerivative (N,Q)
   └─ .mean() -> scalar
 
-Optimizer: Adam(clip at grad_clip) -> parameter update
+Optimizer: Adam(clip at grad_clip_multiplier * grad_norm_ema) -> parameter update
 ```
 
 ---

@@ -309,35 +309,30 @@ class ScatterNet(nn.Module):
             Scalar total loss.
         """
 
-        # Kratky-weighted MSLE: (1+q²) * (log1p(Î(q)) - log1p(I(q)))²
-        residual = torch.log1p(output_head) - torch.log1p(iqval)
-        msle_loss = q_weights * residual**2  # (N, Q)
-
         mask_2d = mask.unsqueeze(-1)  # (N, M, 1)
         n_atoms = mask.sum(dim=1, keepdim=True).float().clamp(min=1)  # (N, 1)
 
-        # form-factor penalty.
-        # log1p-normalized L2 vs xraydb reference, atom-count-normalized
+        # Kratky-weighted MSLE: (1+q²) * (log1p(Î(q)) - log1p(I(q)))²
+        # /n_atoms: per-molecule gradient contribution shouldn't scale
+        # with atom count (coh ~M, inc ~M near q->0), matching ff_penalty.
+        residual = torch.log1p(output_head) - torch.log1p(iqval)
+        msle_loss = q_weights * residual**2 / n_atoms  # (N, Q)
+
+        # form-factor penalty: log1p-normalized L2 vs xraydb reference
         f_mag_real = torch.log1p(fmag_table[vocab])
         f_mag_pred = torch.log1p(f_mag_pred)
         ff_penalty = (
             (lambda_6 * ((f_mag_pred - f_mag_real) ** 2)) * mask_2d
         ).sum(dim=1) / n_atoms  # (N, Q)
 
-        # 2nd-derivative roughness penalty, pre-smoothing coh/inc, in log
-        # space like the terms above (raw coh/inc can be O(1e6)+ from
-        # molecule size alone, which blew this term up to ~1e13 on a live
-        # run). coh is signed (PBId), so log1p(coh**2) instead of log1p(coh).
-        # Plain discrete 2nd difference, not a calculus-accurate derivative:
-        # this is a roughness regularizer, not a physical quantity, so no
-        # /delta_q**2 (that reintroduces the same scale problem via
-        # lambda_7 instead) and no boundary stencil (dropped, like
-        # PPSpline's D).
+        # 2nd-derivative roughness penalty, pre-smoothing coh/inc, log
+        # space (raw coh/inc can be O(1e6)+ from molecule size alone).
+        # coh is signed (PBId) so log1p(coh**2), not log1p(coh).
         log_coh = torch.log1p(coh**2)
         log_inc = torch.log1p(inc)
         d2_coh = log_coh[:, 2:] - 2.0 * log_coh[:, 1:-1] + log_coh[:, :-2]
         d2_inc = log_inc[:, 2:] - 2.0 * log_inc[:, 1:-1] + log_inc[:, :-2]
-        smooth_penalty = lambda_7 * (d2_coh**2 + d2_inc**2)  # (N, Q-2)
+        smooth_penalty = lambda_7 * (d2_coh**2 + d2_inc**2) / n_atoms
 
         return (
             msle_loss.mean() + ff_penalty.mean() + smooth_penalty.mean()

@@ -415,6 +415,7 @@ def _parse_args():
     p.add_argument("--hdf5", default=None)
     p.add_argument("--encodings_sqlite3_path", default=None)
     p.add_argument("--ckpt_best", default=None)
+    p.add_argument("--ckpt_best_ema", default=None)
     p.add_argument("--ckpt_dir", default=None)
     p.add_argument("--resume", default=None, help="path to resume checkpoint")
 
@@ -443,7 +444,8 @@ def _parse_args():
     p.add_argument("--lr_min", type=float, default=None)
     p.add_argument("--lr_ema_alpha", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
-    p.add_argument("--grad_clip", type=float, default=None)
+    p.add_argument("--grad_clip_ema_alpha", type=float, default=None)
+    p.add_argument("--grad_clip_multiplier", type=float, default=None)
     p.add_argument("--adam_eps", type=float, default=None)
     p.add_argument("--smoothing_lr_cut_trigger", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
@@ -1051,14 +1053,9 @@ def _worker(cfg: RunConfig):
 
     start_epoch = 1
     best_val = float("inf")
-    # EMA of val_loss fed to scheduler.step() instead of the raw value -
-    # see RunConfig.lr_ema_alpha's docstring for why (ReduceLROnPlateau
-    # compares one epoch against the all-time best with no windowing, so
-    # a single noisy-but-better epoch can reset num_bad_epochs on its
-    # own). None means "not seeded yet" - the first val_loss becomes the
-    # EMA's starting point outright rather than blending against a
-    # nonexistent prior value.
-    val_loss_ema = None
+    best_val_ema = float("inf")
+    val_loss_ema = None  # None = not seeded yet
+    grad_norm_ema = None  # None = not seeded yet
     # Delayed smoothing: off until smoothing_lr_cut_trigger LR cuts fail to
     # escape the plateau. target_lambda_7 preserves the configured value
     # while cfg.lambda_7 is forced to 0.0 during the pre-smoothing phase
@@ -1134,11 +1131,9 @@ def _worker(cfg: RunConfig):
         # checkpoints wrote this same quantity under the misleading key
         # "val_loss", so fall back to that for backward compatibility.
         best_val = ckpt.get("best_val", ckpt.get("val_loss", float("inf")))
-        # No fallback to raw val_loss if missing - an old checkpoint that
-        # predates this feature has no EMA history to seed from, so start
-        # fresh at None (seeded outright by the next val_loss, same as a
-        # brand new run) rather than silently guessing a starting point.
+        best_val_ema = ckpt.get("best_val_ema", float("inf"))
         val_loss_ema = ckpt.get("val_loss_ema")
+        grad_norm_ema = ckpt.get("grad_norm_ema")
         # No fallback to the old cumulative "lr_cut_count"/
         # "post_smoothing_lr_cut_count" keys - those counted ANY cuts ever,
         # not consecutive-since-last-improvement, so an old value isn't a
@@ -1398,7 +1393,9 @@ def _worker(cfg: RunConfig):
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "best_val": best_val,
+                "best_val_ema": best_val_ema,
                 "val_loss_ema": val_loss_ema,
+                "grad_norm_ema": grad_norm_ema,
                 "lr_consecutive_fires": lr_consecutive_fires,
                 "smoothing_triggered": smoothing_triggered,
                 "post_smoothing_lr_consecutive_fires": (
@@ -1457,13 +1454,7 @@ def _worker(cfg: RunConfig):
         train_n_elem = 0
         train_pct_err_sum = 0.0
         train_pct_err_n = 0
-        # (batch_idx, grad_norm) PRE-clip, for this epoch. Recorded because
-        # grad_clip is only meaningful relative to the norms actually seen:
-        # at grad_clip=1.0 against a measured |g| of 10-18 the clip fires on
-        # every step, which is gradient normalisation rather than a safety
-        # valve, and the clip factor then varies with molecule size (buckets
-        # are size-sorted), systematically downweighting large molecules.
-        # Set grad_clip off the p99 of this series.
+        # (batch_idx, grad_norm) PRE-clip, for this epoch (diagnostic).
         batch_grad_norms: list[tuple[int, float]] = (
             resume_grad_norms if is_resumed_epoch else []
         )
@@ -1585,8 +1576,19 @@ def _worker(cfg: RunConfig):
                 loss.backward()
 
             with loop_prof.section("clip", rec):
+                clip_threshold = (
+                    float("inf")
+                    if grad_norm_ema is None
+                    else cfg.grad_clip_multiplier * grad_norm_ema
+                )
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), cfg.grad_clip
+                    model.parameters(), clip_threshold
+                )
+                grad_norm_ema = (
+                    grad_norm.item()
+                    if grad_norm_ema is None
+                    else cfg.grad_clip_ema_alpha * grad_norm.item()
+                    + (1.0 - cfg.grad_clip_ema_alpha) * grad_norm_ema
                 )
             with loop_prof.section("step", rec):
                 optimizer.step()
@@ -1908,19 +1910,10 @@ def _worker(cfg: RunConfig):
             save_epoch_pct_err_plot(_history, cfg.data_dir)
             _rclone_push(cfg.data_dir, cfg.data_rclone_dest)
 
-        # update best BEFORE the resume save so the latter records the
-        # current best_val. val_loss/val_r2 are always floats by this
-        # point (either just computed, or carried forward from a
-        # checkpoint written after val phase completed - never None).
+        # update best BEFORE the resume save so the latter records it
         assert val_loss is not None
         if val_loss < best_val:
             best_val = val_loss
-            # A cut that gets followed by real improvement worked - the
-            # unproductive-cut streak breaks. Reset whichever counter is
-            # currently active (the other is already 0, so this is a
-            # no-op for it either way).
-            lr_consecutive_fires = 0
-            post_smoothing_lr_consecutive_fires = 0
             torch.save(
                 {
                     "epoch": epoch,
@@ -1933,12 +1926,6 @@ def _worker(cfg: RunConfig):
                 },
                 cfg.ckpt_best,
             )
-            # delete_after=False, unlike every other checkpoint push: the
-            # delayed-smoothing trigger reads this file back locally
-            # (rolls back to it before switching smoothing on), so it does
-            # NOT meet _rclone_push's own documented condition for
-            # delete_after=True ("never safe for paths read back locally
-            # during the run").
             _rclone_push(cfg.ckpt_best, cfg.ckpt_rclone_dest)
             print(f"  saved best checkpoint (val {val_loss:.4f})")
 
@@ -1962,9 +1949,6 @@ def _worker(cfg: RunConfig):
         resume_train_loss = resume_train_r2 = resume_train_pct_err = None
         resume_val_loss = resume_val_r2 = resume_val_pct_err = None
 
-        # val_loss/val_r2 are always floats by this point (either just
-        # computed, or carried forward from a checkpoint written after val
-        # phase completed - never None).
         assert val_loss is not None
         val_loss_ema = (
             val_loss
@@ -1972,95 +1956,63 @@ def _worker(cfg: RunConfig):
             else cfg.lr_ema_alpha * val_loss
             + (1.0 - cfg.lr_ema_alpha) * val_loss_ema
         )
+        # EMA-best, not raw-best: rollback target + consecutive-fire reset
+        # both key off this, so a single lucky epoch can't count as
+        # "escaped the plateau" the way a raw-best check would.
+        if val_loss_ema < best_val_ema:
+            best_val_ema = val_loss_ema
+            lr_consecutive_fires = 0
+            post_smoothing_lr_consecutive_fires = 0
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "val_loss_ema": val_loss_ema,
+                    "q_grid": q_grid,
+                    "energy": energy,
+                    "hparams": hparams,
+                },
+                cfg.ckpt_best_ema,
+            )
+            _rclone_push(cfg.ckpt_best_ema, cfg.ckpt_rclone_dest)
+
         prev_lr = optimizer.param_groups[0]["lr"]
         scheduler.step(val_loss_ema)
         new_lr = optimizer.param_groups[0]["lr"]
         if new_lr != prev_lr:
-            print(
-                f"  val loss plateaued (ema {val_loss_ema:.4f}, raw "
-                f"{val_loss:.4f}), lr {prev_lr:.3g} -> {new_lr:.3g}"
-            )
-            # lr_consecutive_fires/post_smoothing_lr_consecutive_fires are
-            # NOT reset here on a cut - only a genuine improvement resets
-            # them (see the "update best" block above). A cut simply
-            # extends the current streak; whether that streak is actually
-            # "consecutive and unproductive" is enforced by that reset,
-            # not by anything in this block.
+            print(f"  lr cut: {prev_lr:.3g} -> {new_lr:.3g}")
             if not smoothing_triggered:
                 lr_consecutive_fires += 1
                 if lr_consecutive_fires >= cfg.smoothing_lr_cut_trigger:
                     smoothing_triggered = True
-                    # The 2 consecutive unproductive cuts it took to get
-                    # here mean the CURRENT weights are, by construction,
-                    # worse than the best point this run already found -
-                    # roll back to that point rather than starting
-                    # smoothing from a state training has since drifted
-                    # past. Model AND optimizer state together, not just
-                    # weights: Adam's momentum/variance were built for the
-                    # trajectory that led to the current (worse) point, so
-                    # reloading only the weights would pair rolled-back
-                    # weights with a mismatched optimizer state.
-                    if os.path.exists(cfg.ckpt_best):
+                    # Rewind to the best point found, weights + optimizer
+                    # (not just weights - Adam's momentum/variance were
+                    # built for the worse trajectory since).
+                    if os.path.exists(cfg.ckpt_best_ema):
                         best_ckpt = torch.load(
-                            cfg.ckpt_best, map_location=device
+                            cfg.ckpt_best_ema, map_location=device
                         )
                         model.load_state_dict(best_ckpt["model"])
-                        has_opt = "optimizer" in best_ckpt
-                        if has_opt:
-                            optimizer.load_state_dict(
-                                best_ckpt["optimizer"]
-                            )
-                        opt_note = (
-                            "weights + optimizer"
-                            if has_opt
-                            else "weights ONLY - ckpt_best predates "
-                            "optimizer-state saving, momentum/variance "
-                            "left at their current (non-best) values"
-                        )
-                        print(
-                            f"  rolled back to best checkpoint (epoch "
-                            f"{best_ckpt['epoch']}, val "
-                            f"{best_ckpt['val_loss']:.4f}) before "
-                            f"enabling smoothing - {opt_note}"
-                        )
+                        optimizer.load_state_dict(best_ckpt["optimizer"])
+                        print(f"  rollback to epoch {best_ckpt['epoch']}")
                         del best_ckpt
                     else:
-                        print(
-                            "  WARNING: no ckpt_best found to roll back "
-                            "to - enabling smoothing from current "
-                            "(non-best) weights"
-                        )
+                        print("  WARNING: no ckpt_best_ema, no rollback")
                     model.smoothing_enabled = True
                     cfg.lambda_7 = target_lambda_7
-                    # AFTER the optimizer rollback, not before - loading
-                    # best_ckpt's optimizer state_dict restores whatever LR
-                    # was active back at that epoch, which would silently
-                    # undo this reset if it ran first.
                     for g in optimizer.param_groups:
                         g["lr"] = cfg.lr
-                    scheduler._reset()  # clears best/num_bad_epochs/cooldown
-                    print(
-                        f"  {lr_consecutive_fires} consecutive lr cuts "
-                        "without escaping the plateau - enabling "
-                        f"smoothing (lambda_7={cfg.lambda_7:.3g}), lr "
-                        f"reset to {cfg.lr:.3g}"
-                    )
+                    scheduler._reset()
+                    print(f"  smoothing on, lambda_7={cfg.lambda_7:.3g}")
             else:
-                # Same stall signature, now under smoothing: this many
-                # consecutive cuts with no escape means the smoothed model
-                # has itself converged, not just the raw one - training is
-                # done.
                 post_smoothing_lr_consecutive_fires += 1
                 if (
                     post_smoothing_lr_consecutive_fires
                     >= cfg.smoothing_lr_cut_trigger
                 ):
                     fully_converged = True
-                    print(
-                        f"  {post_smoothing_lr_consecutive_fires} "
-                        "consecutive lr cuts post-smoothing without "
-                        "escaping - model fully converged, ending run"
-                    )
+                    print("  converged, ending run")
 
         if fully_converged:
             break
@@ -2095,6 +2047,7 @@ def main(cfg: RunConfig | None = None):
             hdf5=A.hdf5,
             encodings_sqlite3_path=A.encodings_sqlite3_path,
             ckpt_best=A.ckpt_best,
+            ckpt_best_ema=A.ckpt_best_ema,
             ckpt_dir=A.ckpt_dir,
             resume=A.resume,
             lambda_1=A.lambda_1,
@@ -2117,7 +2070,8 @@ def main(cfg: RunConfig | None = None):
             lr_min=A.lr_min,
             lr_ema_alpha=A.lr_ema_alpha,
             weight_decay=A.weight_decay,
-            grad_clip=A.grad_clip,
+            grad_clip_ema_alpha=A.grad_clip_ema_alpha,
+            grad_clip_multiplier=A.grad_clip_multiplier,
             epochs=A.epochs,
             batcher_seed=A.batcher_seed,
             atom_size_ceil=A.atom_size_ceil,
