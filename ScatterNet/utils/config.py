@@ -148,6 +148,16 @@ class RunConfig:
         curves. Ramps from 0 to this value over smoothing_n_stages
         plateaus - see smoothing_lr_cut_trigger, smoothing_n_stages, and
         ScatterNet/scatter_net.py's ScatterNet.compute_loss.
+    lambda_8 : float
+        Weight on the direct percent-error term (lambda_8 * |pred -
+        true| / true, same formula/floor as the reported pct_err
+        metric). Multiplies the ratio - NOT a target subtracted from it
+        (`lambda_8 - ratio` would be decreasing in the error, so
+        minimizing it would drive error up). Untuned initial guess: the
+        other loss terms are O(0.01-0.4) and pct_err as a fraction (not
+        x100) is O(0.25-3.0), so lambda_8 is kept small to avoid this
+        term dominating. See ScatterNet/scatter_net.py's
+        ScatterNet.compute_loss.
 
     Training
     lr : float
@@ -308,6 +318,12 @@ class RunConfig:
     # smoothing_lr_cut_trigger, smoothing_n_stages below). Train/train.py's
     # lambda_7_stage tracks ramp progress.
     lambda_7: float = 0.25
+    # Weight on the direct percent-error term (lambda_8 * |pred-true|/true,
+    # matching the reported pct_err metric's formula/floor). Untuned initial
+    # guess - other loss terms run O(0.01-0.4), pct_err as a fraction is
+    # O(0.25-3.0), so this stays small to avoid dominating. See
+    # ScatterNet.compute_loss.
+    lambda_8: float = 0.02
 
     # training
     lr: float = 1.3e-4
@@ -427,6 +443,7 @@ class RunConfig:
             "sigma_init_gain",
             "lambda_6",
             "lambda_7",
+            "lambda_8",
             "lr",
             "lr_factor",
             "lr_threshold",

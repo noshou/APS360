@@ -53,6 +53,7 @@ For scripting on cloud proviers please refer to `_shell_scrpts/README.md` .
 | λ₅    | Random Fourier Features count (`lambda_5`, default 128)                      |
 | λ₆    | form-factor penalty weight (`lambda_6`, default 1.0)                         |
 | λ₇    | 2nd-derivative smoothness penalty weight (`lambda_7`, default 0.25)          |
+| λ₈    | direct percent-error term weight (`lambda_8`, default 0.02)                  |
 | Nc      | molecules per N-chunk (`mol_chunk`)                                          |
 | mc      | atoms per M-chunk (`atm_chunk`)                                              |
 | V       | VOCAB size = len(VOCAB) + 1 (row 0 is padding)                               |
@@ -659,19 +660,24 @@ batch -> Embed(batch, ε_e)               (embeds, f_mags, sigmas): (N,M,1,λ₁
 
 ## 9. `Loss`
 
-There is no standalone `Loss` module. Loss computation is `ScatterNet.compute_loss(output_head, coh, inc, f_mag_pred, batch, lambda_6, lambda_7)`, a method on `ScatterNet` itself, using the `__fmag_table` / `__q_weights_` buffers described in [§8](#8-scatternet).
+There is no standalone `Loss` module. Loss computation is `ScatterNet.compute_loss(output_head, coh, inc, f_mag_pred, batch, lambda_6, lambda_7, lambda_8)`, a method on `ScatterNet` itself, using the `__fmag_table` / `__q_weights_` buffers described in [§8](#8-scatternet).
 
 Form factor table construction: `q -> s = q/(4π)` converts to crystallographic s (sinθ/λ used by xraydb), then `|f(q)| = hypot(f0 + f1_chantler, f2_chantler)`. Transuranics: f0 only.
 
 ### Loss Terms
 
-**Term 1: Kratky-weighted MSLE**, on the final (post-smoothing) `iq`:
+**Term 1: Kratky-transformed reconstruction term**, on the final (post-smoothing) `iq`:
 
 ```{Latex}
-L_kratky(n, q) = (1/n_atoms) * (1 + q²) * (log1p(Î(q)) - log1p(I(q)))²
+L_recon(n, q) = ( (1 + q²) * (Î(q)/n_atoms² - I(q)/n_atoms²) )²
 ```
 
-`log1p` handles the multi-decade dynamic range of I(q). The `(1+q²)` Kratky weight emphasises high-q structure; without it the Guinier region (low-q, high intensity) would dominate all gradients. `1/n_atoms` keeps a molecule's gradient contribution from scaling with its size (coh/inc scale ~atom count near q->0), same reasoning as term 2's normalization.
+Replaces the earlier log1p-space MSLE. Two changes at once, both aimed at the model's weakest spot - high-q precision:
+
+- **Atom-count normalization, not log1p.** `OutputHead`'s docstring establishes `coh = Σ f_m` at the Debye q→0 limit - linear in atom count, so `coh²` (the dominant term in `I(q) = coh² + inc` near q→0) scales as `n_atoms²`. Dividing by `n_atoms²` cancels that scaling directly, using the model's own known scaling law instead of a generic log squash to control the dynamic range across the dataset's 2-to-78,819-atom span.
+- **Kratky weight applied *before* squaring, not after.** This is a different objective than a plain importance-weighted MSE: it's literally fitting the Kratky-transformed curve `(1+q²)*I(q)` itself, so the effective per-q weight on the squared residual is `(1+q²)²`, not `(1+q²)¹`. The model was underperforming specifically at high q (where `I(q)` is naturally small, so an unweighted or linearly-weighted loss barely notices being relatively very wrong there); this pushes harder on exactly that region.
+
+Operates on `output_head` (the smoothed final `iq`), not raw `coh`/`inc` - this is load-bearing, since `LambdaHead` only receives gradient via this term flowing back through `SplineSmooth`'s solve (see `ScatterNet.forward`'s "Always run SplineSmooth" comment). Routing it through raw `coh`/`inc` instead would cold-start `LambdaHead` again.
 
 **Term 2: Form-factor penalty**, weight `lambda_6`:
 
@@ -689,13 +695,21 @@ L_smooth(n, q) = (1/n_atoms) * λ₇ * (coh''(q)² + inc''(q)²)
 
 `coh''`/`inc''` come from `IQ2ndDerivative`, a central-difference second derivative (`(f[q+Δq] - 2f[q] + f[q-Δq]) / Δq²`, second-order one-sided at the grid boundaries). This penalizes `OutputHead`'s raw curves directly rather than the post-`SplineSmooth` output, so the term nudges `OutputHead` itself toward an already-reasonable curve instead of letting `SplineSmooth`'s learned Λ compensate for a rough raw prediction. Default `lambda_7 = 0.25`.
 
+**Term 4: Direct percent-error term**, weight `lambda_8`:
+
+```{Latex}
+L_pct(n, q) = λ₈ * |Î(q) - I(q)| / clamp(I(q), min=PCT_ERR_FLOOR)
+```
+
+Trains directly toward the actual gate metric (`pct_err`, see [§11](#11-training-loop)) instead of relying solely on `L_recon` as a proxy for it - same formula and `PCT_ERR_FLOOR` (`1e-3`) as the reported `pct_err` metric, so the loss term and the number the run is gated on mean the same thing. `λ₈` **multiplies** the ratio (same weight-coefficient convention as `λ₆`/`λ₇`) rather than being subtracted from a target: `λ₈ - ratio` would be *decreasing* in the error, so minimizing it would drive error up, backwards. Already scale-invariant (a ratio), so unlike `L_recon` it is not divided by `n_atoms` or `n_atoms²` again. Default `lambda_8 = 0.02` is an untuned initial guess - the other terms run O(0.01-0.4) and raw `pct_err` (as a fraction, not ×100) is O(0.25-3.0), so it's kept small to avoid dominating.
+
 **Total:**
 
 ```{Latex}
-L_total = mean_{n,q}[ L_kratky(n,q) + L_ff(n,q) + L_smooth(n,q) ]
+L_total = mean_{n,q}[ L_recon(n,q) + L_ff(n,q) + L_smooth(n,q) + L_pct(n,q) ]
 ```
 
-`.mean()` averages over all N molecules and all Q q-points. Per-molecule normalisation inside `L_ff` prevents large molecules from dominating. Sigma needs no explicit penalty term: `MessagePass` bounds it structurally with `Embed`'s arctan sigma window on every round (see `ScatterNet/utils/sigma_window.py`).
+`.mean()` averages over all N molecules and all Q q-points. Per-molecule normalisation inside `L_ff`/`L_recon` prevents large molecules from dominating. Sigma needs no explicit penalty term: `MessagePass` bounds it structurally with `Embed`'s arctan sigma window on every round (see `ScatterNet/utils/sigma_window.py`).
 
 ---
 
@@ -736,7 +750,7 @@ A reactive mid-epoch cut (windowed train-loss plateau detection) previously ran 
 2. optimizer.zero_grad(set_to_none=True)
 3. with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
        iq, coh, inc, fmags, sigmas = model(batch)
-       loss = model.compute_loss(iq, coh, inc, fmags, batch, lambda_6, lambda_7)
+       loss = model.compute_loss(iq, coh, inc, fmags, batch, lambda_6, lambda_7, lambda_8)
 4. loss.backward()
 5. clip_grad_norm_(model.parameters(), grad_clip_multiplier * grad_norm_ema)
 6. optimizer.step()
@@ -800,6 +814,7 @@ If `data_rclone_dest` is set, the whole `data_dir` is pushed to that rclone remo
 | `lambda_5`          | 128     | RFF count. More = tighter kernel approximation, higher memory cost.                                                                                                                                                                      |
 | `lambda_6`          | 1.0     | Form-factor penalty weight.                                                                                                                                                                                                              |
 | `lambda_7`          | 0.25    | FINAL/target second-derivative smoothness penalty weight, applied to the pre-`SplineSmooth` coherent/incoherent curves. Ramps from 0 to this value over `smoothing_n_stages` plateaus - see "Staged smoothing + auto-kill" below.       |
+| `lambda_8`          | 0.02    | Weight on the direct percent-error loss term (`lambda_8 * \|pred-true\|/true`). Untuned initial guess - see [§9](#9-loss).                                                                                                              |
 | `msg_seed`          | 42      | Seed for fixed RFF frequency matrix Ω.                                                                                                                                                                                                  |
 | `atm_chunk`         | 512     | Atoms per M-chunk. Reduce to lower VRAM.                                                                                                                                                                                                 |
 | `mol_chunk`         | 256     | Molecules per N-chunk. Reduce to lower VRAM on large molecules.                                                                                                                                                                          |
@@ -885,9 +900,10 @@ Batch
        └─ returns coh_smooth**2 + inc_smooth -> I(q) (N, Q)
 
 Loss
-  └─ _kratky_MSLE:    (1+q²)*(log1p(Î)-log1p(I))²          (N,Q)
+  └─ _recon_loss:     ((1+q²)*(Î/n² - I/n²))²                (N,Q)
   └─ _ff_penalty:     λ₆*(log1p(f̂)-log1p(f_ref))²/n        (N,Q)
   └─ _smooth_penalty: λ₇*(d²coh_accum + d²inc_accum)², pre-spline curvature via IQ2ndDerivative (N,Q)
+  └─ _pct_err_term:   λ₈*|Î-I|/clamp(I, PCT_ERR_FLOOR)        (N,Q)
   └─ .mean() -> scalar
 
 Optimizer: Adam(clip at grad_clip_multiplier * grad_norm_ema) -> parameter update

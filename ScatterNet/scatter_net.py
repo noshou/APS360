@@ -26,9 +26,10 @@ class ScatterNet(nn.Module):
     4. SplineSmooth smooths the raw coherent/incoherent curves into the
     final predicted I(q).
 
-    Also computes the training loss: Kratky MSLE plus a form-factor
-    penalty. Sigma needs no penalty term; MessagePass bounds it
-    structurally with Embed's arctan window on every round.
+    Also computes the training loss: a Kratky-transformed-curve
+    reconstruction term, a form-factor penalty, a roughness penalty, and
+    a direct percent-error term. Sigma needs no penalty term; MessagePass
+    bounds it structurally with Embed's arctan window on every round.
 
     Hyperparameters:
         lambda_1:  atom embedding dimension
@@ -260,12 +261,14 @@ class ScatterNet(nn.Module):
         mask: torch.Tensor,
         lambda_6: float,
         lambda_7: float,
+        lambda_8: float,
     ) -> torch.Tensor:
         """Compute the total training loss.
 
-        Sums the Kratky MSLE, the form-factor penalty, and a 2nd-
-        derivative roughness penalty on the pre-smoothing coherent/
-        incoherent curves, then averages over molecules and q-points.
+        Sums the Kratky-transformed reconstruction term, the form-factor
+        penalty, a 2nd-derivative roughness penalty on the pre-smoothing
+        coherent/incoherent curves, and a direct percent-error term, then
+        averages over molecules and q-points.
 
         Parameters
         ----------
@@ -275,7 +278,7 @@ class ScatterNet(nn.Module):
         q_weights : torch.Tensor
             Kratky weighting (1 + q^2), shape (1, Q).
         output_head : torch.Tensor
-            Predicted I(q), shape (N, Q).
+            Predicted I(q), post-`SplineSmooth`, shape (N, Q).
         coh : torch.Tensor
             Raw accumulated coherent sum, pre-`SplineSmooth`, shape
             (N, Q). Penalized directly rather than post-smoothing so the
@@ -297,6 +300,8 @@ class ScatterNet(nn.Module):
             Weight on the form-factor penalty term.
         lambda_7 : float
             Weight on the 2nd-derivative roughness penalty term.
+        lambda_8 : float
+            Weight on the direct percent-error term.
 
         Returns
         -------
@@ -307,11 +312,16 @@ class ScatterNet(nn.Module):
         mask_2d = mask.unsqueeze(-1)  # (N, M, 1)
         n_atoms = mask.sum(dim=1, keepdim=True).float().clamp(min=1)  # (N, 1)
 
-        # Kratky-weighted MSLE: (1+q²) * (log1p(Î(q)) - log1p(I(q)))²
-        # /n_atoms: per-molecule gradient contribution shouldn't scale
-        # with atom count (coh ~M, inc ~M near q->0), matching ff_penalty.
-        residual = torch.log1p(output_head) - torch.log1p(iqval)
-        msle_loss = q_weights * residual**2 / n_atoms  # (N, Q)
+        # Reconstruction term: MSE on the KRATKY-TRANSFORMED curve itself,
+        # not weighted-least-squares on raw I(q).
+        #
+        # coh ~ n_atoms (Debye q->0 limit), so coh**2, the dominant term in
+        # output_head near q->0, scales ~n_atoms**2. Dividing by
+        # n_atoms**2 there (not just n_atoms) is what  cancels
+        # that scaling and keeps the per-molecule loss magnitude
+        # comparable across the dataset's 2-to-78,819-atom range.
+        norm_residual = output_head / n_atoms**2 - iqval / n_atoms**2
+        recon_loss = (q_weights * norm_residual) ** 2  # (N, Q)
 
         # form-factor penalty: log1p-normalized L2 vs xraydb reference
         f_mag_real = torch.log1p(fmag_table[vocab])
@@ -329,8 +339,21 @@ class ScatterNet(nn.Module):
         d2_inc = log_inc[:, 2:] - 2.0 * log_inc[:, 1:-1] + log_inc[:, :-2]
         smooth_penalty = lambda_7 * (d2_coh**2 + d2_inc**2) / n_atoms
 
+        # Trains toward the <5% gate.
+        # _PCT_ERR_FLOOR must match Baselines/run/metrics.py's constant
+        # so this loss # term and the reported gate metric mean the same thing.
+        _PCT_ERR_FLOOR = 1e-3
+        pct_err_term = (
+            lambda_8
+            * (output_head - iqval).abs()
+            / iqval.clamp(min=_PCT_ERR_FLOOR)
+        )  # (N, Q)
+
         return (
-            msle_loss.mean() + ff_penalty.mean() + smooth_penalty.mean()
+            recon_loss.mean()
+            + ff_penalty.mean()
+            + smooth_penalty.mean()
+            + pct_err_term.mean()
         )
 
     def compute_loss(
@@ -342,17 +365,19 @@ class ScatterNet(nn.Module):
         batch: Batch,
         lambda_6: float,
         lambda_7: float,
+        lambda_8: float,
     ) -> torch.Tensor:  # scalar
         """Compute the total training loss.
 
-        Sums the Kratky MSLE, the form-factor penalty, and a 2nd-
-        derivative roughness penalty on the pre-smoothing coherent/
-        incoherent curves, then averages over molecules and q-points.
+        Sums the Kratky-transformed reconstruction term, the form-factor
+        penalty, a 2nd-derivative roughness penalty on the pre-smoothing
+        coherent/incoherent curves, and a direct percent-error term, then
+        averages over molecules and q-points.
 
         Parameters
         ----------
         output_head : torch.Tensor
-            Predicted I(q), shape (N, Q).
+            Predicted I(q), post-`SplineSmooth`, shape (N, Q).
         coh : torch.Tensor
             Raw accumulated coherent sum, pre-`SplineSmooth`, shape
             (N, Q).
@@ -367,6 +392,8 @@ class ScatterNet(nn.Module):
             Weight on the form-factor penalty term.
         lambda_7 : float
             Weight on the 2nd-derivative roughness penalty term.
+        lambda_8 : float
+            Weight on the direct percent-error term.
 
         Returns
         -------
@@ -389,6 +416,7 @@ class ScatterNet(nn.Module):
             batch.padding_mask(),
             lambda_6,
             lambda_7,
+            lambda_8,
         )
 
     def forward(
@@ -429,23 +457,22 @@ class ScatterNet(nn.Module):
         _, f_mags, sigmas = msg_head
         f_mags = f_mags.squeeze(-1)
         sigmas = sigmas.squeeze(-1)
+
         # whole molecule on one device, so coh already covers every atom
         coh, inc = self.__out(batch, msg_head)
+
         # Always run SplineSmooth, even while lambda_7 == 0: LambdaHead is
         # bias-initialized to Λ≈0 (near-identity, see lambda_head.py), and
         # only learns via the reconstruction loss flowing back through the
         # spline solve - keeping it out of the forward pass until lambda_7
         # ramps up would cold-start an untrained module mid-run.
         iq = self.__spline(sigmas, f_mags, coh, inc, batch)
+
         # I(q) is a physical scattering intensity - it cannot be negative.
         # SplineSmooth's linear solve has no such guarantee on its own output
         # (a penalized smoother can undershoot near sharp features and dip
         # negative even from a strictly non-negative input); nothing enforced
         # this constraint anywhere in the pipeline. A live run hit log1p(iq)
         # with iq <= -1 (NaN, log1p's domain boundary) from exactly this.
-        # Clamped here, not inside SplineSmooth: SplineSmooth is a generic
-        # P-spline smoother with no notion that its output represents a
-        # non-negative physical quantity - that knowledge belongs where iq
-        # is actually established as I(q).
         iq = iq.clamp(min=0.0)
         return iq, coh, inc, f_mags, sigmas

@@ -46,6 +46,7 @@ class ScatterNetBaseline(Baseline):
         compute_loss: bool = False,
         lambda_6: float | None = None,
         lambda_7: float | None = None,
+        lambda_8: float | None = None,
         progress: bool = False,
         n_batch: int = 0,
         start_seen: int = 0,
@@ -71,6 +72,9 @@ class ScatterNetBaseline(Baseline):
         lambda_7 : float, optional
             2nd-derivative roughness penalty weight forwarded to
             `model.compute_loss`; required when `compute_loss` is True.
+        lambda_8 : float, optional
+            Direct percent-error term weight forwarded to
+            `model.compute_loss`; required when `compute_loss` is True.
         progress : bool
             Print a progress line every 20 batches.
         n_batch : int
@@ -93,6 +97,7 @@ class ScatterNetBaseline(Baseline):
         self._compute_loss = compute_loss
         self._lambda_6 = lambda_6
         self._lambda_7 = lambda_7
+        self._lambda_8 = lambda_8
         self._progress = progress
         self._n_batch = n_batch
         self._seen = start_seen
@@ -185,11 +190,15 @@ class ScatterNetBaseline(Baseline):
             if self._compute_loss:
                 lambda_6 = self._lambda_6
                 lambda_7 = self._lambda_7
+                lambda_8 = self._lambda_8
                 assert lambda_6 is not None, (
                     "lambda_6 required when compute_loss is True"
                 )
                 assert lambda_7 is not None, (
                     "lambda_7 required when compute_loss is True"
+                )
+                assert lambda_8 is not None, (
+                    "lambda_8 required when compute_loss is True"
                 )
                 loss = self._model.compute_loss(
                     iq,
@@ -199,6 +208,7 @@ class ScatterNetBaseline(Baseline):
                     batch,
                     lambda_6,
                     lambda_7,
+                    lambda_8,
                 )
                 iqf = iq.float()
                 n = batch.iqval.shape[0]
@@ -248,6 +258,7 @@ def save_epoch_plots(
     compute_loss: bool = False,
     lambda_6: float | None = None,
     lambda_7: float | None = None,
+    lambda_8: float | None = None,
     verbose: bool = False,
     start_batch: int = 0,
     resume_state: dict | None = None,
@@ -303,6 +314,9 @@ def save_epoch_plots(
     lambda_7 : float, optional
         2nd-derivative roughness penalty weight, required when
         `compute_loss` is True.
+    lambda_8 : float, optional
+        Direct percent-error term weight, required when `compute_loss`
+        is True.
     verbose : bool
         Print a progress line every 20 batches.
     start_batch : int
@@ -336,6 +350,7 @@ def save_epoch_plots(
         compute_loss=compute_loss,
         lambda_6=lambda_6,
         lambda_7=lambda_7,
+        lambda_8=lambda_8,
         progress=verbose,
         n_batch=start_batch + len(loader),  # type: ignore[arg-type]
         start_seen=start_batch,
@@ -673,6 +688,7 @@ _CFG_SECTIONS: list[tuple[str, tuple[str, ...]]] = [
         (
             "lambda_6",
             "lambda_7",
+            "lambda_8",
             "smoothing_lr_cut_trigger",
             "smoothing_n_stages",
         ),
