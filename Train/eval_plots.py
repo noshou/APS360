@@ -8,7 +8,7 @@ from dataclasses import replace as dc_replace
 import torch
 
 from Baselines.run.baseline import Baseline
-from Baselines.run.metrics import _PCT_ERR_FLOOR, run_all_plots
+from Baselines.run.metrics import _PCT_ERR_FLOOR, _write_json, run_all_plots
 from Baselines.run.metrics import evaluate as _bl_evaluate
 from ScatterNet import ScatterNet
 from ScatterNet.batching import Batch
@@ -390,10 +390,75 @@ def save_epoch_plots(
         categories={"ScatterNet": "learned"},
         bar_chart_png=False,
     )
+    # Full result dump: every plot_* function in Baselines/run/metrics.py
+    # reads only fields already on `EvalResult` (r2_per_q, pct_err_per_q,
+    # the Kratky/raw-Kratky per-q means, the per-molecule histograms/bins,
+    # atom_scaling_fit, example_curves, ...) - summary.json/
+    # per_q_summary.json above are lossy reductions of that (a handful of
+    # collapsed scalars each), not the full picture. This one file is
+    # `to_json()` verbatim, so every number behind every plot PNG this
+    # epoch is reproducible from saved data alone, without re-running
+    # inference.
+    eval_result_path = os.path.join(epoch_dir, "eval_result.json")
+    _write_json(result.to_json(), eval_result_path)
+    written.append(eval_result_path)
     print(
         f"  [plots] wrote {len(written)} file(s) to {epoch_dir}",
         flush=True,
     )
+
+    # Ground truth doesn't change epoch to epoch - the test DataLoader is
+    # unshuffled (_ResumableSequentialSampler, see Train/train.py), so
+    # "the first n_example_molecules in iteration order" is the SAME set
+    # of molecules every epoch. Write it once, at the root (alongside
+    # run_config.rtf), so a "pred vs. fixed true" overlay across epochs
+    # only ever needs one ground-truth file plus each epoch's pred.
+    ground_truth_path = os.path.join(data_dir, "ground_truth.json")
+    if not os.path.exists(ground_truth_path):
+        _write_json(
+            {
+                "q_grid": q_grid.tolist(),
+                "mean_true_per_q": result.mean_true_per_q.tolist(),
+                "example_true_curves": [
+                    {
+                        "index": c["index"],
+                        "atoms": c["atoms"],
+                        "true": c["true"],
+                    }
+                    for c in result.example_curves
+                ],
+            },
+            ground_truth_path,
+        )
+        print(f"  [data] wrote {ground_truth_path}", flush=True)
+
+    # Root-level "current" snapshot (like loss_per_epoch.json/.png):
+    # overwritten every epoch rather than accumulated per-epoch, since
+    # this is a running "what does the model's raw I(q) curve look like
+    # right now" check, not a per-epoch historical record (full history
+    # is still recoverable from each epoch_NNN/eval_result.json). Raw
+    # (not log1p) space, since that's what the current reconstruction
+    # loss (ScatterNet.compute_loss's recon_loss) actually optimizes.
+    # PRED only, not true - true lives in ground_truth.json above, fixed
+    # for the whole run, so it isn't redundantly rewritten every epoch.
+    kratky_raw_path = os.path.join(data_dir, "kratky_raw.json")
+    _write_json(
+        {
+            "epoch": epoch,
+            "mean_pred_per_q": result.mean_pred_per_q.tolist(),
+            "example_pred_curves": [
+                {
+                    "index": c["index"],
+                    "atoms": c["atoms"],
+                    "pred": c["pred"],
+                }
+                for c in result.example_curves
+            ],
+        },
+        kratky_raw_path,
+    )
+    print(f"  [data] wrote {kratky_raw_path}", flush=True)
+
     return baseline.loss_r2()
 
 

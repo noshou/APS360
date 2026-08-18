@@ -57,6 +57,12 @@ class EvalResult:
     mean_pred_log1p_per_q: (
         np.ndarray
     )  # (Q,) mean log1p(pred) at each q -- Kratky-style
+    mean_true_per_q: (
+        np.ndarray
+    )  # (Q,) mean raw I(q) (true) at each q -- Kratky-style, raw space
+    mean_pred_per_q: (
+        np.ndarray
+    )  # (Q,) mean raw I(q) (pred) at each q -- Kratky-style, raw space
 
     msle_by_atom_bin: dict = field(
         default_factory=dict
@@ -100,6 +106,17 @@ class EvalResult:
         default_factory=dict
     )  # slope/intercept/r2/n
 
+    # A small fixed number of individual molecules' full raw I(q) curves
+    # (pred and true, not aggregated), for a reproducible "what does an
+    # actual prediction look like" check without re-running inference.
+    # Captured from the first batches of `evaluate`'s pass, in iteration
+    # order - not randomly sampled, so this is a deterministic, cheap side
+    # effect rather than a second pass. `index` is the molecule's position
+    # in evaluation order (Batch carries no (grp, stem) identifier to key
+    # off instead - see batch.py). List of
+    # {"index": int, "atoms": int, "true": [Q floats], "pred": [Q floats]}.
+    example_curves: list = field(default_factory=list)
+
     def to_json(self) -> dict:
         """Serialize to plain JSON-able types, for checkpointing."""
         return {
@@ -116,6 +133,8 @@ class EvalResult:
             "mean_pred_log1p_per_q": np.asarray(
                 self.mean_pred_log1p_per_q
             ).tolist(),
+            "mean_true_per_q": np.asarray(self.mean_true_per_q).tolist(),
+            "mean_pred_per_q": np.asarray(self.mean_pred_per_q).tolist(),
             "msle_by_atom_bin": self.msle_by_atom_bin,
             "n_by_atom_bin": self.n_by_atom_bin,
             "resid_hist": np.asarray(self.resid_hist).tolist(),
@@ -126,6 +145,7 @@ class EvalResult:
             "msle_stats": self.msle_stats,
             "resid_by_atom_bin": self.resid_by_atom_bin,
             "atom_scaling_fit": self.atom_scaling_fit,
+            "example_curves": self.example_curves,
         }
 
     @classmethod
@@ -147,6 +167,8 @@ class EvalResult:
             pct_err_per_q=np.array(data["pct_err_per_q"]),
             mean_true_log1p_per_q=np.array(data["mean_true_log1p_per_q"]),
             mean_pred_log1p_per_q=np.array(data["mean_pred_log1p_per_q"]),
+            mean_true_per_q=np.array(data.get("mean_true_per_q", [])),
+            mean_pred_per_q=np.array(data.get("mean_pred_per_q", [])),
             msle_by_atom_bin=data["msle_by_atom_bin"],
             n_by_atom_bin=data["n_by_atom_bin"],
             resid_hist=np.array(data.get("resid_hist", [])),
@@ -157,6 +179,7 @@ class EvalResult:
             msle_stats=data.get("msle_stats", {}),
             resid_by_atom_bin=data.get("resid_by_atom_bin", {}),
             atom_scaling_fit=data.get("atom_scaling_fit", {}),
+            example_curves=data.get("example_curves", []),
         )
 
 
@@ -218,6 +241,7 @@ def evaluate(
     resume_state: dict | None = None,
     ckpt_cb: "Callable[[dict, int], None] | None" = None,
     ckpt_interval_sec: float = 0,
+    n_example_molecules: int = 3,
 ) -> EvalResult:
     """Evaluate a baseline over every batch in ``loader``, one streaming pass.
 
@@ -264,6 +288,11 @@ def evaluate(
     ckpt_interval_sec : float
         Minimum wall-clock seconds between `ckpt_cb` calls. 0 (default)
         disables checkpointing even if `ckpt_cb` is given.
+    n_example_molecules : int
+        Number of individual molecules' full raw I(q) curves to keep
+        verbatim (see `EvalResult.example_curves`), taken from the first
+        batches in iteration order. Small and fixed so this stays a cheap
+        side effect of the existing pass, not a second one.
 
     Returns
     -------
@@ -283,6 +312,8 @@ def evaluate(
     sum_pred_log1p_q = torch.zeros(Q)
     sum_y2_log1p_q = torch.zeros(Q)
     sum_pct_err_q = torch.zeros(Q)
+    sum_true_q = torch.zeros(Q)  # raw (not log1p) per-q means, Kratky-raw
+    sum_pred_q = torch.zeros(Q)
     n_mols = 0
 
     bin_sq_errs: dict = {
@@ -300,6 +331,7 @@ def evaluate(
     all_atoms: list = []
 
     tpa_weighted, total_atoms = 0.0, 0
+    example_curves: list = []
 
     if resume_state:
         sum_sq_err_log1p = resume_state["sum_sq_err_log1p"]
@@ -314,6 +346,8 @@ def evaluate(
         sum_pred_log1p_q = torch.tensor(resume_state["sum_pred_log1p_q"])
         sum_y2_log1p_q = torch.tensor(resume_state["sum_y2_log1p_q"])
         sum_pct_err_q = torch.tensor(resume_state["sum_pct_err_q"])
+        sum_true_q = torch.tensor(resume_state["sum_true_q"])
+        sum_pred_q = torch.tensor(resume_state["sum_pred_q"])
         n_mols = resume_state["n_mols"]
         bin_sq_errs = resume_state["bin_sq_errs"]
         bin_resids = resume_state["bin_resids"]
@@ -322,6 +356,7 @@ def evaluate(
         all_atoms = resume_state["all_atoms"]
         tpa_weighted = resume_state["tpa_weighted"]
         total_atoms = resume_state["total_atoms"]
+        example_curves = resume_state.get("example_curves", [])
 
     last_ckpt = _time.time()
 
@@ -353,6 +388,8 @@ def evaluate(
         sum_sq_err_log1p_q += sq_err_log1p.sum(dim=0).cpu()
         sum_true_log1p_q += true_log1p.sum(dim=0).cpu()
         sum_pred_log1p_q += pred_log1p.sum(dim=0).cpu()
+        sum_true_q += true.sum(dim=0).cpu()
+        sum_pred_q += pred.sum(dim=0).cpu()
         sum_y2_log1p_q += (true_log1p**2).sum(dim=0).cpu()
 
         pct_err = 100.0 * (pred - true).abs() / true.clamp(min=_PCT_ERR_FLOOR)
@@ -365,6 +402,24 @@ def evaluate(
             (pred_log1p - true_log1p).mean(dim=1).cpu()
         )  # (N,) signed direction
         atom_counts = batch.padding_mask().sum(dim=1).cpu().tolist()
+
+        if len(example_curves) < n_example_molecules:
+            n_take = min(
+                n_example_molecules - len(example_curves), true.shape[0]
+            )
+            true_cpu = true[:n_take].cpu()
+            pred_cpu = pred[:n_take].cpu()
+            start_idx = n_mols - true.shape[0]
+            for j in range(n_take):
+                example_curves.append(
+                    {
+                        "index": start_idx + j,
+                        "atoms": int(atom_counts[j]),
+                        "true": true_cpu[j].tolist(),
+                        "pred": pred_cpu[j].tolist(),
+                    }
+                )
+
         for a, m, s in zip(
             atom_counts, per_mol_msle.tolist(), per_mol_resid.tolist()
         ):
@@ -398,6 +453,8 @@ def evaluate(
                     "sum_sq_err_log1p_q": sum_sq_err_log1p_q.tolist(),
                     "sum_true_log1p_q": sum_true_log1p_q.tolist(),
                     "sum_pred_log1p_q": sum_pred_log1p_q.tolist(),
+                    "sum_true_q": sum_true_q.tolist(),
+                    "sum_pred_q": sum_pred_q.tolist(),
                     "sum_y2_log1p_q": sum_y2_log1p_q.tolist(),
                     "sum_pct_err_q": sum_pct_err_q.tolist(),
                     "n_mols": n_mols,
@@ -408,6 +465,7 @@ def evaluate(
                     "all_atoms": all_atoms,
                     "tpa_weighted": tpa_weighted,
                     "total_atoms": total_atoms,
+                    "example_curves": example_curves,
                 },
                 _bi,
             )
@@ -445,11 +503,15 @@ def evaluate(
         pct_err_per_q = (sum_pct_err_q / n_mols).numpy()
         mean_true_log1p_per_q = (sum_true_log1p_q / n_mols).numpy()
         mean_pred_log1p_per_q = (sum_pred_log1p_q / n_mols).numpy()
+        mean_true_per_q = (sum_true_q / n_mols).numpy()
+        mean_pred_per_q = (sum_pred_q / n_mols).numpy()
     else:
         r2_per_q = np.full(Q, float("nan"))
         pct_err_per_q = np.full(Q, float("nan"))
         mean_true_log1p_per_q = np.full(Q, float("nan"))
         mean_pred_log1p_per_q = np.full(Q, float("nan"))
+        mean_true_per_q = np.full(Q, float("nan"))
+        mean_pred_per_q = np.full(Q, float("nan"))
 
     # mean, not median -- a baseline that quietly fails on rare large
     # molecules is a real problem worth seeing, not noise to smooth away.
@@ -550,6 +612,8 @@ def evaluate(
         pct_err_per_q=pct_err_per_q,
         mean_true_log1p_per_q=mean_true_log1p_per_q,
         mean_pred_log1p_per_q=mean_pred_log1p_per_q,
+        mean_true_per_q=mean_true_per_q,
+        mean_pred_per_q=mean_pred_per_q,
         msle_by_atom_bin=msle_by_atom_bin,
         n_by_atom_bin=n_by_atom_bin,
         resid_hist=resid_hist,
@@ -560,6 +624,7 @@ def evaluate(
         msle_stats=msle_stats,
         resid_by_atom_bin=resid_by_atom_bin,
         atom_scaling_fit=atom_scaling_fit,
+        example_curves=example_curves,
     )
 
 
@@ -1045,6 +1110,86 @@ def plot_kratky(results: list, q_grid: torch.Tensor, out_dir: str) -> list:
 
         fig.tight_layout()
         out_path = os.path.join(out_dir, f"kratky_{_slug(r.name)}.png")
+        fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
+        plt.close(fig)
+        written.append(out_path)
+
+    return written
+
+
+def plot_kratky_raw(results: list, q_grid: torch.Tensor, out_dir: str) -> list:
+    """Kratky-style overlay in RAW I(q) space (not log1p): mean I(q) vs q,
+    true vs. each baseline's prediction.
+
+    Same layout/styling as `plot_kratky`, complementary rather than a
+    replacement - the log1p view stays useful for eyeballing shape across
+    I(q)'s huge dynamic range (see `plot_kratky`'s docstring), but training
+    now optimizes a raw-space, atom-count-normalized loss directly
+    (`ScatterNet.compute_loss`'s `recon_loss`), so a raw-space curve is
+    what actually corresponds to what's being fit.
+
+    Y axis is log-SCALED, not log1p-TRANSFORMED: `ax.set_yscale('log')`
+    keeps the plotted VALUES as real I(q) numbers (axis ticks read as
+    actual intensities), it just spaces them geometrically so the low-q
+    peak doesn't flatten the rest of the curve to invisibility on a linear
+    axis. Values are floored at `_PCT_ERR_FLOOR` before plotting since a
+    log axis can't render exactly 0 (clamped, not clipped, since `pred`
+    is already `>=0` from `evaluate()` and could legitimately land there).
+
+    Returns the list of file paths written.
+    """
+    import os
+
+    import matplotlib.pyplot as plt
+
+    _configure_mpl()
+
+    q_np = (
+        q_grid.numpy()
+        if isinstance(q_grid, torch.Tensor)
+        else np.asarray(q_grid)
+    )
+    colors = _colors(results)
+    written = []
+
+    for r in results:
+        fig, ax = plt.subplots(figsize=(9, 6))
+        true_np = np.clip(
+            np.asarray(r.mean_true_per_q), _PCT_ERR_FLOOR, None
+        )
+        pred_np = np.clip(
+            np.asarray(r.mean_pred_per_q), _PCT_ERR_FLOOR, None
+        )
+        ax.plot(
+            q_np,
+            true_np,
+            color=TEXT_PRIMARY,
+            linewidth=1.5,
+            linestyle="--",
+            label="true",
+        )
+        ax.plot(
+            q_np,
+            pred_np,
+            color=colors[r.name],
+            linewidth=2,
+            label="pred",
+        )
+        ax.set_yscale("log")
+        ax.set_xlabel(_Q_LABEL, color=TEXT_PRIMARY)
+        ax.set_ylabel(r"mean $I(q)$", color=TEXT_PRIMARY)
+        _style_axes(ax)
+        # boxed and outside the axes (right side) so it never sits on top
+        # of the true/pred curves themselves
+        ax.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1),
+            frameon=True,
+            labelcolor=TEXT_PRIMARY,
+        )
+
+        fig.tight_layout()
+        out_path = os.path.join(out_dir, f"kratky_raw_{_slug(r.name)}.png")
         fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.15)
         plt.close(fig)
         written.append(out_path)
@@ -1638,6 +1783,7 @@ def run_all_plots(
 
     # one PNG per baseline, not one shared file
     written += plot_kratky(results, q_grid, out_dir)
+    written += plot_kratky_raw(results, q_grid, out_dir)
     written += plot_residual_histogram(results, out_dir)
     written += plot_per_molecule_msle(results, out_dir)
 
